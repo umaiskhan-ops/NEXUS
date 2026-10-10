@@ -1,0 +1,415 @@
+"""Block 5 — Governance, Security & Safety (46 features named in the blueprint)."""
+from __future__ import annotations
+
+import os
+import platform
+import re
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+from ..security import Role
+from .registry import Block, FeatureInputError, clamp, core, integration, llm, require_text
+
+B = Block.GOVERNANCE
+OWNER = Role.OWNER
+
+_POSITIVE = {"good", "great", "thanks", "love", "excellent", "happy", "awesome", "perfect", "nice"}
+_NEGATIVE = {"bad", "angry", "hate", "terrible", "awful", "broken", "frustrated", "annoyed", "useless", "worst"}
+_URGENT = {"urgent", "asap", "now", "immediately", "emergency", "critical"}
+
+INTENT_KEYWORDS = {
+    "/status_grid": ("status", "health", "overview"),
+    "/tasks": ("tasks", "missions", "queue"),
+    "/features": ("features", "capabilities", "what can you do"),
+    "/audit": ("audit", "verify ledger", "integrity"),
+}
+
+
+def _schedule(grid, p):
+    op = p.get("op", "list")
+    if op == "add":
+        key = require_text(p, "feature")
+        grid.registry.get(key)
+        delay = float(p.get("delay_s", 60))
+        payload = dict(p.get("feature_payload", {}))
+        job = grid.scheduler.schedule(delay, lambda: grid.run_feature(grid.owner_tg_id, key, payload, via="scheduler"),
+                                      label=key)
+        return {"status": "SCHEDULED", "job_id": job, "due_in_s": delay}
+    if op == "cancel":
+        return {"status": "OK", "cancelled": grid.scheduler.cancel(require_text(p, "job_id"))}
+    return {"status": "OK", "pending": grid.scheduler.pending()}
+
+
+def _triggers(grid, p):
+    op = p.get("op", "list")
+    if op == "add":
+        grid.registry.get(require_text(p, "feature"))
+        tid = grid.triggers.register(require_text(p, "event"), p["feature"], dict(p.get("feature_payload", {})))
+        return {"status": "REGISTERED", "trigger_id": tid, "events": "feature:<key>, task:approved, alert:<name>"}
+    if op == "remove":
+        return {"status": "OK", "removed": grid.triggers.remove(require_text(p, "trigger_id"))}
+    return {"status": "OK", "triggers": grid.triggers.listing()}
+
+
+def _workflow(grid, p):
+    steps = p.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise FeatureInputError("'steps' must be a non-empty list of {feature, payload}")
+    results = []
+    for i, step in enumerate(steps[:20]):
+        res = grid.run_feature(grid.owner_tg_id, step["feature"], dict(step.get("payload", {})), via="workflow")
+        results.append({"step": i + 1, "feature": step["feature"], "status": res.get("status")})
+        if res.get("status") in {"ERROR", "DENIED", "BLOCKED", "PENDING_APPROVAL"}:
+            return {"status": "HALTED", "at_step": i + 1, "results": results, "last": res}
+    return {"status": "COMPLETED", "results": results}
+
+
+def _error_recovery(grid, p):
+    errors = [a for a in grid.action_log if a.get("status") == "ERROR"][-15:]
+    return {"status": "OK", "policy": "transient backend errors retried once per node, then next node (fallback)",
+            "recent_errors": errors}
+
+
+def _self_opt(grid, p):
+    stats = grid.feature_stats_summary()
+    slow = sorted(stats.items(), key=lambda kv: kv[1]["avg_s"], reverse=True)[:5]
+    suggestions = []
+    if any(s["avg_s"] > 30 for _, s in slow):
+        suggestions.append("Enable eco_mode or swap slow nodes to smaller quantized models.")
+    if any(s["errors"] / max(1, s["calls"]) > 0.3 for s in stats.values()):
+        suggestions.append("High error rates detected; check node health via /status_grid.")
+    return {"status": "OK", "slowest": dict(slow), "suggestions": suggestions or ["No action needed."]}
+
+
+def _nlu(grid, p):
+    text = require_text(p).lower()
+    for intent, kws in INTENT_KEYWORDS.items():
+        if any(k in text for k in kws):
+            return {"status": "OK", "intent": intent, "method": "keyword"}
+    for f in grid.registry.all():
+        if f.name.lower() in text or f.key.replace("_", " ") in text:
+            return {"status": "OK", "intent": "/run", "feature": f.key, "method": "feature-name match"}
+    return {"status": "OK", "intent": None, "suggestion": "Try /features or /run <feature_key> <text>"}
+
+
+def _telegram(grid, p):
+    return {"status": "OK", "bot_configured": bool(grid.config.telegram_bot_token),
+            "webhook_url": grid.config.public_webhook_url or "(long-polling mode)",
+            "webhook_secret_set": bool(grid.config.webhook_secret)}
+
+
+def _dashboard(grid, p):
+    return {"status": "OK", "enabled": bool(grid.config.dashboard_token),
+            "url": f"http://{grid.config.host}:{grid.config.port}/dashboard (Bearer DASHBOARD_TOKEN)"}
+
+
+def _report(grid, p):
+    ok, bad = grid.ledger.verify()
+    stats = grid.feature_stats_summary()
+    report = "\n".join([
+        f"# Grid Report — node {grid.node_id}",
+        f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Uptime: {int(time.time() - grid.started_at)} s",
+        f"Ledger: {len(grid.ledger)} blocks, integrity {'OK' if ok else f'BROKEN at {bad}'}",
+        f"Tasks: {len(grid.tasks.list())} total, {len(grid.tasks.list('QUEUED'))} queued",
+        f"Feature calls: {sum(s['calls'] for s in stats.values())}, "
+        f"errors: {sum(s['errors'] for s in stats.values())}",
+        f"Budget: {grid.budget.status()}",
+    ])
+    path = grid.data_dir / "reports" / f"report_{int(time.time())}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(report, encoding="utf-8")
+    return {"status": "OK", "path": str(path), "report": report}
+
+
+def _action_log(grid, p):
+    return {"status": "OK", "entries": list(grid.action_log)[-clamp(p.get("n"), 1, 200, 20):]}
+
+
+def _authorization(grid, p):
+    uid = p.get("user_id")
+    if uid is None:
+        return {"status": "OK", "roles": grid.access.listing()}
+    role = grid.access.role_of(int(uid))
+    return {"status": "OK", "user_id": uid, "role": role.name if role else None}
+
+
+def _encryption(grid, p):
+    if not grid.encryption.available:
+        return {"status": "UNAVAILABLE", "hint": "pip install cryptography"}
+    if p.get("op") == "decrypt":
+        return {"status": "OK", "plaintext": grid.encryption.decrypt(require_text(p, "token"))}
+    return {"status": "OK", "token": grid.encryption.encrypt(require_text(p))}
+
+
+def _kill_switch(grid, p):
+    cancelled = grid.engage_kill_switch(reason=p.get("text", "kill switch"))
+    return {"status": "KILL_SWITCH_ENGAGED", "cancelled_tasks": cancelled,
+            "note": "Lockdown active. Use /emergency_override <passphrase> to restore."}
+
+
+def _audit(grid, p):
+    ok, bad = grid.ledger.verify()
+    return {"status": "INTACT" if ok else "TAMPERED", "blocks": len(grid.ledger), "first_bad_index": bad,
+            "head": grid.ledger.head_hash[:16]}
+
+
+def _mission_control(grid, p):
+    return {"status": "OK", "tasks": [t.to_dict() for t in grid.tasks.list()][-30:],
+            "pending_approvals": [r.to_dict() for r in grid.approvals.pending()],
+            "scheduled": grid.scheduler.pending()}
+
+
+def _veto(grid, p):
+    target = str(p.get("target_process_id", "ALL"))
+    return {"status": "VETOED", **grid.veto(target)}
+
+
+def _approval_gates(grid, p):
+    op = p.get("op", "list")
+    if op in {"approve", "reject"}:
+        return grid.resolve_approval(require_text(p, "id"), op == "approve")
+    return {"status": "OK", "pending": [r.to_dict() for r in grid.approvals.pending()]}
+
+
+def _transparency(grid, p):
+    return {"status": "OK", "blocks": grid.ledger.tail(clamp(p.get("n"), 1, 100, 10))}
+
+
+def _override(grid, p):
+    return {"status": "OK", "lockdown": grid.toggle_lockdown()}
+
+
+def _shutdown(grid, p):
+    grid.request_shutdown(reason=p.get("text", "owner shutdown"))
+    return {"status": "SHUTDOWN_REQUESTED"}
+
+
+def _access_control(grid, p):
+    op = p.get("op", "list")
+    if op == "grant":
+        grid.access.grant(int(p["user_id"]), Role.parse(require_text(p, "role")))
+    elif op == "revoke":
+        grid.access.revoke(int(p["user_id"]))
+    return {"status": "OK", "roles": grid.access.listing()}
+
+
+def _rollback(grid, p):
+    name = p.get("snapshot") or grid.snapshots.latest()
+    state = grid.snapshots.get(name) if name else None
+    if state is None:
+        return {"status": "NO_SNAPSHOT", "hint": "run state_snapshot_freeze first"}
+    grid.restore_state(state)
+    return {"status": "ROLLED_BACK", "snapshot": name}
+
+
+def _testing_sandbox(grid, p):
+    if not grid.config.enable_code_execution:
+        return {"status": "DISABLED", "hint": "set ENABLE_CODE_EXECUTION=true"}
+    root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run([os.sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+                          cwd=root, capture_output=True, text=True, timeout=300)
+    return {"status": "PASS" if proc.returncode == 0 else "FAIL", "output": (proc.stdout + proc.stderr)[-4000:]}
+
+
+def _sim_rollback(grid, p):
+    return _rollback(grid, {"snapshot": f"branch:{require_text(p, 'branch')}"})
+
+
+def _autonomous(grid, p):
+    if "enabled" in p:
+        grid.autonomous_mode = bool(p["enabled"])
+    return {"status": "OK", "autonomous_mode": grid.autonomous_mode,
+            "note": "Autonomous mode lets queued tasks run without per-task prompts. Hardware and "
+                    "self-improvement features stay approval-gated regardless."}
+
+
+def _preferences(grid, p):
+    if p.get("key"):
+        grid.memory.set(f"pref:{p['key']}", p.get("value"), session="preferences")
+    prefs = {k[5:]: grid.memory.get(k) for k in grid.memory.keys() if k.startswith("pref:")}
+    return {"status": "OK", "preferences": prefs}
+
+
+def _tone(grid, p):
+    words = re.findall(r"[a-z']+", require_text(p).lower())
+    pos, neg, urg = (sum(w in s for w in words) for s in (_POSITIVE, _NEGATIVE, _URGENT))
+    tone = "positive" if pos > neg else "negative" if neg > pos else "neutral"
+    return {"status": "OK", "tone": tone, "urgent": urg > 0, "scores": {"pos": pos, "neg": neg, "urgent": urg},
+            "method": "lexicon (swap in a model via adapter for nuance)"}
+
+
+def _dep_map(grid, p):
+    graph = grid.registry.dependency_graph()
+    return {"status": "OK", "edges": {k: v for k, v in graph.items() if v}}
+
+
+def _hw_health(grid, p):
+    usage = shutil.disk_usage(str(grid.data_dir))
+    info = {"platform": platform.platform(), "python": platform.python_version(), "cpus": os.cpu_count(),
+            "disk_free_gb": round(usage.free / 1e9, 2), "disk_total_gb": round(usage.total / 1e9, 2)}
+    if hasattr(os, "getloadavg"):
+        info["load_avg"] = os.getloadavg()
+    try:
+        import psutil  # optional
+        info["mem_percent"] = psutil.virtual_memory().percent
+        info["cpu_percent"] = psutil.cpu_percent(interval=0.2)
+    except ImportError:
+        info["note"] = "pip install psutil for CPU/RAM metrics"
+    return {"status": "OK", **info}
+
+
+def _deploy_selector(grid, p):
+    need_gpu = bool(p.get("needs_gpu"))
+    latency_ms = float(p.get("max_latency_ms", 500))
+    private = bool(p.get("private_data", True))
+    target = "edge" if private or latency_ms < 100 else "cloud" if need_gpu else "edge"
+    return {"status": "OK", "target": target,
+            "reasoning": {"private_data": private, "needs_gpu": need_gpu, "max_latency_ms": latency_ms}}
+
+
+def _vcs(grid, p):
+    if not shutil.which("git"):
+        return {"status": "UNAVAILABLE", "hint": "git not installed"}
+    root = Path(__file__).resolve().parents[2]
+    proc = subprocess.run(["git", "status", "--short", "--branch"], cwd=root, capture_output=True, text=True,
+                          timeout=20)
+    return {"status": "OK" if proc.returncode == 0 else "NOT_A_REPO", "output": (proc.stdout or proc.stderr)[-3000:]}
+
+
+def _collab(grid, p):
+    return {"status": "OK", "members": grid.access.listing(),
+            "hint": "grant roles via access_control {op: grant, user_id, role: operator|observer}"}
+
+
+def _scaling(grid, p):
+    if "max_workers" in p:
+        grid.set_worker_count(clamp(p["max_workers"], 1, 16, 1))
+    return {"status": "OK", "workers": grid.worker_count, "queue_depth": grid.tasks.queue_depth()}
+
+
+def _load_test(grid, p):
+    n = clamp(p.get("requests"), 1, 500, 50)
+    target = p.get("feature", "input_sanitization_layer")
+    t0 = time.perf_counter()
+    statuses = [grid.run_feature(grid.owner_tg_id, target, {"text": "load test"}, via="load_test", log=False)
+                .get("status") for _ in range(n)]
+    elapsed = time.perf_counter() - t0
+    return {"status": "OK", "feature": target, "requests": n, "elapsed_s": round(elapsed, 3),
+            "rps": round(n / elapsed, 1) if elapsed else None,
+            "errors": sum(s in {"ERROR", "DENIED", "BLOCKED"} for s in statuses)}
+
+
+def _monitor(grid, p):
+    alerts = grid.check_alerts()
+    return {"status": "ALERT" if alerts else "NOMINAL", "alerts": alerts}
+
+
+def _backup(grid, p):
+    return {"status": "OK", **grid.backup()}
+
+
+def _disaster_recovery(grid, p):
+    if p.get("op") == "restore":
+        return {"status": "RESTORED", **grid.restore_backup(require_text(p, "backup"))}
+    return {"status": "OK", "backups": grid.list_backups()}
+
+
+def _constitution(grid, p):
+    return {"status": "OK", "rules": [
+        "no_destructive_commands (block)", "no_secret_exfiltration (block)",
+        "human_approval_required for hardware & self-improvement (review)",
+        "prompt_injection_review for LLM features (review)",
+        "lockdown / kill switch halts all features except override",
+        "frozen state blocks state-mutating features"]}
+
+
+def _guardian(grid, p):
+    blocked = [a for a in grid.action_log if a.get("status") in {"BLOCKED", "DENIED", "PENDING_APPROVAL"}][-20:]
+    return {"status": "OK", "intercepted_actions": blocked, "intrusion_attempts": grid.intrusion_count}
+
+
+def _human_review(grid, p):
+    req = grid.approvals.request(p.get("feature", "manual_review"), dict(p.get("feature_payload", {})),
+                                 grid.owner_tg_id, [p.get("text", "manual review requested")])
+    return {"status": "PENDING_APPROVAL", "approval_id": req.id}
+
+
+def _red_team(grid, p):
+    probes = [
+        ("intruder", lambda: grid.process_telegram_inbound_signal(-1, "/status_grid", {})),
+        ("unauthorised_veto", lambda: grid.run_feature(-1, "veto_power", {"target_process_id": "ALL"},
+                                                       via="red_team", log=False)),
+        ("destructive_payload", lambda: grid.run_feature(grid.owner_tg_id, "knowledge_synthesis",
+                                                         {"text": "rm -rf / now"}, via="red_team", log=False)),
+        ("hardware_without_approval", lambda: grid.run_feature(grid.owner_tg_id, "cnc_machine_control", {},
+                                                               via="red_team", log=False)),
+    ]
+    expectations = {"intruder": lambda r: r.get("drop") is True,
+                    "unauthorised_veto": lambda r: r.get("status") == "DENIED",
+                    "destructive_payload": lambda r: r.get("status") == "BLOCKED",
+                    "hardware_without_approval": lambda r: r.get("status") == "PENDING_APPROVAL"}
+    results = {}
+    for name, probe in probes:
+        r = probe()
+        results[name] = "DEFENDED" if expectations[name](r) else "FAILED"
+    grid.approvals_cleanup_red_team()
+    return {"status": "PASS" if all(v == "DEFENDED" for v in results.values()) else "FAIL", "probes": results}
+
+
+FEATURES = [
+    core("task_scheduling", "Task Scheduling", B, _schedule, "Delayed feature execution."),
+    core("trigger_based_actions", "Trigger-Based Actions", B, _triggers, "event -> feature hooks"),
+    core("workflow_automation", "Workflow Automation", B, _workflow, "Sequential multi-feature pipelines."),
+    core("error_recovery", "Error Recovery", B, _error_recovery),
+    core("self_optimization_loop", "Self-Optimization Loop", B, _self_opt),
+    core("natural_language_understanding", "Natural Language Understanding", B, _nlu, "Free text -> intent."),
+    llm("multi_language_support", "Multi-Language Support", B,
+        "Translate the text. If no target language is specified, translate to English. Preserve meaning and tone."),
+    core("telegram_interface_webhook", "Telegram Interface Webhook", B, _telegram),
+    core("web_dashboard", "Web Dashboard", B, _dashboard),
+    core("report_generation", "Report Generation", B, _report),
+    core("action_logging", "Action Logging", B, _action_log),
+    core("authorization_system", "Authorization System", B, _authorization),
+    core("encryption_layer", "Encryption Layer", B, _encryption, "Fernet at-rest encryption."),
+    core("kill_switch_protocol", "Kill Switch Protocol", B, _kill_switch, min_role=OWNER),
+    core("audit_trail", "Audit Trail", B, _audit, "Ledger hash-chain verification."),
+    core("mission_control", "Mission Control", B, _mission_control),
+    core("veto_power", "Veto Power", B, _veto, min_role=OWNER),
+    core("approval_gates", "Approval Gates", B, _approval_gates, min_role=OWNER),
+    core("full_transparency_ledger", "Full Transparency Ledger", B, _transparency, min_role=Role.OBSERVER),
+    core("emergency_override", "Emergency Override", B, _override, min_role=OWNER),
+    core("shutdown_authority", "Shutdown Authority", B, _shutdown, min_role=OWNER),
+    core("access_control", "Access Control", B, _access_control, min_role=OWNER),
+    core("mission_change_rollbacks", "Mission Change Rollbacks", B, _rollback, min_role=OWNER),
+    core("automated_testing_sandbox", "Automated Testing Sandbox", B, _testing_sandbox, min_role=OWNER),
+    core("simulation_rollback", "Simulation Rollback", B, _sim_rollback,
+         depends_on=("parallel_reality_branching",)),
+    core("autonomous_mode_toggle", "Autonomous Mode Toggle", B, _autonomous, min_role=OWNER),
+    core("user_preference_learning", "User Preference Learning", B, _preferences),
+    core("emotional_tone_detection", "Emotional Tone Detection", B, _tone),
+    core("dependency_mapping", "Dependency Mapping", B, _dep_map),
+    integration("patent_publication_checker", "Patent/Publication Checker", B,
+                "a patent/literature search API adapter (e.g. Lens.org, Semantic Scholar)"),
+    llm("legal_compliance_checker", "Legal Compliance Checker", B,
+        "Flag potential legal/regulatory compliance issues in the described activity and which regimes may apply. "
+        "State clearly that this is not legal advice and a qualified lawyer must review."),
+    integration("multimodal_input", "Multimodal Input", B, "a vision-capable local model adapter (e.g. llava)"),
+    integration("stt_tts_engine", "STT/TTS Engine", B, "a local speech adapter (e.g. whisper.cpp + piper)"),
+    core("hardware_health_monitor", "Hardware Health Monitor", B, _hw_health),
+    core("cloud_edge_deployment_selector", "Cloud/Edge Deployment Selector", B, _deploy_selector),
+    core("version_control_integration", "Version Control Integration", B, _vcs),
+    core("multi_user_collaboration", "Multi-User Collaboration", B, _collab),
+    core("gradual_scaling_controller", "Gradual Scaling Controller", B, _scaling, min_role=OWNER),
+    core("load_testing_engine", "Load Testing Engine", B, _load_test, min_role=OWNER),
+    core("realtime_monitor_alert_grid", "Real-Time Monitor & Alert Grid", B, _monitor),
+    core("disaster_recovery_manager", "Disaster Recovery Manager", B, _disaster_recovery, min_role=OWNER,
+         depends_on=("redundant_backup_system",)),
+    core("redundant_backup_system", "Redundant Backup System", B, _backup, min_role=OWNER),
+    core("constitutional_rule_enforcer", "Constitutional Rule Enforcer", B, _constitution),
+    core("guardian_ai_monitor", "Guardian AI Monitor", B, _guardian),
+    core("human_review_gate", "Human Review Gate", B, _human_review),
+    core("red_team_safety_tester", "Red-Team Safety Tester", B, _red_team, min_role=OWNER),
+]
