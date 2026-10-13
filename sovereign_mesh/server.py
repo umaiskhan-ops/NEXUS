@@ -107,7 +107,7 @@ def make_handler(grid, client):
                 threading.Thread(target=self._process, args=(update,), daemon=True).start()
                 return
 
-            if path in {"/api/chat", "/api/run"}:
+            if path in {"/api/chat", "/api/run", "/api/ide/generate", "/api/ide/execute", "/api/ide/test", "/api/ide/review"}:
                 if not self._auth_ok():
                     return self._send(401, {"error": "unauthorized"})
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -117,6 +117,88 @@ def make_handler(grid, client):
                     body = json.loads(self.rfile.read(length))
                 except ValueError:
                     return self._send(400, {"error": "bad json"})
+
+                if path == "/api/ide/execute":
+                    code = body.get("code", "").strip()
+                    if not code:
+                        return self._send(400, {"error": "code is required"})
+                    from .sandbox import compile_check, run_python
+                    chk = compile_check(code)
+                    if not chk["ok"]:
+                        return self._send(200, {"ok": False, "compile": chk, "stdout": "", "stderr": chk.get("error", "SyntaxError")})
+                    res = run_python(code, enabled=True, timeout=float(body.get("timeout", 10.0)))
+                    return self._send(200, {"ok": res["ok"], "compile": chk, "returncode": res.get("returncode"),
+                                            "stdout": res.get("stdout", ""), "stderr": res.get("stderr", "")})
+
+                if path == "/api/ide/generate":
+                    prompt = body.get("prompt", "").strip()
+                    if not prompt:
+                        return self._send(400, {"error": "prompt is required"})
+                    mode = body.get("mode", "generate")
+                    from .features.registry import extract_code
+                    if mode == "debug_fix":
+                        res = grid.run_feature(grid.owner_tg_id, "code_debug_fix_loop", {
+                            "text": prompt,
+                            "code": body.get("code") or None,
+                            "max_iterations": int(body.get("max_iterations", 3))
+                        })
+                        return self._send(200, {"ok": res.get("status") in {"FIXED", "OK"}, "status": res.get("status"),
+                                                "code": res.get("code", ""), "history": res.get("history", [])})
+                    else:
+                        try:
+                            ask_res = grid.router.ask(
+                                f"Write a complete, working Python script for: {prompt}\nInclude necessary imports and test code.",
+                                system="Return ONLY executable Python code inside a ```python ``` code block. No extra conversational text.",
+                                role="JIT Compiler"
+                            )
+                            code = extract_code(ask_res.get("text", ""))
+                            return self._send(200, {"ok": True, "code": code, "model": ask_res.get("model")})
+                        except Exception as exc:
+                            res = grid.run_feature(grid.owner_tg_id, "code_generation_core", {"text": prompt})
+                            code = extract_code(str(res.get("output", "")))
+                            return self._send(200, {"ok": True, "code": code, "backend_note": str(exc)[:200]})
+
+                if path == "/api/ide/test":
+                    code = body.get("code", "").strip()
+                    if not code:
+                        return self._send(400, {"error": "code is required"})
+                    from .features.registry import extract_code
+                    from .sandbox import run_python
+                    try:
+                        test_gen = grid.router.ask(
+                            f"Write a comprehensive unittest test script for the following Python code:\n```python\n{code}\n```\nMake sure tests run with unittest.main().",
+                            system="Return ONLY the unittest Python code inside a ```python ``` code block.",
+                            role="JIT Compiler"
+                        )
+                        test_code = extract_code(test_gen.get("text", ""))
+                    except Exception:
+                        res = grid.run_feature(grid.owner_tg_id, "test_generation_sandbox", {"text": code})
+                        test_code = extract_code(str(res.get("output", "")))
+
+                    combined = f"{code}\n\n# --- AUTO-GENERATED TEST SUITE ---\n{test_code}"
+                    exec_res = run_python(combined, enabled=True, timeout=12.0)
+                    return self._send(200, {
+                        "ok": exec_res["ok"],
+                        "test_code": test_code,
+                        "returncode": exec_res.get("returncode"),
+                        "stdout": exec_res.get("stdout", ""),
+                        "stderr": exec_res.get("stderr", "")
+                    })
+
+                if path == "/api/ide/review":
+                    code = body.get("code", "").strip()
+                    if not code:
+                        return self._send(400, {"error": "code is required"})
+                    try:
+                        rev_res = grid.router.ask(
+                            f"Review this Python code for bugs, security vulnerabilities, and optimizations:\n```python\n{code}\n```",
+                            system="Give severity-ranked findings: 1. Bugs/Flaws, 2. Security Risks, 3. Performance & Cleanliness.",
+                            role="Validator"
+                        )
+                        return self._send(200, {"ok": True, "review": rev_res.get("text")})
+                    except Exception:
+                        res = grid.run_feature(grid.owner_tg_id, "automated_code_review", {"text": code})
+                        return self._send(200, {"ok": True, "review": res.get("output", "")})
 
                 if path == "/api/run":
                     feature_key = body.get("feature", "")

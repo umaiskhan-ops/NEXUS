@@ -1,23 +1,19 @@
-"""Embedded Single-Page Web Studio for Sovereign Mesh Node.
-Zero external dependencies; fully responsive dark-mode UI for Chat, Direct Feature Execution,
-and Distributed Mesh Monitoring.
+"""Embedded Single-Page Web Studio & Cloud IDE for Sovereign Mesh Node.
+Zero external dependencies; fully responsive dark-mode UI for Chat, Cloud IDE & Sandbox,
+Direct Feature Execution, and Distributed Mesh Monitoring.
 """
 from __future__ import annotations
 
-import html
 import json
 
 
 def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> str:
-    models_json = json.dumps(active_models)
-    counts_json = json.dumps(feature_counts)
-
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NEXUS Sovereign Mesh Studio</title>
+  <title>NEXUS Sovereign Studio & Cloud IDE</title>
   <style>
     :root {{
       --bg: #0d1117;
@@ -94,12 +90,12 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
     }}
     .main-layout {{
       display: grid;
-      grid-template-columns: 320px 1fr;
+      grid-template-columns: 300px 1fr;
       flex: 1;
       height: calc(100vh - 65px);
       overflow: hidden;
     }}
-    @media (max-width: 860px) {{
+    @media (max-width: 900px) {{
       .main-layout {{ grid-template-columns: 1fr; }}
       .sidebar {{ display: none; }}
     }}
@@ -175,9 +171,10 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
       border-bottom: 1px solid var(--border);
       background: var(--card-bg);
       padding: 0 1rem;
+      overflow-x: auto;
     }}
     .tab-btn {{
-      padding: 0.75rem 1.25rem;
+      padding: 0.75rem 1.15rem;
       background: none;
       border: none;
       color: var(--text-muted);
@@ -186,6 +183,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
       cursor: pointer;
       border-bottom: 2px solid transparent;
       transition: all 0.2s ease;
+      white-space: nowrap;
     }}
     .tab-btn.active {{
       color: var(--text);
@@ -274,13 +272,14 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
       background: #238636;
       color: white;
       border: none;
-      border-radius: 8px;
-      padding: 0 1.25rem;
+      border-radius: 6px;
+      padding: 0.45rem 1rem;
       font-weight: 600;
       cursor: pointer;
       display: flex;
       align-items: center;
       gap: 0.4rem;
+      font-size: 0.85rem;
       transition: background 0.15s ease;
     }}
     .send-btn:hover {{ background: #2ea043; }}
@@ -342,13 +341,13 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
   <header>
     <div class="brand">
       <div class="brand-icon">N</div>
-      <span>NEXUS Sovereign Studio</span>
+      <span>NEXUS Sovereign Studio & Cloud IDE</span>
     </div>
     <div class="stats-bar">
       <div class="stat-pill"><div class="status-dot"></div> Node: <strong style="margin-left:2px">{node_id[:8]}</strong></div>
       <div class="stat-pill">⚡ Features: <strong>130</strong></div>
       <div class="stat-pill">🤖 Cloud Models: <strong id="model-count">{len(active_models)}</strong></div>
-      <div class="stat-pill">🔒 Ledger: <strong style="color:var(--success)">Active</strong></div>
+      <div class="stat-pill">🔒 Sandbox: <strong style="color:var(--success)">Active</strong></div>
     </div>
   </header>
 
@@ -366,14 +365,103 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
     <!-- Main Workspace -->
     <div class="content-area">
       <nav class="tabs-nav">
-        <button class="tab-btn active" onclick="switchTab('chat')">💬 AGI Chat & Assistant</button>
+        <button class="tab-btn active" onclick="switchTab('ide')">💻 Cloud IDE & Sandbox</button>
+        <button class="tab-btn" onclick="switchTab('chat')">💬 AGI Chat Assistant</button>
         <button class="tab-btn" onclick="switchTab('runner')">⚡ Direct Feature Studio</button>
         <button class="tab-btn" onclick="switchTab('workers')">🌐 Workers & Economy</button>
         <button class="tab-btn" onclick="switchTab('status')">📊 Node Telemetry</button>
       </nav>
 
-      <!-- TAB 1: Chat Assistant -->
-      <div id="tab-chat" class="tab-content active">
+      <!-- TAB 1: CLOUD IDE & TEST SANDBOX -->
+      <div id="tab-ide" class="tab-content active">
+        <div style="padding: 0.75rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--card-bg); display: flex; flex-direction: column; gap: 0.5rem;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+            <div>
+              <div style="display: flex; align-items: center; gap: 0.6rem;">
+                <h3 style="font-size: 1.05rem; font-weight: 700;">💻 Sovereign Cloud IDE & Execution Sandbox</h3>
+                <span style="font-size: 0.7rem; padding: 0.15rem 0.45rem; background: rgba(63, 185, 80, 0.2); color: var(--success); border-radius: 4px; font-weight: 600;">SUBPROCESS ISOLATION READY</span>
+              </div>
+              <p style="color: var(--text-muted); font-size: 0.8rem; margin-top: 0.2rem;">
+                Enter what you want to build. Sovereign Mesh generates the Python code, executes it in a live sandbox, tests it, and auto-fixes bugs!
+              </p>
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+              <button class="send-btn" style="background:#238636" onclick="generateIdeCode()">🚀 Generate Code</button>
+              <button class="send-btn" style="background:#d29922" onclick="autoDebugFixLoop()">🛠️ Auto-Fix Loop</button>
+            </div>
+          </div>
+          <div style="display: flex; gap: 0.5rem; align-items: center;">
+            <input type="text" id="ide-prompt" class="search-input" style="flex:1" placeholder="Describe what to build... (e.g. Build an algorithm to find primes up to N and measure execution time, or a REST API)">
+          </div>
+          <div style="display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; font-size: 0.75rem; color: var(--text-muted);">
+            <span>Quick Presets:</span>
+            <span class="feature-badge badge-pro" style="cursor:pointer" onclick="setIdePreset('primes')">⚡ Prime Sieve Benchmark</span>
+            <span class="feature-badge badge-pro" style="cursor:pointer" onclick="setIdePreset('matrix')">📊 Matrix Multiplication</span>
+            <span class="feature-badge badge-pro" style="cursor:pointer" onclick="setIdePreset('json_validator')">🛡️ Schema Validator</span>
+            <span class="feature-badge badge-pro" style="cursor:pointer" onclick="setIdePreset('crypto')">🔐 Token Generator</span>
+          </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 55% 45%; flex: 1; overflow: hidden; height: 100%;">
+          <!-- Left: Code Editor -->
+          <div style="display: flex; flex-direction: column; border-right: 1px solid var(--border); background: #0b0f14; overflow: hidden;">
+            <div style="padding: 0.4rem 1rem; background: var(--card-bg); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-family: monospace; font-size: 0.82rem; color: var(--accent);">📄 main.py <span style="color:var(--text-muted)">(Python 3.10)</span></span>
+              <div style="display: flex; gap: 0.4rem;">
+                <button class="send-btn" style="background: #238636; padding: 0.25rem 0.6rem; font-size: 0.78rem;" onclick="runIdeSandbox()">▶️ Run Code</button>
+                <button class="send-btn" style="background: #1f6feb; padding: 0.25rem 0.6rem; font-size: 0.78rem;" onclick="testIdeCode()">🧪 Auto-Test</button>
+                <button class="send-btn" style="background: #8957e5; padding: 0.25rem 0.6rem; font-size: 0.78rem;" onclick="reviewIdeCode()">🔍 AI Review</button>
+                <button class="send-btn" style="background: #30363d; padding: 0.25rem 0.6rem; font-size: 0.78rem;" onclick="copyIdeCode()">📋 Copy</button>
+              </div>
+            </div>
+            <textarea id="ide-editor" style="flex: 1; width: 100%; background: #0b0f14; color: #7ee787; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.86rem; line-height: 1.5; padding: 1rem; border: none; outline: none; resize: none; tab-size: 4;" spellcheck="false"># Welcome to Sovereign Cloud IDE & Sandbox
+# Click '▶️ Run Code' to execute in the isolated subprocess sandbox
+# Or type an instruction in the top prompt bar and click '🚀 Generate Code'
+
+def compute_primes(limit: int):
+    sieve = [True] * (limit + 1)
+    sieve[0] = sieve[1] = False
+    for i in range(2, int(limit**0.5) + 1):
+        if sieve[i]:
+            for j in range(i*i, limit + 1, i):
+                sieve[j] = False
+    return [i for i, is_prime in enumerate(sieve) if is_prime]
+
+if __name__ == "__main__":
+    import time
+    t0 = time.perf_counter()
+    primes = compute_primes(50000)
+    elapsed = time.perf_counter() - t0
+    print(f"Found {{len(primes)}} primes up to 50,000 in {{elapsed*1000:.2f}}ms")
+    print(f"Top 10 largest: {{primes[-10:]}}")
+</textarea>
+          </div>
+
+          <!-- Right: Terminal & Results -->
+          <div style="display: flex; flex-direction: column; background: #070a0d; overflow: hidden;">
+            <div style="padding: 0.4rem 1rem; background: var(--card-bg); border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
+              <div style="display: flex; gap: 0.5rem; align-items: center;">
+                <span style="font-size: 0.82rem; font-weight: 600;">💻 Terminal & Sandbox Output</span>
+                <span id="ide-status-badge" style="font-size: 0.7rem; padding: 0.15rem 0.4rem; background: rgba(255,255,255,0.06); border-radius: 4px;">IDLE</span>
+              </div>
+              <button class="send-btn" style="background: transparent; color: var(--text-muted); border: 1px solid var(--border); padding: 0.2rem 0.5rem; font-size: 0.74rem;" onclick="clearIdeTerminal()">Clear Console</button>
+            </div>
+            <div id="ide-terminal" style="flex: 1; padding: 1rem; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.84rem; line-height: 1.5; color: #e6edf3; overflow-y: auto; white-space: pre-wrap;">
+<span style="color: #58a6ff;">[Sovereign Mesh Sandbox Terminal Initialized]</span>
+- Python 3.10 Subprocess Sandbox Active
+- Ready to compile, execute, test, and auto-debug code.
+Type an instruction or click '▶️ Run Code' above.</div>
+            <div style="padding: 0.4rem 1rem; background: var(--card-bg); border-top: 1px solid var(--border); font-size: 0.75rem; color: var(--text-muted); display: flex; justify-content: space-between;">
+              <span id="ide-exit-code">Exit Code: -</span>
+              <span id="ide-exec-time">Execution Time: -</span>
+              <span>Isolation: Disposable Subprocess</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 2: Chat Assistant -->
+      <div id="tab-chat" class="tab-content">
         <div class="chat-messages" id="chat-stream">
           <div class="msg-card msg-assistant">
             <strong>Sovereign Mesh Assistant</strong>
@@ -393,7 +481,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
         </div>
       </div>
 
-      <!-- TAB 2: Direct Feature Runner -->
+      <!-- TAB 3: Direct Feature Runner -->
       <div id="tab-runner" class="tab-content">
         <div class="runner-container">
           <h3>⚡ Direct Feature Execution Studio</h3>
@@ -422,7 +510,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
         </div>
       </div>
 
-      <!-- TAB 3: Workers & Economy -->
+      <!-- TAB 4: Workers & Economy -->
       <div id="tab-workers" class="tab-content">
         <div class="workers-view">
           <h3>🌐 Distributed Mesh Workers & 3 Economic Models</h3>
@@ -448,7 +536,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
         </div>
       </div>
 
-      <!-- TAB 4: Status / Telemetry -->
+      <!-- TAB 5: Status / Telemetry -->
       <div id="tab-status" class="tab-content">
         <div class="workers-view">
           <h3>📊 Node Telemetry & Sovereign Ledger</h3>
@@ -471,6 +559,178 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
       if (name === 'workers' || name === 'status') refreshStatus();
     }}
 
+    /* --- CLOUD IDE FUNCTIONS --- */
+    function logToIdeTerminal(text, type='info') {{
+      const term = document.getElementById('ide-terminal');
+      const time = new Date().toLocaleTimeString();
+      let color = '#e6edf3';
+      if (type === 'error') color = '#f85149';
+      if (type === 'success') color = '#3fb950';
+      if (type === 'info') color = '#58a6ff';
+      if (type === 'warning') color = '#d29922';
+
+      term.innerHTML += `\\n<span style="color:${{color}}">[${{time}}] ${{escapeHtml(text)}}</span>`;
+      term.scrollTop = term.scrollHeight;
+    }}
+
+    function clearIdeTerminal() {{
+      document.getElementById('ide-terminal').innerHTML = '<span style="color:#58a6ff;">[Console Cleared]</span>';
+    }}
+
+    async function runIdeSandbox() {{
+      const code = document.getElementById('ide-editor').value;
+      const badge = document.getElementById('ide-status-badge');
+      badge.textContent = 'RUNNING';
+      badge.style.background = 'rgba(210, 153, 34, 0.3)';
+      badge.style.color = '#d29922';
+
+      logToIdeTerminal('Compiling bytecode and executing in isolated sandbox...', 'info');
+      const t0 = performance.now();
+
+      try {{
+        const res = await fetch('/api/ide/execute', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ code: code, timeout: 10.0 }})
+        }});
+        const data = await res.json();
+        const elapsed = ((performance.now() - t0) / 1000).toFixed(3);
+        document.getElementById('ide-exec-time').textContent = `Execution Time: ${{elapsed}}s`;
+        document.getElementById('ide-exit-code').textContent = `Exit Code: ${{data.returncode !== undefined ? data.returncode : 'ERR'}}`;
+
+        if (data.ok) {{
+          badge.textContent = 'PASS (0)';
+          badge.style.background = 'rgba(63, 185, 80, 0.3)';
+          badge.style.color = '#3fb950';
+          logToIdeTerminal(data.stdout || '(Program completed with no stdout output)', 'success');
+        }} else {{
+          badge.textContent = 'ERROR (' + (data.returncode || 1) + ')';
+          badge.style.background = 'rgba(248, 81, 73, 0.3)';
+          badge.style.color = '#f85149';
+          if (data.stderr) logToIdeTerminal(data.stderr, 'error');
+          if (data.compile && !data.compile.ok) logToIdeTerminal('Compiler: ' + data.compile.error, 'error');
+        }}
+      }} catch (err) {{
+        badge.textContent = 'FAIL';
+        logToIdeTerminal('Execution failure: ' + err.toString(), 'error');
+      }}
+    }}
+
+    async function generateIdeCode() {{
+      const prompt = document.getElementById('ide-prompt').value.trim();
+      if (!prompt) {{
+        alert('Please enter a description of what you want to build in the prompt bar.');
+        return;
+      }}
+      logToIdeTerminal(`Dispatching prompt to JIT Compiler model: "${{prompt}}"`, 'info');
+      const badge = document.getElementById('ide-status-badge');
+      badge.textContent = 'GENERATING';
+
+      try {{
+        const res = await fetch('/api/ide/generate', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ prompt: prompt, mode: 'generate' }})
+        }});
+        const data = await res.json();
+        if (data.ok && data.code) {{
+          document.getElementById('ide-editor').value = data.code;
+          logToIdeTerminal(`Successfully generated Python script via ${{data.model || 'Mesh JIT Compiler'}}! Ready to run.`, 'success');
+          badge.textContent = 'CODE READY';
+        }} else {{
+          logToIdeTerminal('Code generation failed: ' + (data.error || 'Unknown error'), 'error');
+        }}
+      }} catch(err) {{
+        logToIdeTerminal('Error connecting to backend: ' + err.toString(), 'error');
+      }}
+    }}
+
+    async function autoDebugFixLoop() {{
+      const prompt = document.getElementById('ide-prompt').value.trim() || 'Fix and verify the code in editor';
+      const code = document.getElementById('ide-editor').value;
+      logToIdeTerminal('Launching Recursive Autonomous Debug & Fix Loop (up to 3 iterations)...', 'warning');
+      const badge = document.getElementById('ide-status-badge');
+      badge.textContent = 'AUTO-FIXING';
+
+      try {{
+        const res = await fetch('/api/ide/generate', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ prompt: prompt, code: code, mode: 'debug_fix', max_iterations: 3 }})
+        }});
+        const data = await res.json();
+        if (data.code) {{
+          document.getElementById('ide-editor').value = data.code;
+        }}
+        if (data.history && data.history.length > 0) {{
+          data.history.forEach(h => {{
+            logToIdeTerminal(`Iteration ${{h.attempt}}: ok=${{h.ok}} ${{h.error ? '| error: ' + h.error : ''}}`, h.ok ? 'success' : 'warning');
+          }});
+        }}
+        badge.textContent = data.status || 'DONE';
+        logToIdeTerminal(`Auto-Debug Loop Finished: Status = ${{data.status}}`, data.ok ? 'success' : 'error');
+      }} catch(err) {{
+        logToIdeTerminal('Auto-debug error: ' + err.toString(), 'error');
+      }}
+    }}
+
+    async function testIdeCode() {{
+      const code = document.getElementById('ide-editor').value;
+      logToIdeTerminal('Generating unittests and testing in sandbox...', 'info');
+      try {{
+        const res = await fetch('/api/ide/test', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ code: code }})
+        }});
+        const data = await res.json();
+        logToIdeTerminal('=== AUTO-GENERATED TEST SUITE EXECUTION ===', 'info');
+        if (data.stdout) logToIdeTerminal(data.stdout, 'info');
+        if (data.stderr) logToIdeTerminal(data.stderr, data.ok ? 'success' : 'warning');
+        logToIdeTerminal(`Test Suite Result: ${{data.ok ? 'ALL TESTS PASSED' : 'TEST FAILURES DETECTED'}}`, data.ok ? 'success' : 'error');
+      }} catch(err) {{
+        logToIdeTerminal('Test run failure: ' + err.toString(), 'error');
+      }}
+    }}
+
+    async function reviewIdeCode() {{
+      const code = document.getElementById('ide-editor').value;
+      logToIdeTerminal('Analyzing AST & generating automated code review...', 'info');
+      try {{
+        const res = await fetch('/api/ide/review', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ code: code }})
+        }});
+        const data = await res.json();
+        logToIdeTerminal('=== AI CODE REVIEW & SECURITY FINDINGS ===', 'warning');
+        logToIdeTerminal(data.review || 'No critical issues detected.', 'info');
+      }} catch(err) {{
+        logToIdeTerminal('Review failure: ' + err.toString(), 'error');
+      }}
+    }}
+
+    function copyIdeCode() {{
+      const code = document.getElementById('ide-editor').value;
+      navigator.clipboard.writeText(code).then(() => {{
+        logToIdeTerminal('Code copied to clipboard.', 'info');
+      }});
+    }}
+
+    function setIdePreset(name) {{
+      const presets = {{
+        'primes': `# Prime Sieve Benchmark\\ndef compute_primes(limit: int):\\n    sieve = [True] * (limit + 1)\\n    sieve[0] = sieve[1] = False\\n    for i in range(2, int(limit**0.5) + 1):\\n        if sieve[i]:\\n            for j in range(i*i, limit + 1, i):\\n                sieve[j] = False\\n    return [i for i, is_prime in enumerate(sieve) if is_prime]\\n\\nif __name__ == "__main__":\\n    import time\\n    t0 = time.perf_counter()\\n    primes = compute_primes(50000)\\n    elapsed = time.perf_counter() - t0\\n    print(f"Computed {{len(primes)}} primes up to 50,000 in {{elapsed*1000:.2f}}ms")`,
+        'matrix': `# 2D Matrix Multiplication\\ndef matrix_multiply(A, B):\\n    rows_A, cols_A = len(A), len(A[0])\\n    rows_B, cols_B = len(B), len(B[0])\\n    assert cols_A == rows_B, "Incompatible dimensions"\\n    C = [[0] * cols_B for _ in range(rows_A)]\\n    for i in range(rows_A):\\n        for j in range(cols_B):\\n            for k in range(cols_A):\\n                C[i][j] += A[i][k] * B[k][j]\\n    return C\\n\\nif __name__ == "__main__":\\n    A = [[1, 2], [3, 4]]\\n    B = [[5, 6], [7, 8]]\\n    print("Matrix A x B =", matrix_multiply(A, B))`,
+        'json_validator': `# JSON Structure Validator\\nimport json\\n\\ndef validate_record(rec_str: str) -> bool:\\n    data = json.loads(rec_str)\\n    required = {{"id", "name", "role", "active"}}\\n    return required.issubset(data.keys()) and isinstance(data["active"], bool)\\n\\nif __name__ == "__main__":\\n    sample = '{{\\"id\\": 101, \\"name\\": \\"Ali\\", \\"role\\": \\"Architect\\", \\"active\\": true}}'\\n    print("Validation passed:", validate_record(sample))`,
+        'crypto': `# Secure Token Generator\\nimport secrets\\nimport hashlib\\n\\ndef make_secure_credentials():\\n    raw_token = secrets.token_hex(16)\\n    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()\\n    return raw_token, token_hash\\n\\nif __name__ == "__main__":\\n    tok, h = make_secure_credentials()\\n    print(f"Generated Token: {{tok}}")\\n    print(f"SHA-256 Hash:   {{h}}")`
+      }};
+      if (presets[name]) {{
+        document.getElementById('ide-editor').value = presets[name];
+        logToIdeTerminal(`Loaded preset: ${{name}}`, 'info');
+      }}
+    }}
+
+    /* --- GENERAL FEATURES & TABS --- */
     async function loadFeatures() {{
       try {{
         const res = await fetch('/api/features');
@@ -509,7 +769,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
           `;
           item.onclick = () => {{
             switchTab('runner');
-            document.querySelectorAll('.tab-btn')[1].classList.add('active');
+            document.querySelectorAll('.tab-btn')[2].classList.add('active');
             document.querySelectorAll('.tab-btn')[0].classList.remove('active');
             document.getElementById('runner-feature-select').value = f.key;
             populateFeaturePayload();
@@ -538,7 +798,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
         "data_analysis": {{"numbers": [12, 45, 67, 89, 23, 56, 78, 90]}},
         "trend_forecasting": {{"values": [10, 15, 20, 25, 30], "horizon": 3}},
         "unit_test_generator": {{"code": "def add(a, b): return a + b"}},
-        "ast_static_analyzer": {{"code": "import os\ndef test(): pass"}},
+        "ast_static_analyzer": {{"code": "import os\\ndef test(): pass"}},
         "threat_modeling": {{"architecture": "User -> API Gateway -> Auth Service -> PostgreSQL"}},
         "natural_language_understanding": {{"text": "Analyze system performance"}}
       }};

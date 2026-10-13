@@ -351,7 +351,84 @@ class SovereignMeshTests(unittest.TestCase):
         self.assertEqual(stats["treasury_balance_usd"], 300.0)
         self.assertEqual(stats["commercial_revenue_pool_usd"], 0.0)
 
+    def test_server_web_studio_and_api_endpoints(self):
+        import threading
+        import urllib.request
+        from http.server import ThreadingHTTPServer
+        from sovereign_mesh.server import make_handler
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(self.grid, None))
+        host, port = httpd.server_address
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        base = f"http://{host}:{port}"
+        try:
+            # 1. Test GET / (Web Studio HTML)
+            with urllib.request.urlopen(f"{base}/", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                html_text = resp.read().decode("utf-8")
+                self.assertIn("NEXUS Sovereign Studio", html_text)
+                self.assertIn("Direct Feature Execution Studio", html_text)
+
+            # 2. Test GET /api/features (130 features catalog)
+            with urllib.request.urlopen(f"{base}/api/features", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                feats = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(len(feats), 130)
+
+            # 3. Test POST /api/run (direct feature execution)
+            req = urllib.request.Request(
+                f"{base}/api/run",
+                data=json.dumps({"feature": "data_analysis", "payload": {"numbers": [10, 20, 30]}}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                run_res = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(run_res.get("status"), "OK")
+                self.assertEqual(run_res.get("mean"), 20.0)
+
+            # 4. Test POST /api/chat with slash command
+            req = urllib.request.Request(
+                f"{base}/api/chat",
+                data=json.dumps({"prompt": "/status_grid"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                chat_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(chat_res.get("ok"))
+                self.assertIn("SOVEREIGN MESH OVERVIEW", chat_res.get("reply", ""))
+
+            # 5. Test POST /api/ide/execute (Isolated Subprocess Python Sandbox)
+            req = urllib.request.Request(
+                f"{base}/api/ide/execute",
+                data=json.dumps({"code": "print('SANDBOX_TEST_OK_123')"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                ide_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(ide_res.get("ok"))
+                self.assertEqual(ide_res.get("returncode"), 0)
+                self.assertIn("SANDBOX_TEST_OK_123", ide_res.get("stdout", ""))
+
+            # 6. Test POST /api/ide/execute syntax validation
+            req = urllib.request.Request(
+                f"{base}/api/ide/execute",
+                data=json.dumps({"code": "def broken_syntax("}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                syntax_res = json.loads(resp.read().decode("utf-8"))
+                self.assertFalse(syntax_res.get("ok"))
+                self.assertFalse(syntax_res.get("compile", {}).get("ok"))
+        finally:
+            httpd.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
