@@ -63,7 +63,7 @@ class UltimateAgiSovereignGrid:
         self.scheduler = Scheduler()
         self.approvals = ApprovalQueue()
         self.triggers = TriggerEngine()
-        self.hub = MasterHubCoordinator(self.ledger, config.peer_shared_secret or "sovereign-hub-default-secret")
+        self.hub = MasterHubCoordinator(self.ledger, grid=self, state_path=self.data_dir / "hub_workers.json")
 
         nodes = [ModelNode(m["name"], m["role"], m["model"]) for m in config.mesh]
         self.router = ModelRouter(nodes, backend or OllamaBackend(config.ollama_url), self.budget,
@@ -530,8 +530,9 @@ class UltimateAgiSovereignGrid:
                 return {"tele_response": "❌ Usage: /register_worker <worker_id> [url]"}
             try:
                 rec = self.hub.register_worker(wid, payload.get("url", "local"))
-                return {"tele_response": f"✅ Worker registered: {rec.worker_id} (Initial stake: {rec.credits} credits)"}
-            except PermissionError as exc:
+                return {"tele_response": f"✅ Worker registered: {rec.worker_id} (Initial stake: {rec.credits} credits)",
+                        "worker_key": rec.key}
+            except (PermissionError, ValueError) as exc:
                 return {"tele_response": f"❌ {exc}"}
 
         if intent == "/dispatch_worker":
@@ -543,16 +544,18 @@ class UltimateAgiSovereignGrid:
             if not wid or not fkey:
                 return {"tele_response": "❌ Usage: /dispatch_worker <worker_id> <feature_key> <text_or_json>"}
             try:
-                signed_task = self.hub.create_signed_task(wid, fkey, task_payload)
-                worker_node = LightweightWorkerNode(
-                    wid, self.config.peer_shared_secret or "sovereign-hub-default-secret", self
-                )
-                response_packet = worker_node.execute_signed_task(signed_task)
-                settlement = self.hub.verify_and_settle(response_packet)
+                wrec = self.hub.get_worker(wid)
+                if wrec and wrec.url != "local":
+                    settlement = self.hub.dispatch_remote(wid, fkey, task_payload)
+                else:
+                    signed_task = self.hub.create_signed_task(wid, fkey, task_payload)
+                    worker_node = LightweightWorkerNode(wid, self.hub.worker_key(wid), self)
+                    response_packet = worker_node.execute_signed_task(signed_task)
+                    settlement = self.hub.verify_and_settle(response_packet)
                 return {"tele_response": f"⚡ HUB-AND-SPOKE SETTLEMENT [{settlement['status']}]:\n"
                                          f"{json.dumps(settlement, indent=1, default=str)[:3500]}",
                         "settlement": settlement}
-            except (KeyError, PermissionError) as exc:
+            except (KeyError, PermissionError, ValueError) as exc:
                 return {"tele_response": f"❌ Dispatch rejected: {exc}"}
 
         if intent == "/kill_switch":

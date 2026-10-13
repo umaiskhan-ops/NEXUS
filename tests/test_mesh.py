@@ -214,15 +214,31 @@ class SovereignMeshTests(unittest.TestCase):
             self.grid.hub.create_signed_task("spoke-beta", "emergency_override", {})
 
     def test_hub_slashing_logic_on_tampered_worker_proof(self):
-        self.grid.hub.register_worker("spoke-rogue", initial_credits=250)
+        from sovereign_mesh.hub_spoke import compute_hmac
+
+        rec = self.grid.hub.register_worker("spoke-rogue", initial_credits=250)
         task = self.grid.hub.create_signed_task("spoke-rogue", "data_analysis", {"numbers": [1, 2, 3]})
 
-        # Rogue worker modifies output or returns corrupted proof
-        forged_packet = {
+        # 1. Invalid HMAC proof (unattributable network garbage) is REJECTED without burning honest credits
+        bad_sig_packet = {
             "task_id": task["task_id"],
             "worker_id": "spoke-rogue",
             "result": {"status": "OK", "mean": 999999.0},
             "worker_proof": "tampered_hmac_proof_string",
+        }
+        rejected = self.grid.hub.verify_and_settle(bad_sig_packet)
+        self.assertEqual(rejected["status"], "REJECTED")
+
+        # 2. Rogue worker modifies output and signs it with its valid worker key -> Spot-check catches & SLASHES
+        forged_result = {"status": "OK", "mean": 999999.0}
+        forged_packet = {
+            "task_id": task["task_id"],
+            "worker_id": "spoke-rogue",
+            "result": forged_result,
+            "worker_proof": compute_hmac(rec.key, {
+                "task_id": task["task_id"], "worker_id": "spoke-rogue",
+                "feature": task["feature"], "nonce": task["nonce"], "result": forged_result,
+            }),
         }
         slashed = self.grid.hub.verify_and_settle(forged_packet)
         self.assertEqual(slashed["status"], "SLASHED")

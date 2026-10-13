@@ -72,15 +72,17 @@ def cmd_repl(_args) -> int:
 
 def cmd_worker(_args) -> int:
     """Lightweight stateless Spoke Worker Node HTTP server."""
+    import hashlib
     import os
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from .hub_spoke import LightweightWorkerNode
 
     worker_id = os.environ.get("WORKER_ID", f"spoke-{secrets.token_hex(3)}")
-    secret = os.environ.get("PEER_SHARED_SECRET", "sovereign-hub-default-secret")
+    raw_key = os.environ.get("WORKER_KEY") or os.environ.get("PEER_SHARED_SECRET", "sovereign-hub-default-secret")
+    worker_key = raw_key if len(raw_key) >= 32 else hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
     port = int(os.environ.get("WORKER_PORT", "8444"))
     grid = _grid_from_env()
-    worker = LightweightWorkerNode(worker_id, secret, grid)
+    worker = LightweightWorkerNode(worker_id, worker_key, grid)
 
     class WorkerHandler(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802
@@ -107,7 +109,7 @@ def cmd_selftest(_args) -> int:
     from .config import GridConfig
     from .features import SPEC_COUNTS, Block
     from .grid import UltimateAgiSovereignGrid
-    from .hub_spoke import LightweightWorkerNode
+    from .hub_spoke import LightweightWorkerNode, compute_hmac
     from .security import hash_passphrase
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -123,15 +125,23 @@ def cmd_selftest(_args) -> int:
         deadlock = grid.run_feature(1, "dependency_deadlock_detector", {})
 
         # Verify Hub-and-Spoke Signing & Slashing
-        grid.hub.register_worker("worker-honest", initial_credits=100)
-        grid.hub.register_worker("worker-rogue", initial_credits=100)
-        w_honest = LightweightWorkerNode("worker-honest", "test-hub-secret", grid)
+        rec_honest = grid.hub.register_worker("worker-honest", initial_credits=100)
+        rec_rogue = grid.hub.register_worker("worker-rogue", initial_credits=100)
+        w_honest = LightweightWorkerNode("worker-honest", rec_honest.key, grid)
         t1 = grid.hub.create_signed_task("worker-honest", "data_analysis", {"numbers": [10, 20, 30]})
         s1 = grid.hub.verify_and_settle(w_honest.execute_signed_task(t1))
 
         t2 = grid.hub.create_signed_task("worker-rogue", "data_analysis", {"numbers": [1, 2, 3]})
-        tampered_resp = {"task_id": t2["task_id"], "worker_id": "worker-rogue",
-                         "result": {"status": "OK", "mean": 999999}, "worker_proof": "forged_hash_000"}
+        forged_result = {"status": "OK", "mean": 999999}
+        tampered_resp = {
+            "task_id": t2["task_id"],
+            "worker_id": "worker-rogue",
+            "result": forged_result,
+            "worker_proof": compute_hmac(rec_rogue.key, {
+                "task_id": t2["task_id"], "worker_id": "worker-rogue",
+                "feature": t2["feature"], "nonce": t2["nonce"], "result": forged_result,
+            }),
+        }
         s2 = grid.hub.verify_and_settle(tampered_resp)
         hub_ok = (s1["status"] == "SETTLED" and s1["total_credits"] == 125 and
                   s2["status"] == "SLASHED" and s2["remaining_credits"] == 0)
