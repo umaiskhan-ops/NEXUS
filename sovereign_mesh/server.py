@@ -1,4 +1,4 @@
-"""HTTP server: Telegram webhook, health check, token-protected dashboard/API, HMAC-authenticated peer endpoint."""
+"""HTTP server: Web Studio UI, REST API, Telegram webhook, health check, token-protected dashboard, HMAC-authenticated peer endpoint."""
 from __future__ import annotations
 
 import hmac
@@ -7,8 +7,10 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
-from .telegram_gateway import TelegramClient, handle_update
+from .telegram_gateway import TelegramClient, handle_update, parse_command
+from .web_ui import get_web_ui_html
 
 MAX_BODY = 1_000_000
 
@@ -32,25 +34,36 @@ def make_handler(grid, client):
             self.end_headers()
             self.wfile.write(data)
 
-        def _bearer_ok(self) -> bool:
+        def _auth_ok(self) -> bool:
             if not cfg.dashboard_token:
-                return False
+                return True
             supplied = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-            return hmac.compare_digest(supplied, cfg.dashboard_token)
+            if not supplied and "?" in self.path:
+                qs = parse_qs(urlparse(self.path).query)
+                supplied = qs.get("token", [""])[0]
+            return bool(supplied and hmac.compare_digest(supplied, cfg.dashboard_token))
 
         def do_GET(self):  # noqa: N802
             path = self.path.split("?", 1)[0]
+            if path in {"/", "/chat"}:
+                page = get_web_ui_html(grid.node_id, [n.to_dict() for n in grid.router.nodes], grid.registry.counts())
+                return self._send(200, page, "text/html; charset=utf-8")
+            if path == "/api/features":
+                return self._send(200, [f.to_dict() for f in grid.registry.all()])
             if path == "/healthz":
                 return self._send(200, {"ok": True, "node": grid.node_id, "lockdown": grid.system_lockdown})
             if path == "/p2p/head":
                 return self._p2p_head()
             if path in {"/dashboard", "/api/status"}:
-                if not self._bearer_ok():
+                if not self._auth_ok():
                     return self._send(401, {"error": "unauthorized"})
+                workers_data = [w.to_dict() for w in grid.hub.workers] if getattr(grid, "hub", None) else []
                 status = {
                     "node_id": grid.node_id, "uptime_s": int(time.time() - grid.started_at),
                     "lockdown": grid.system_lockdown, "autonomous": grid.autonomous_mode,
-                    "nodes": [n.to_dict() for n in grid.router.nodes], "features": grid.registry.counts(),
+                    "nodes": [n.to_dict() for n in grid.router.nodes],
+                    "workers": workers_data,
+                    "features": grid.registry.counts(),
                     "feature_kinds": grid.registry.kind_counts(), "ledger_blocks": len(grid.ledger),
                     "ledger_intact": grid.ledger.verify()[0], "alerts": grid.check_alerts(),
                     "tasks": [t.to_dict() for t in grid.tasks.list()][-20:], "budget": grid.budget.status(),
@@ -78,20 +91,66 @@ def make_handler(grid, client):
                                     "head_hash": grid.ledger.head_hash})
 
         def do_POST(self):  # noqa: N802
-            if self.path.split("?", 1)[0] != "/telegram/webhook":
-                return self._send(404, {"error": "not found"})
-            supplied = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if not cfg.webhook_secret or not hmac.compare_digest(supplied, cfg.webhook_secret):
-                return self._send(401, {"error": "unauthorized"})
-            length = int(self.headers.get("Content-Length", "0") or 0)
-            if length <= 0 or length > MAX_BODY:
-                return self._send(413, {"error": "bad length"})
-            try:
-                update = json.loads(self.rfile.read(length))
-            except ValueError:
-                return self._send(400, {"error": "bad json"})
-            self._send(200, {"ok": True})  # ack fast; Telegram retries slow webhooks
-            threading.Thread(target=self._process, args=(update,), daemon=True).start()
+            path = self.path.split("?", 1)[0]
+            if path == "/telegram/webhook":
+                supplied = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+                if not cfg.webhook_secret or not hmac.compare_digest(supplied, cfg.webhook_secret):
+                    return self._send(401, {"error": "unauthorized"})
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > MAX_BODY:
+                    return self._send(413, {"error": "bad length"})
+                try:
+                    update = json.loads(self.rfile.read(length))
+                except ValueError:
+                    return self._send(400, {"error": "bad json"})
+                self._send(200, {"ok": True})  # ack fast; Telegram retries slow webhooks
+                threading.Thread(target=self._process, args=(update,), daemon=True).start()
+                return
+
+            if path in {"/api/chat", "/api/run"}:
+                if not self._auth_ok():
+                    return self._send(401, {"error": "unauthorized"})
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > MAX_BODY:
+                    return self._send(413, {"error": "bad length"})
+                try:
+                    body = json.loads(self.rfile.read(length))
+                except ValueError:
+                    return self._send(400, {"error": "bad json"})
+
+                if path == "/api/run":
+                    feature_key = body.get("feature", "")
+                    payload = body.get("payload", {})
+                    if not feature_key:
+                        return self._send(400, {"error": "feature is required"})
+                    res = grid.run_feature(grid.owner_tg_id, feature_key, payload)
+                    return self._send(200, res)
+
+                # /api/chat
+                prompt = body.get("prompt", "").strip()
+                if not prompt:
+                    return self._send(400, {"error": "prompt is required"})
+                if prompt.startswith("/"):
+                    intent, p_load, passph = parse_command(prompt)
+                    res = grid.process_telegram_inbound_signal(grid.owner_tg_id, intent, p_load, passph)
+                    return self._send(200, {"ok": True, "reply": res.get("tele_response"), "result": res})
+
+                feature = body.get("feature")
+                if feature:
+                    res = grid.run_feature(grid.owner_tg_id, feature, body.get("payload") or {"prompt": prompt})
+                    return self._send(200, {"ok": True, "feature": feature, "result": res})
+
+                # Try LLM ask, fall back to NLU
+                try:
+                    ask_res = grid.router.ask(prompt, system="You are the Sovereign Mesh AGI assistant. Answer helpfully, accurately, and concisely.")
+                    return self._send(200, {"ok": True, "reply": ask_res.get("text"), "model": ask_res.get("model"),
+                                            "latency_s": ask_res.get("latency_s")})
+                except Exception as exc:
+                    nlu_res = grid.run_feature(grid.owner_tg_id, "natural_language_understanding", {"text": prompt})
+                    return self._send(200, {"ok": True, "reply": str(nlu_res.get("output") or nlu_res.get("intent") or nlu_res),
+                                            "result": nlu_res, "backend_note": str(exc)[:200]})
+
+            return self._send(404, {"error": "not found"})
 
         @staticmethod
         def _process(update):
@@ -105,16 +164,15 @@ def make_handler(grid, client):
 
 def serve(grid) -> None:
     cfg = grid.config
-    if not cfg.webhook_secret:
-        raise SystemExit("TELEGRAM_WEBHOOK_SECRET is required in webhook mode")
     client = TelegramClient(cfg.telegram_bot_token) if cfg.telegram_bot_token else None
     if client:
         grid.notifier = lambda text: client.send_message(cfg.owner_telegram_id, text)
-        if cfg.public_webhook_url:
+        if cfg.public_webhook_url and cfg.webhook_secret:
             res = client.set_webhook(cfg.public_webhook_url.rstrip("/") + "/telegram/webhook", cfg.webhook_secret)
             print(f"[TELEGRAM] setWebhook -> {res.get('ok')} {res.get('description', '')}")
     httpd = ThreadingHTTPServer((cfg.host, cfg.port), make_handler(grid, client))
     grid.start()
     threading.Thread(target=lambda: (grid.shutdown_event.wait(), httpd.shutdown()), daemon=True).start()
-    print(f"[HTTP] listening on {cfg.host}:{cfg.port}")
+    print(f"[HTTP] NEXUS Sovereign Mesh listening on http://{cfg.host}:{cfg.port}")
     httpd.serve_forever()
+

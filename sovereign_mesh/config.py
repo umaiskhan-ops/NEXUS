@@ -38,6 +38,8 @@ class GridConfig:
     host: str = "0.0.0.0"
     port: int = 8443
     ollama_url: str = "http://localhost:11434"
+    llm_api_key: str = ""
+    llm_base_url: str = ""
     llm_timeout_s: float = 120.0
     mesh: List[dict] = field(default_factory=lambda: [dict(m) for m in DEFAULT_MESH])
     data_dir: Path = Path("./data")
@@ -48,8 +50,20 @@ class GridConfig:
     token_budget: int = 500_000
 
     @classmethod
-    def from_env(cls) -> "GridConfig":
+    def from_env(cls, env_path: Optional[Path] = None) -> "GridConfig":
         from .security import hash_passphrase
+
+        p = env_path or Path(".env")
+        if p.exists():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                v = v.strip().strip("'").strip('"')
+                if k and k not in os.environ:
+                    os.environ[k] = v
 
         owner = os.environ.get("OWNER_TELEGRAM_ID", "").strip()
         if not owner.lstrip("-").isdigit():
@@ -91,6 +105,10 @@ class GridConfig:
             host=os.environ.get("HOST", "0.0.0.0"),
             port=int(os.environ.get("PORT", "8443")),
             ollama_url=os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+            llm_api_key=(os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+                         or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GROQ_API_KEY") or "").strip(),
+            llm_base_url=(os.environ.get("LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
+                          or "https://openrouter.ai/api/v1").strip(),
             llm_timeout_s=float(os.environ.get("LLM_TIMEOUT_S", "120")),
             mesh=mesh,
             data_dir=Path(os.environ.get("DATA_DIR", "./data")),

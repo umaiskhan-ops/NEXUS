@@ -90,6 +90,10 @@ class WorkerNodeRecord:
     rejected_packets: int = 0
     registered_at: float = field(default_factory=time.time)
     slashed_reason: str = ""
+    payout_address: str = ""
+    total_payout_earned: float = 0.0
+    pending_payout: float = 0.0
+    epoch_tasks_verified: int = 0
 
     def to_dict(self, include_key: bool = False) -> dict:
         d = dataclasses.asdict(self)
@@ -110,21 +114,43 @@ class MasterHubCoordinator:
         self._path = state_path
         self._workers: Dict[str, WorkerNodeRecord] = {}
         self._pending: Dict[str, dict] = {}
+        self.commercial_revenue_pool: float = 0.0
+        self.treasury_balance: float = 0.0
+        self.current_epoch: int = 1
         self._lock = threading.RLock()
         self._load()
 
     # -- persistence
     def _load(self) -> None:
         if self._path and self._path.exists():
-            for d in json.loads(self._path.read_text(encoding="utf-8")):
-                self._workers[d["worker_id"]] = WorkerNodeRecord(**d)
+            try:
+                data = json.loads(self._path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self.commercial_revenue_pool = float(data.get("commercial_revenue_pool", 0.0))
+                    self.treasury_balance = float(data.get("treasury_balance", 0.0))
+                    self.current_epoch = int(data.get("current_epoch", 1))
+                    workers_data = data.get("workers", [])
+                else:
+                    workers_data = data
+                valid_fields = {f.name for f in dataclasses.fields(WorkerNodeRecord)}
+                for d in workers_data:
+                    filtered = {k: v for k, v in d.items() if k in valid_fields}
+                    self._workers[d["worker_id"]] = WorkerNodeRecord(**filtered)
+            except Exception:
+                pass
 
     def _flush(self) -> None:
         if not self._path:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps([w.to_dict(include_key=True) for w in self._workers.values()]), encoding="utf-8")
+        payload = {
+            "commercial_revenue_pool": self.commercial_revenue_pool,
+            "treasury_balance": self.treasury_balance,
+            "current_epoch": self.current_epoch,
+            "workers": [w.to_dict(include_key=True) for w in self._workers.values()],
+        }
+        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
         tmp.replace(self._path)
         try:
             os.chmod(self._path, 0o600)
@@ -217,6 +243,7 @@ class MasterHubCoordinator:
             worker.credits += self.reward_per_task
             worker.tasks_completed += 1
             worker.tasks_verified += int(verified)
+            worker.epoch_tasks_verified += int(verified)
             self._flush()
             block = self.ledger.append("worker_task_settled", {
                 "task_id": task_id, "worker_id": worker_id, "feature": task["feature"], "verified": verified,
@@ -228,6 +255,8 @@ class MasterHubCoordinator:
     def _slash(self, worker: WorkerNodeRecord, reason: str) -> dict:
         burned, worker.credits = worker.credits, 0
         worker.burned_credits += burned
+        worker.pending_payout = 0.0  # Slashed workers forfeit pending payouts
+        worker.epoch_tasks_verified = 0
         worker.status = "SLASHED"
         worker.slashed_reason = reason
         self._flush()
@@ -235,6 +264,167 @@ class MasterHubCoordinator:
                                                       "burned_credits": burned})
         return {"status": "SLASHED", "worker_id": worker.worker_id, "reason": reason, "burned_credits": burned,
                 "remaining_credits": 0, "ledger_block": block["hash"][:16]}
+
+    # -- Model 1: Compute Barter & Credit Economy
+    def spend_credits(self, worker_id: str, amount: int, reason: str = "compute_task") -> dict:
+        if amount <= 0:
+            raise ValueError("Amount to spend must be positive")
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if not worker:
+                raise KeyError(f"Unknown worker node {worker_id!r}")
+            if worker.status == "SLASHED":
+                raise PermissionError(f"Worker {worker_id!r} is SLASHED and cannot spend credits")
+            if worker.credits < amount:
+                return {"status": "INSUFFICIENT_CREDITS", "worker_id": worker_id,
+                        "balance": worker.credits, "required": amount,
+                        "error": (f"Insufficient credits (balance: {worker.credits}, required: {amount}). "
+                                  f"Run worker node to execute network tasks and earn compute credits!")}
+            worker.credits -= amount
+            self._flush()
+            block = self.ledger.append("credits_spent", {
+                "worker_id": worker_id, "amount": amount, "reason": reason, "remaining": worker.credits})
+            return {"status": "SPENT", "worker_id": worker_id, "amount": amount,
+                    "remaining_credits": worker.credits, "reason": reason,
+                    "ledger_block": block["hash"][:16]}
+
+    def transfer_credits(self, from_worker: str, to_worker: str, amount: int) -> dict:
+        if amount <= 0:
+            raise ValueError("Transfer amount must be positive")
+        if from_worker == to_worker:
+            raise ValueError("Cannot transfer credits to self")
+        with self._lock:
+            w_from = self._workers.get(from_worker)
+            w_to = self._workers.get(to_worker)
+            if not w_from:
+                raise KeyError(f"Sender worker {from_worker!r} not found")
+            if not w_to:
+                raise KeyError(f"Recipient worker {to_worker!r} not found")
+            if w_from.status == "SLASHED" or w_to.status == "SLASHED":
+                raise PermissionError("Slashed nodes cannot transfer or receive credits")
+            if w_from.credits < amount:
+                return {"status": "INSUFFICIENT_CREDITS", "worker_id": from_worker,
+                        "balance": w_from.credits, "required": amount}
+            w_from.credits -= amount
+            w_to.credits += amount
+            self._flush()
+            block = self.ledger.append("credits_transferred", {
+                "from_worker": from_worker, "to_worker": to_worker, "amount": amount,
+                "from_balance": w_from.credits, "to_balance": w_to.credits})
+            return {"status": "TRANSFERRED", "from_worker": from_worker, "to_worker": to_worker,
+                    "amount": amount, "from_balance": w_from.credits, "to_balance": w_to.credits,
+                    "ledger_block": block["hash"][:16]}
+
+    def get_balance(self, worker_id: str) -> dict:
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if not worker:
+                raise KeyError(f"Unknown worker node {worker_id!r}")
+            tier_name = "COMMUNITY"
+            if worker.credits >= 200:
+                tier_name = "SOVEREIGN_VIP"
+            elif worker.credits >= 50:
+                tier_name = "PRO"
+            return {
+                "worker_id": worker.worker_id,
+                "status": worker.status,
+                "credits": worker.credits,
+                "tier": tier_name,
+                "tasks_completed": worker.tasks_completed,
+                "tasks_verified": worker.tasks_verified,
+                "pending_payout_usd": worker.pending_payout,
+                "total_payout_earned_usd": worker.total_payout_earned,
+                "payout_address": worker.payout_address or "NOT_SET",
+            }
+
+    # -- Model 3: Enterprise Revenue Share & Payout Settlement
+    def set_payout_address(self, worker_id: str, address: str) -> dict:
+        address = str(address).strip()
+        if not address:
+            raise ValueError("Payout address cannot be empty")
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if not worker:
+                raise KeyError(f"Unknown worker node {worker_id!r}")
+            worker.payout_address = address
+            self._flush()
+            self.ledger.append("worker_payout_address_updated", {"worker_id": worker_id, "address": address})
+            return {"status": "UPDATED", "worker_id": worker_id, "payout_address": address}
+
+    def deposit_commercial_revenue(self, amount_usd: float, client_name: str, job_id: str = "") -> dict:
+        if amount_usd <= 0:
+            raise ValueError("Deposit amount must be positive")
+        with self._lock:
+            self.commercial_revenue_pool = round(self.commercial_revenue_pool + amount_usd, 2)
+            block = self.ledger.append("commercial_revenue_deposit", {
+                "client": client_name, "amount_usd": amount_usd, "job_id": job_id,
+                "pool_balance": self.commercial_revenue_pool})
+            self._flush()
+            return {"status": "DEPOSITED", "client": client_name, "amount_usd": amount_usd,
+                    "commercial_revenue_pool_usd": self.commercial_revenue_pool,
+                    "ledger_block": block["hash"][:16]}
+
+    def settle_epoch_revenue_split(self, split_ratio: float = 0.70) -> dict:
+        with self._lock:
+            pool = self.commercial_revenue_pool
+            if pool <= 0:
+                return {"status": "NO_REVENUE", "message": "Commercial revenue pool is $0.00"}
+            eligible = [w for w in self._workers.values() if w.status == "ACTIVE" and w.epoch_tasks_verified > 0]
+            worker_pot = round(pool * split_ratio, 2)
+            treasury_share = round(pool - worker_pot, 2)
+            self.treasury_balance = round(self.treasury_balance + treasury_share, 2)
+
+            distributions = []
+            total_work = sum(w.epoch_tasks_verified for w in eligible)
+            if total_work > 0:
+                for w in eligible:
+                    share = round((w.epoch_tasks_verified / total_work) * worker_pot, 2)
+                    w.pending_payout = round(w.pending_payout + share, 2)
+                    w.total_payout_earned = round(w.total_payout_earned + share, 2)
+                    distributions.append({
+                        "worker_id": w.worker_id, "epoch_tasks": w.epoch_tasks_verified,
+                        "payout_usd": share, "pending_payout_usd": w.pending_payout,
+                        "payout_address": w.payout_address or "UNSPECIFIED"
+                    })
+                    w.epoch_tasks_verified = 0
+            else:
+                self.treasury_balance = round(self.treasury_balance + worker_pot, 2)
+                treasury_share = round(treasury_share + worker_pot, 2)
+
+            epoch_num = self.current_epoch
+            self.current_epoch += 1
+            self.commercial_revenue_pool = 0.0
+            self._flush()
+
+            block = self.ledger.append("revenue_epoch_settled", {
+                "epoch": epoch_num, "total_pool_usd": pool, "workers_share_usd": worker_pot,
+                "treasury_share_usd": treasury_share, "workers_count": len(distributions),
+                "distributions": distributions})
+            return {
+                "status": "SETTLED", "epoch": epoch_num, "total_revenue_usd": pool,
+                "workers_pool_usd": worker_pot, "treasury_pool_usd": treasury_share,
+                "split_ratio": f"{int(split_ratio * 100)}% workers / {int((1 - split_ratio) * 100)}% treasury",
+                "distributions": distributions, "ledger_block": block["hash"][:16]
+            }
+
+    def payout_stats(self) -> dict:
+        with self._lock:
+            return {
+                "current_epoch": self.current_epoch,
+                "commercial_revenue_pool_usd": self.commercial_revenue_pool,
+                "treasury_balance_usd": self.treasury_balance,
+                "workers": [
+                    {
+                        "worker_id": w.worker_id, "credits": w.credits,
+                        "epoch_tasks_verified": w.epoch_tasks_verified,
+                        "pending_payout_usd": w.pending_payout,
+                        "total_payout_earned_usd": w.total_payout_earned,
+                        "payout_address": w.payout_address or "NOT_SET",
+                        "status": w.status
+                    }
+                    for w in self._workers.values()
+                ]
+            }
 
     def dispatch_remote(self, worker_id: str, feature_key: str, payload: dict, timeout: float = 120.0) -> dict:
         worker = self.get_worker(worker_id)

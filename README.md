@@ -231,3 +231,27 @@ Choose your operational mode:
 - **Brute-Force Lockout**: 5 failed authentication attempts enforce a 15-minute freeze.
 - **Append-Only Ledger**: SHA-256 hash-chaining prevents retroactive history alteration.
 - **Hardware Gates**: Actuators (3D printers, CNCs, robotic arms) cannot execute without Owner signoff.
+
+---
+
+## 4. Decentralized Economic & Incentive Models
+
+The network implements three reciprocal incentive and settlement engines:
+
+### Model 1: Compute Barter Economy
+- Edge nodes earn credits by verifying tasks for the swarm (`worker.credits += reward_per_task`).
+- Nodes can spend their credits (`/spend_credits`, `/barter_task`) to harness the collective supercomputing power of other mesh nodes for heavy multi-model debate, simulations, and code synthesis.
+- Peer-to-peer credit transfers (`/transfer_credits <from> <to> <amount>`) enable cooperative sub-swarms.
+
+### Model 2: Tiered VIP Feature Access
+- **COMMUNITY (Free / 0 credits)**: General-purpose reasoning and discovery tools.
+- **PRO (50+ credits)**: Advanced software engineering, AST static analysis, trend forecasting, and OpenAPI contract synthesis.
+- **SOVEREIGN_VIP (200+ credits or Owner)**: Monte Carlo virtual simulators, multi-agent debate, consensus engines, chaos testing, and hardware actuators.
+
+### Model 3: Enterprise Revenue Share (70/30 Split)
+- Commercial client deposits (`/deposit_revenue <client> <amount_usd>`) fund an active epoch pool.
+- Epoch settlement (`/settle_revenue [split_ratio]`):
+  - **70%** automatically distributed to active honest worker nodes proportional to their verified tasks.
+  - **30%** retained by the network treasury for infrastructure and core development.
+- Slashed/tampered workers forfeit all pending payouts (`pending_payout = 0`).
+- Transparent ledger tracking (`/payout_stats`, `/set_payout <worker_id> <address>`).

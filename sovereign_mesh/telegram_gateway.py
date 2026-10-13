@@ -12,10 +12,12 @@ NLU_SAFE_INTENTS = {"/status_grid", "/tasks", "/features", "/audit"}
 
 
 class TelegramClient:
-    def __init__(self, token: str, timeout: float = 40.0):
+    def __init__(self, token: str, timeout: float = 40.0, base_url: str = ""):
+        import os
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN is required")
-        self._base = f"https://api.telegram.org/bot{token}"
+        root = (base_url or os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org")).rstrip("/")
+        self._base = f"{root}/bot{token}"
         self._timeout = timeout
 
     def call(self, method: str, **params) -> dict:
@@ -101,6 +103,33 @@ def parse_command(text: str) -> Tuple[str, dict, Optional[str]]:
         wid, _, rem = rest.partition(" ")
         fkey, _, body = rem.strip().partition(" ")
         return intent, {"worker_id": wid.strip(), "feature": fkey.strip(), "task_payload": _parse_json_or_text(body)}, None
+    if intent in {"/balance", "/my_tier"}:
+        return intent, {"worker_id": rest.strip()} if rest else {}, None
+    if intent == "/spend_credits":
+        parts = rest.split(None, 2)
+        if len(parts) >= 2:
+            return intent, {"worker_id": parts[0], "amount": int(parts[1]), "reason": parts[2] if len(parts) > 2 else "manual_spend"}, None
+        return intent, {"text": rest}, None
+    if intent == "/transfer_credits":
+        parts = rest.split()
+        if len(parts) >= 3:
+            return intent, {"from_worker": parts[0], "to_worker": parts[1], "amount": int(parts[2])}, None
+        return intent, {"text": rest}, None
+    if intent == "/barter_task":
+        wid, _, rem = rest.partition(" ")
+        fkey, _, body = rem.strip().partition(" ")
+        return intent, {"worker_id": wid.strip(), "feature": fkey.strip(), "task_payload": _parse_json_or_text(body)}, None
+    if intent == "/set_payout":
+        wid, _, addr = rest.partition(" ")
+        return intent, {"worker_id": wid.strip(), "address": addr.strip()}, None
+    if intent == "/deposit_revenue":
+        parts = rest.split()
+        if len(parts) >= 2:
+            return intent, {"client": parts[0], "amount": float(parts[1]), "job_id": parts[2] if len(parts) > 2 else ""}, None
+        return intent, {"text": rest}, None
+    if intent == "/settle_revenue":
+        ratio = float(rest.strip()) if rest.strip() else 0.70
+        return intent, {"split_ratio": ratio}, None
     return intent, {"text": rest} if rest else {}, None
 
 

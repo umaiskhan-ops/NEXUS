@@ -251,6 +251,106 @@ class SovereignMeshTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.grid.hub.create_signed_task("spoke-rogue", "data_analysis", {"numbers": [1, 2]})
 
+    def test_model_1_compute_barter_credit_economy(self):
+        # Register workers
+        w1 = self.grid.hub.register_worker("barter-alice", initial_credits=100)
+        w2 = self.grid.hub.register_worker("barter-bob", initial_credits=20)
+
+        # Alice spends 30 credits
+        res_spend = self.grid.hub.spend_credits("barter-alice", 30, reason="test_compute")
+        self.assertEqual(res_spend["status"], "SPENT")
+        self.assertEqual(res_spend["remaining_credits"], 70)
+
+        # Bob tries to spend 50 credits -> INSUFFICIENT_CREDITS
+        res_fail = self.grid.hub.spend_credits("barter-bob", 50, reason="test_heavy")
+        self.assertEqual(res_fail["status"], "INSUFFICIENT_CREDITS")
+
+        # Alice transfers 40 credits to Bob
+        res_tx = self.grid.hub.transfer_credits("barter-alice", "barter-bob", 40)
+        self.assertEqual(res_tx["status"], "TRANSFERRED")
+        self.assertEqual(res_tx["from_balance"], 30)
+        self.assertEqual(res_tx["to_balance"], 60)
+
+        # Barter task execution via telegram gateway
+        resp = self.grid.process_telegram_inbound_signal(
+            self.grid.owner_tg_id, "/barter_task",
+            {"worker_id": "barter-bob", "feature": "data_analysis", "task_payload": {"numbers": [1, 2, 3]}}
+        )
+        self.assertEqual(resp["barter"]["status"], "SPENT")
+        self.assertEqual(resp["barter"]["remaining_credits"], 40)
+
+    def test_model_2_tiered_vip_feature_access(self):
+        from sovereign_mesh.features.registry import FeatureTier
+
+        # 1. Tier counts check
+        counts = self.grid.registry.tier_counts()
+        self.assertGreater(counts[FeatureTier.COMMUNITY.value], 0)
+        self.assertGreater(counts[FeatureTier.PRO.value], 0)
+        self.assertGreater(counts[FeatureTier.SOVEREIGN_VIP.value], 0)
+
+        # 2. Telegram /tiers overview
+        tiers_resp = self.grid.process_telegram_inbound_signal(self.grid.owner_tg_id, "/tiers")
+        self.assertIn("SYSTEM ACCESS TIERS", tiers_resp["tele_response"])
+
+        # 3. Non-owner with 0 credits tries to run a PRO feature -> TIER_LOCKED
+        from sovereign_mesh.security import Role
+        self.grid.access.grant(999999, Role.OPERATOR)
+        self.grid.hub.register_worker("tier-novice", initial_credits=0)
+        locked_res = self.grid.run_feature(
+            999999, "data_analysis", {"as_worker": "tier-novice", "numbers": [1, 2, 3]}
+        )
+        self.assertEqual(locked_res["status"], "TIER_LOCKED")
+        self.assertEqual(locked_res["tier_required"], "PRO")
+
+        # 4. Worker with 50+ credits runs PRO feature successfully
+        self.grid.hub.register_worker("tier-pro-user", initial_credits=60)
+        unlocked_res = self.grid.run_feature(
+            999999, "data_analysis", {"as_worker": "tier-pro-user", "numbers": [10, 20]}
+        )
+        self.assertEqual(unlocked_res["status"], "OK")
+
+        # 5. Owner has unconditional access to all tiers
+        owner_res = self.grid.run_feature(
+            self.grid.owner_tg_id, "data_analysis", {"numbers": [10, 20]}
+        )
+        self.assertEqual(owner_res["status"], "OK")
+
+    def test_model_3_commercial_revenue_sharing_and_payouts(self):
+        from sovereign_mesh.hub_spoke import LightweightWorkerNode
+
+        # Register workers & set payout addresses
+        rec = self.grid.hub.register_worker("commercial-miner", initial_credits=50)
+        self.grid.hub.set_payout_address("commercial-miner", "paypal:miner@nexus.network")
+
+        # Worker performs a verified task
+        w_node = LightweightWorkerNode("commercial-miner", rec.key, self.grid)
+        task = self.grid.hub.create_signed_task("commercial-miner", "data_analysis", {"numbers": [2, 4, 6]})
+        settled = self.grid.hub.verify_and_settle(w_node.execute_signed_task(task))
+        self.assertTrue(settled["verified"])
+
+        # Deposit $1000 commercial revenue from Enterprise client
+        dep = self.grid.hub.deposit_commercial_revenue(1000.0, client_name="EnterpriseCorp", job_id="job-101")
+        self.assertEqual(dep["status"], "DEPOSITED")
+        self.assertEqual(dep["commercial_revenue_pool_usd"], 1000.0)
+
+        # Settle revenue epoch: 70% ($700) to workers, 30% ($300) to treasury
+        settle_res = self.grid.hub.settle_epoch_revenue_split(0.70)
+        self.assertEqual(settle_res["status"], "SETTLED")
+        self.assertEqual(settle_res["total_revenue_usd"], 1000.0)
+        self.assertEqual(settle_res["workers_pool_usd"], 700.0)
+        self.assertEqual(settle_res["treasury_pool_usd"], 300.0)
+
+        # Check miner received their pending payout
+        bal = self.grid.hub.get_balance("commercial-miner")
+        self.assertEqual(bal["pending_payout_usd"], 700.0)
+        self.assertEqual(bal["total_payout_earned_usd"], 700.0)
+        self.assertEqual(bal["payout_address"], "paypal:miner@nexus.network")
+
+        # Payout stats overview
+        stats = self.grid.hub.payout_stats()
+        self.assertEqual(stats["treasury_balance_usd"], 300.0)
+        self.assertEqual(stats["commercial_revenue_pool_usd"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

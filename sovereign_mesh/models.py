@@ -52,6 +52,38 @@ class OllamaBackend:
             return []
 
 
+class OpenAICompatibleBackend:
+    """Talks to any OpenAI-compatible API endpoint (OpenRouter, Groq, DeepSeek, Together, vLLM)."""
+
+    def __init__(self, base_url: str, api_key: str):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+
+    def chat(self, model: str, system: str, prompt: str, timeout: float) -> str:
+        messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+        body = json.dumps({"model": model, "messages": messages, "stream": False}).encode("utf-8")
+        url = self.base_url if self.base_url.endswith("/chat/completions") else f"{self.base_url}/chat/completions"
+        req = urllib.request.Request(url, data=body, headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "HTTP-Referer": "https://nexus.sovereign.local",
+            "X-Title": "NEXUS Sovereign Mesh",
+            "User-Agent": "NEXUS-Sovereign-Mesh/2026.4",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
+            raise BackendUnavailable(f"{model}: {exc}") from exc
+        choices = data.get("choices", [])
+        if choices:
+            return choices[0].get("message", {}).get("content", "")
+        return ""
+
+    def list_models(self, timeout: float = 3.0) -> List[str]:
+        return []
+
+
 @dataclass
 class ModelNode:
     name: str

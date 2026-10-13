@@ -21,7 +21,8 @@ from .config import GridConfig
 from .features import Block, FeatureInputError, Kind, build_registry
 from .hub_spoke import LightweightWorkerNode, MasterHubCoordinator
 from .ledger import HashChainLedger
-from .models import BackendUnavailable, LLMBackend, ModelNode, ModelRouter, OllamaBackend
+from .models import (BackendUnavailable, LLMBackend, ModelNode, ModelRouter,
+                     OllamaBackend, OpenAICompatibleBackend)
 from .security import (AccessControl, AuthGuard, ConstitutionalRuleEnforcer, EncryptionLayer, Role,
                        sanitize_payload)
 from .state import (ApprovalQueue, BudgetExceeded, MemoryStore, Scheduler, SnapshotManager, TaskRegistry,
@@ -66,8 +67,12 @@ class UltimateAgiSovereignGrid:
         self.hub = MasterHubCoordinator(self.ledger, grid=self, state_path=self.data_dir / "hub_workers.json")
 
         nodes = [ModelNode(m["name"], m["role"], m["model"]) for m in config.mesh]
-        self.router = ModelRouter(nodes, backend or OllamaBackend(config.ollama_url), self.budget,
-                                  config.llm_timeout_s)
+        if backend is None:
+            if config.llm_api_key:
+                backend = OpenAICompatibleBackend(config.llm_base_url or "https://openrouter.ai/api/v1", config.llm_api_key)
+            else:
+                backend = OllamaBackend(config.ollama_url)
+        self.router = ModelRouter(nodes, backend, self.budget, config.llm_timeout_s)
         self.registry = build_registry()
         self.adapters: Dict[str, Callable[[Any, dict], dict]] = {}
 
@@ -352,6 +357,18 @@ class UltimateAgiSovereignGrid:
         # 2. access control
         if not self.access.allows(sender_id, feature.min_role):
             return finish({"status": "DENIED", "error": f"requires role {feature.min_role.name}"})
+        # 2b. Tier access check (Model 2: VIP Feature Access)
+        if not approved and sender_id != self.owner_tg_id:
+            caller_worker_id = payload.get("as_worker") or payload.get("worker_id")
+            caller_credits = 0
+            if caller_worker_id and self.hub:
+                rec = self.hub.get_worker(caller_worker_id)
+                if rec and rec.status == "ACTIVE":
+                    caller_credits = rec.credits
+            ok_tier, reason = self.registry.check_tier_access(feature.key, caller_credits, is_owner=False)
+            if not ok_tier:
+                return finish({"status": "TIER_LOCKED", "tier_required": feature.tier.value,
+                               "credits": caller_credits, "error": reason})
         # 3. passphrase gate
         if feature.key in PASSPHRASE_FEATURES and not approved:
             ok, reason = self.auth.verify(passphrase)
@@ -386,7 +403,7 @@ class UltimateAgiSovereignGrid:
             result = {"status": "ERROR", "error": f"bad input: {exc}"}
         except (BackendUnavailable, BudgetExceeded) as exc:
             result = {"status": "ERROR", "error": str(exc)[:500],
-                      "hint": "Is Ollama running and are the models pulled? See README."}
+                       "hint": "Is Ollama running and are the models pulled? See README."}
         except Exception as exc:  # noqa: BLE001 - a broken feature must never crash the node
             result = {"status": "ERROR", "error": f"{type(exc).__name__}: {exc}"[:500]}
         elapsed = time.perf_counter() - t0
@@ -402,10 +419,15 @@ class UltimateAgiSovereignGrid:
         return finish(result)
 
     # ------------------------------------------------------------ Telegram intent gateway
-    HELP = ("Commands:\n/status_grid\n/features [block]\n/run <feature_key> <text | json>\n"
+    HELP = ("Commands:\n/status_grid\n/features [block]\n/tiers\n/my_tier [worker_id]\n"
+            "/run <feature_key> <text | json>\n"
             "/execute_autonomous_task <name> [| json]\n/tasks\n/models\n"
             "/add_model <name> <role> <model_tag>\n/remove_model <name>\n"
             "/workers\n/register_worker <id> [url]\n/dispatch_worker <id> <feature> <payload>\n"
+            "/balance <worker_id>\n/spend_credits <worker_id> <amount> [reason]\n"
+            "/transfer_credits <from> <to> <amount>\n/barter_task <worker_id> <feature> <payload>\n"
+            "/set_payout <worker_id> <address>\n/deposit_revenue <client> <amount> [job_id]\n"
+            "/settle_revenue [split_ratio]\n/payout_stats\n"
             "/approve <id> | /reject <id>\n/audit\n"
             "/kill_switch [reason]\n/shutdown\n/federal_veto <task_id|ALL> <passphrase>\n"
             "/emergency_override <passphrase>")
@@ -453,6 +475,19 @@ class UltimateAgiSovereignGrid:
                 lines += [f"  {f.key} ({f.kind.value})" for f in feats] if block else []
             return {"tele_response": f"Features: {len(self.registry)}" + "\n".join(lines) +
                                      ("" if block else "\n\nUse /features <block> for keys.")}
+
+        if intent == "/tiers":
+            counts = self.registry.tier_counts()
+            resp = (
+                f"🏷️ SYSTEM ACCESS TIERS (130 Features Total):\n"
+                f"1. COMMUNITY (Free / Basic, 0 credits): {counts.get('COMMUNITY', 0)} features\n"
+                f"2. PRO (Active Contributor, 50+ credits): {counts.get('PRO', 0)} features\n"
+                f"   (Includes code generation, static analysis, trend forecasting, refactoring)\n"
+                f"3. SOVEREIGN_VIP (VIP Sovereign, 200+ credits or Owner): {counts.get('SOVEREIGN_VIP', 0)} features\n"
+                f"   (Includes Monte Carlo simulator, multi-agent debate, consensus, hardware actuators)\n\n"
+                f"Contribute compute by running an edge worker node to earn credits and unlock higher tiers!"
+            )
+            return {"tele_response": resp, "tier_counts": counts}
 
         if intent == "/run":
             key = payload.pop("feature", "")
@@ -557,6 +592,138 @@ class UltimateAgiSovereignGrid:
                         "settlement": settlement}
             except (KeyError, PermissionError, ValueError) as exc:
                 return {"tele_response": f"❌ Dispatch rejected: {exc}"}
+
+        if intent == "/my_tier":
+            wid = payload.get("worker_id") or payload.get("text")
+            if not wid:
+                if role is Role.OWNER:
+                    return {"tele_response": "👑 Owner role detected: Unconditional SOVEREIGN_VIP access to all 130 features."}
+                return {"tele_response": "Usage: /my_tier <worker_id>"}
+            try:
+                bal = self.hub.get_balance(wid)
+                return {"tele_response": f"👤 Worker {wid} [{bal['tier']} Tier]\n"
+                                         f"Credits: {bal['credits']} | Status: {bal['status']}\n"
+                                         f"Tasks Completed: {bal['tasks_completed']} | Verified: {bal['tasks_verified']}\n"
+                                         f"Pending Payout: ${bal['pending_payout_usd']:.2f} (Total: ${bal['total_payout_earned_usd']:.2f})"}
+            except KeyError:
+                return {"tele_response": f"❌ Unknown worker: {wid}"}
+
+        if intent == "/balance":
+            wid = payload.get("worker_id") or payload.get("text")
+            if not wid:
+                return {"tele_response": "❌ Usage: /balance <worker_id>"}
+            try:
+                b = self.hub.get_balance(wid)
+                return {"tele_response": f"💳 Worker {wid} Balance:\n"
+                                         f"Credits: {b['credits']} [{b['tier']} Tier]\n"
+                                         f"Pending Payout: ${b['pending_payout_usd']:.2f}\n"
+                                         f"Total Payout Earned: ${b['total_payout_earned_usd']:.2f}\n"
+                                         f"Payout Address: {b['payout_address']}",
+                        "balance": b}
+            except KeyError:
+                return {"tele_response": f"❌ Unknown worker: {wid}"}
+
+        if intent == "/spend_credits":
+            wid = payload.get("worker_id", "")
+            amount = int(payload.get("amount", 0) or 0)
+            reason = payload.get("reason", "manual_spend")
+            if not wid or amount <= 0:
+                return {"tele_response": "❌ Usage: /spend_credits <worker_id> <amount> [reason]"}
+            try:
+                res = self.hub.spend_credits(wid, amount, reason)
+                if res.get("status") == "INSUFFICIENT_CREDITS":
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {"tele_response": f"💸 Spent {amount} credits from {wid}. Remaining: {res['remaining_credits']}"}
+            except (KeyError, PermissionError, ValueError) as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/transfer_credits":
+            from_w = payload.get("from_worker", "")
+            to_w = payload.get("to_worker", "")
+            amount = int(payload.get("amount", 0) or 0)
+            if not from_w or not to_w or amount <= 0:
+                return {"tele_response": "❌ Usage: /transfer_credits <from_worker> <to_worker> <amount>"}
+            try:
+                res = self.hub.transfer_credits(from_w, to_w, amount)
+                if res.get("status") == "INSUFFICIENT_CREDITS":
+                    return {"tele_response": f"❌ Insufficient credits in {from_w} (balance: {res.get('balance')})"}
+                return {"tele_response": f"🤝 Transferred {amount} credits: {from_w} ({res['from_balance']}) ➡️ {to_w} ({res['to_balance']})"}
+            except (KeyError, PermissionError, ValueError) as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/barter_task":
+            # Model 1: Deducts 20 compute credits to dispatch a task on the mesh
+            wid = payload.get("worker_id", "")
+            fkey = payload.get("feature", "")
+            task_payload = payload.get("task_payload", {})
+            if not wid or not fkey:
+                return {"tele_response": "❌ Usage: /barter_task <worker_id> <feature_key> <text_or_json>"}
+            try:
+                spent = self.hub.spend_credits(wid, 20, reason=f"barter_compute:{fkey}")
+                if spent.get("status") == "INSUFFICIENT_CREDITS":
+                    return {"tele_response": f"❌ Barter rejected: {spent.get('error')}"}
+                res = self.run_feature(sender_id, fkey, task_payload, via="barter_compute")
+                return {"tele_response": f"⚡ BARTER COMPUTE EXECUTED (20 credits deducted, {spent['remaining_credits']} remaining):\n"
+                                         f"{json.dumps(res, indent=1, default=str)[:3500]}",
+                        "result": res, "barter": spent}
+            except (KeyError, PermissionError, ValueError) as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/set_payout":
+            wid = payload.get("worker_id", "")
+            addr = payload.get("address") or payload.get("text", "")
+            if not wid or not addr:
+                return {"tele_response": "❌ Usage: /set_payout <worker_id> <address_or_iban_or_paypal>"}
+            try:
+                res = self.hub.set_payout_address(wid, addr)
+                return {"tele_response": f"🏦 Payout address for {wid} set to: {res['payout_address']}"}
+            except (KeyError, ValueError) as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/deposit_revenue":
+            if role is not Role.OWNER:
+                return {"tele_response": "❌ Owner role required to record commercial revenue."}
+            client = payload.get("client") or payload.get("client_name", "EnterpriseClient")
+            amt = float(payload.get("amount") or payload.get("amount_usd", 0.0) or 0.0)
+            job_id = payload.get("job_id", "")
+            if amt <= 0:
+                return {"tele_response": "❌ Usage: /deposit_revenue <client> <amount_usd> [job_id]"}
+            try:
+                res = self.hub.deposit_commercial_revenue(amt, client, job_id)
+                return {"tele_response": f"💵 Commercial deposit recorded: ${amt:.2f} from {client}.\n"
+                                         f"Total Revenue Pool: ${res['commercial_revenue_pool_usd']:.2f}"}
+            except ValueError as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/settle_revenue":
+            if role is not Role.OWNER:
+                return {"tele_response": "❌ Owner role required to settle revenue epoch."}
+            ratio = float(payload.get("split_ratio", 0.70) or 0.70)
+            res = self.hub.settle_epoch_revenue_split(ratio)
+            if res.get("status") == "NO_REVENUE":
+                return {"tele_response": "ℹ️ Commercial revenue pool is empty ($0.00)."}
+            lines = [f"  • {d['worker_id']}: ${d['payout_usd']:.2f} (Epoch tasks: {d['epoch_tasks']}, Pending: ${d['pending_payout_usd']:.2f})"
+                     for d in res.get("distributions", [])]
+            dist_str = "\n".join(lines) if lines else "  (No active worker completed verified tasks this epoch)"
+            return {"tele_response": (
+                f"🎉 REVENUE EPOCH #{res['epoch']} SETTLED ({res['split_ratio']}):\n"
+                f"Total Pool: ${res['total_revenue_usd']:.2f}\n"
+                f"Workers Share (70%): ${res['workers_pool_usd']:.2f}\n"
+                f"Treasury Retained (30%): ${res['treasury_pool_usd']:.2f}\n"
+                f"Distributions:\n{dist_str}"),
+                "settlement": res}
+
+        if intent == "/payout_stats":
+            stats = self.hub.payout_stats()
+            workers = stats.get("workers", [])
+            lines = [f"  • {w['worker_id']}: Pending ${w['pending_payout_usd']:.2f} | Total ${w['total_payout_earned_usd']:.2f} | Acc: {w['payout_address']}"
+                     for w in workers]
+            return {"tele_response": (
+                f"📊 COMMERCIAL REVENUE & PAYOUT STATS (Epoch {stats['current_epoch']}):\n"
+                f"Current Commercial Pool: ${stats['commercial_revenue_pool_usd']:.2f}\n"
+                f"Treasury Balance: ${stats['treasury_balance_usd']:.2f}\n"
+                f"Registered Workers ({len(workers)}):\n" + "\n".join(lines)),
+                "stats": stats}
 
         if intent == "/kill_switch":
             res = self.run_feature(sender_id, "kill_switch_protocol", {"text": payload.get("text", "telegram")},

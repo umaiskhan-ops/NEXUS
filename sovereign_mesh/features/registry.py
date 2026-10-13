@@ -8,11 +8,12 @@ Kinds:
 """
 from __future__ import annotations
 
+import dataclasses
 import enum
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..security import Role
 
@@ -38,6 +39,37 @@ class Kind(str, enum.Enum):
     HARDWARE = "hardware"
 
 
+class FeatureTier(str, enum.Enum):
+    COMMUNITY = "COMMUNITY"          # Tier 1: Free / Basic (0 credits)
+    PRO = "PRO"                      # Tier 2: Pro Contributor (>= 50 credits)
+    SOVEREIGN_VIP = "SOVEREIGN_VIP"  # Tier 3: VIP Sovereign (>= 200 credits)
+
+
+TIER_CREDIT_THRESHOLDS: Dict[FeatureTier, int] = {
+    FeatureTier.COMMUNITY: 0,
+    FeatureTier.PRO: 50,
+    FeatureTier.SOVEREIGN_VIP: 200,
+}
+
+SOVEREIGN_VIP_KEYS: Set[str] = {
+    "mission_control", "veto_power", "approval_gates", "emergency_override", "shutdown_authority",
+    "final_say_protocol", "kill_switch_protocol", "token_budget_controller",
+    "virtual_experiment_simulator", "multi_agent_debate", "consensus_engine",
+    "conflict_resolution_protocol", "chaos_engineering_injector", "adversarial_stress_test",
+    "printer_3d_control", "robotic_arm_ros2", "cnc_machine_control",
+    "load_testing_engine", "red_team_safety_tester", "recursive_self_improvement",
+    "state_snapshot_freeze", "disaster_recovery_manager", "redundant_backup_system",
+}
+
+PRO_KEYS: Set[str] = {
+    "code_generation", "ast_static_analyzer", "automated_refactoring", "unit_test_generator",
+    "trend_forecasting", "data_analysis", "openapi_contract_generation", "microservice_decomposition",
+    "schema_designer", "system_scalability_blueprint", "threat_modeling", "performance_profiler",
+    "automated_testing_sandbox", "version_control_integration", "workflow_automation",
+    "task_scheduling", "trigger_based_actions", "competitive_benchmarking", "market_gap_analyzer",
+}
+
+
 class FeatureInputError(ValueError):
     pass
 
@@ -53,10 +85,11 @@ class Feature:
     min_role: Role = Role.OPERATOR
     requires_approval: bool = False
     depends_on: Tuple[str, ...] = ()
+    tier: FeatureTier = FeatureTier.COMMUNITY
 
     def to_dict(self) -> dict:
         return {"key": self.key, "name": self.name, "block": self.block.value, "kind": self.kind.value,
-                "min_role": self.min_role.name, "requires_approval": self.requires_approval,
+                "tier": self.tier.value, "min_role": self.min_role.name, "requires_approval": self.requires_approval,
                 "depends_on": list(self.depends_on), "description": self.description}
 
 
@@ -67,6 +100,11 @@ class FeatureRegistry:
     def register(self, feature: Feature) -> None:
         if feature.key in self._features:
             raise ValueError(f"duplicate feature key {feature.key!r}")
+        if feature.tier == FeatureTier.COMMUNITY:
+            if feature.key in SOVEREIGN_VIP_KEYS or feature.kind == Kind.HARDWARE:
+                feature = dataclasses.replace(feature, tier=FeatureTier.SOVEREIGN_VIP)
+            elif feature.key in PRO_KEYS:
+                feature = dataclasses.replace(feature, tier=FeatureTier.PRO)
         self._features[feature.key] = feature
 
     def extend(self, features: List[Feature]) -> None:
@@ -97,6 +135,23 @@ class FeatureRegistry:
 
     def by_block(self, block: Block) -> List[Feature]:
         return [f for f in self._features.values() if f.block == block]
+
+    def by_tier(self, tier: FeatureTier) -> List[Feature]:
+        return [f for f in self._features.values() if f.tier == tier]
+
+    def tier_counts(self) -> Dict[str, int]:
+        return {t.value: len(self.by_tier(t)) for t in FeatureTier}
+
+    def check_tier_access(self, key: str, credits: int = 0, is_owner: bool = False) -> Tuple[bool, str]:
+        if is_owner:
+            return True, "owner_sovereign_access"
+        feature = self.get(key)
+        threshold = TIER_CREDIT_THRESHOLDS[feature.tier]
+        if credits >= threshold:
+            return True, f"tier_unlocked_{feature.tier.value}"
+        return False, (f"Feature '{feature.key}' requires {feature.tier.value} tier "
+                       f"({threshold} verified credits required; caller currently has {credits}). "
+                       f"Run an edge worker node to contribute compute and unlock!")
 
     def counts(self) -> Dict[str, int]:
         return {b.value: len(self.by_block(b)) for b in Block}
