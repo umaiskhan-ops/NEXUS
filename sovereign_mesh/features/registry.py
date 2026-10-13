@@ -27,8 +27,8 @@ class Block(str, enum.Enum):
     GOVERNANCE = "governance_safety"
 
 
-# Counts of features actually NAMED in the V2026.4 blueprint (it claims 130 / 63 but names 113 / 46).
-SPEC_COUNTS = {Block.CORE: 10, Block.DISCOVERY: 21, Block.CODING: 10, Block.ADVANCED: 26, Block.GOVERNANCE: 46}
+# Counts of features mapped across the 5 logic blocks (10 + 21 + 10 + 26 + 63 = 130 features).
+SPEC_COUNTS = {Block.CORE: 10, Block.DISCOVERY: 21, Block.CODING: 10, Block.ADVANCED: 26, Block.GOVERNANCE: 63}
 
 
 class Kind(str, enum.Enum):

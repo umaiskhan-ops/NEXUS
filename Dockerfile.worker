@@ -1,0 +1,22 @@
+# Sovereign Agentic Mesh — Lightweight Edge Worker Node (Spoke)
+# Stateless execution container with Federal Powers and Governance stripped
+
+FROM python:3.10-slim AS worker-runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    WORKER_PORT=8444
+
+WORKDIR /app
+
+COPY sovereign_mesh /app/sovereign_mesh
+
+RUN useradd -u 10002 -m -s /bin/bash spokeuser && \
+    mkdir -p /app/data && \
+    chown -R spokeuser:spokeuser /app
+
+USER spokeuser
+
+EXPOSE 8444
+
+ENTRYPOINT ["python", "-m", "sovereign_mesh", "worker"]

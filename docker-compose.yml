@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  # Local Open-Source Swarm Execution Engine (Ollama Backend)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sovereign-mesh-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+    # Optional GPU support (uncomment if NVIDIA GPU is present):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # Sovereign Mesh Decentralized Node
+  sovereign-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sovereign-mesh-node
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    ports:
+      - "8443:8443"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8443
+      - OWNER_TELEGRAM_ID=${OWNER_TELEGRAM_ID}
+      - MASTER_PASSPHRASE_HASH=${MASTER_PASSPHRASE_HASH}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
+      - PUBLIC_WEBHOOK_URL=${PUBLIC_WEBHOOK_URL:-}
+      - DASHBOARD_TOKEN=${DASHBOARD_TOKEN:-}
+      - PEER_SHARED_SECRET=${PEER_SHARED_SECRET:-}
+      - OLLAMA_URL=http://ollama:11434
+      - ENABLE_CODE_EXECUTION=false
+      - TOKEN_BUDGET=500000
+    volumes:
+      - mesh_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8443/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ollama_models:
+  mesh_data:

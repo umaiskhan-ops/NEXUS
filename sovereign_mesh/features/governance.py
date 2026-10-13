@@ -9,7 +9,9 @@ import subprocess
 import time
 from pathlib import Path
 
+from ..sandbox import run_python
 from ..security import Role
+from ..state import cosine, tokenize
 from .registry import Block, FeatureInputError, clamp, core, integration, llm, require_text
 
 B = Block.GOVERNANCE
@@ -359,6 +361,175 @@ def _red_team(grid, p):
     return {"status": "PASS" if all(v == "DEFENDED" for v in results.values()) else "FAIL", "probes": results}
 
 
+def _data_analysis(grid, p):
+    data = p.get("data") or p.get("numbers", [])
+    if isinstance(data, str):
+        nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", data)]
+    elif isinstance(data, (list, tuple)):
+        nums = [float(x) for x in data if isinstance(x, (int, float))]
+    else:
+        raise FeatureInputError("payload requires 'data' or 'numbers' as a list of numbers or formatted string")
+    if not nums:
+        raise FeatureInputError("no numerical values found in data")
+    n = len(nums)
+    s = sum(nums)
+    mean = s / n
+    sorted_nums = sorted(nums)
+    median = (sorted_nums[n // 2] if n % 2 != 0 else (sorted_nums[n // 2 - 1] + sorted_nums[n // 2]) / 2)
+    var = sum((x - mean) ** 2 for x in nums) / max(1, n - 1)
+    std_dev = var ** 0.5
+    return {
+        "status": "OK",
+        "count": n,
+        "sum": round(s, 4),
+        "mean": round(mean, 4),
+        "median": round(median, 4),
+        "min": round(min(nums), 4),
+        "max": round(max(nums), 4),
+        "std_dev": round(std_dev, 4),
+    }
+
+
+def _trend_forecasting(grid, p):
+    nums = p.get("series") or p.get("data")
+    if isinstance(nums, (list, tuple)) and len(nums) >= 2:
+        xs = [float(x) for x in nums if isinstance(x, (int, float))]
+        n = len(xs)
+        t = list(range(n))
+        t_mean = sum(t) / n
+        x_mean = sum(xs) / n
+        denom = sum((ti - t_mean) ** 2 for ti in t)
+        slope = sum((ti - t_mean) * (xi - x_mean) for ti, xi in zip(t, xs)) / (denom if denom != 0 else 1)
+        forecast = [xs[-1] + slope * (step + 1) for step in range(clamp(p.get("steps", 3), 1, 10, 3))]
+        direction = "UPWARD" if slope > 0.01 else "DOWNWARD" if slope < -0.01 else "FLAT"
+        return {"status": "OK", "slope": round(slope, 4), "trend": direction, "projected": [round(f, 3) for f in forecast]}
+    text = p.get("text", "")
+    if not text:
+        raise FeatureInputError("payload requires 'series' list of numbers or 'text' description")
+    res = grid.router.ask(text, system="Analyze the trend and project probable future trajectory with confidence levels.")
+    return {"status": "OK", "projection": res["text"]}
+
+
+def _final_say(grid, p):
+    decision = require_text(p, "decision")
+    task_id = p.get("task_id", "GLOBAL")
+    block = grid.ledger.append("final_say_executive_order", {
+        "decision": decision,
+        "task_id": task_id,
+        "owner_id": grid.owner_tg_id,
+        "timestamp": time.time(),
+    })
+    if task_id != "GLOBAL":
+        t = grid.tasks.get(task_id)
+        if t:
+            t.status = "EXECUTED_BY_FINAL_SAY"
+            t.result = {"executive_decision": decision}
+    return {
+        "status": "EXECUTIVE_RULING_RECORDED",
+        "task_id": task_id,
+        "decision": decision,
+        "ledger_block": block["hash"][:16],
+        "authority": "OWNER_ABSOLUTE",
+    }
+
+
+def _grid_state_rollback(grid, p):
+    name = p.get("snapshot") or grid.snapshots.latest()
+    if not name:
+        return {"status": "NO_SNAPSHOT", "hint": "save snapshot first via state_snapshot_freeze"}
+    state = grid.snapshots.get(name)
+    if state is None:
+        raise FeatureInputError(f"snapshot {name!r} not found")
+    grid.restore_state(state)
+    return {"status": "ROLLED_BACK", "snapshot": name}
+
+
+def _code_testing_sandbox(grid, p):
+    code = require_text(p, "code")
+    timeout = float(p.get("timeout", 15.0))
+    res = run_python(code, enabled=grid.config.enable_code_execution, timeout=timeout)
+    return {"status": "OK" if res["ok"] else "TEST_FAILED", **res}
+
+
+def _virtual_experiment_simulator(grid, p):
+    sim_code = p.get("code")
+    if sim_code:
+        res = run_python(sim_code, enabled=grid.config.enable_code_execution, timeout=float(p.get("timeout", 10.0)))
+        return {"status": "OK" if res["ok"] else "FAILED", **res}
+    import random
+    params = p.get("parameters") or {}
+    try:
+        trials = clamp(params.get("trials", 1000), 1, 1_000_000, 1000)
+        runs = clamp(params.get("runs", 200), 1, 10_000, 200)
+        rate = float(params.get("rate", 0.5))
+    except (TypeError, ValueError) as exc:
+        raise FeatureInputError("parameters: trials/runs must be ints, rate a float") from exc
+    if not 0.0 <= rate <= 1.0:
+        raise FeatureInputError("rate must be within [0, 1]")
+    if trials * runs > 5_000_000:
+        raise FeatureInputError("trials * runs must be <= 5,000,000")
+    seed = params.get("seed", 42)
+    rng = random.Random(seed)
+    outcomes = sorted(sum(rng.random() < rate for _ in range(trials)) / trials for _ in range(runs))
+    mean = sum(outcomes) / runs
+    variance = sum((x - mean) ** 2 for x in outcomes) / max(1, runs - 1)
+    pct = lambda q: outcomes[min(runs - 1, int(q * runs))]  # noqa: E731
+    return {"status": "OK", "simulation": "monte_carlo_bernoulli",
+            "parameters": {"trials": trials, "runs": runs, "rate": rate, "seed": seed},
+            "distribution": {"mean": round(mean, 5), "variance": round(variance, 7),
+                             "p05": round(pct(0.05), 5), "p50": round(pct(0.5), 5), "p95": round(pct(0.95), 5)}}
+
+
+def _sliding_window_attention(grid, p):
+    window_size = clamp(p.get("window_size", 10), 1, 100, 10)
+    logs = list(grid.action_log)[-window_size:]
+    summary_tokens = sum(len(str(entry)) // 4 for entry in logs)
+    return {
+        "status": "OK",
+        "window_size": window_size,
+        "captured_items": len(logs),
+        "estimated_tokens": summary_tokens,
+        "active_window": logs,
+    }
+
+
+def _hierarchical_memory_system(grid, p):
+    op = p.get("op", "query")
+    if op == "status":
+        return {
+            "status": "OK",
+            "L1_working_keys": len(grid.memory.keys()),
+            "L2_snapshots": len(grid.snapshots.names()),
+            "L3_ledger_blocks": len(grid.ledger),
+        }
+    key = p.get("key", "")
+    if op == "promote" and key:
+        val = grid.memory.get(key)
+        if val is not None:
+            block = grid.ledger.append("memory_promoted_L3", {"key": key, "val": val})
+            return {"status": "PROMOTED_TO_L3", "key": key, "block": block["hash"][:16]}
+    return {"status": "OK", "hierarchy": {"L1": "RAM/KeyStore", "L2": "SnapshotManager", "L3": "HashChainLedger"}}
+
+
+def _on_demand_memory_recall(grid, p):
+    query = require_text(p, "query")
+    k = clamp(p.get("k", 5), 1, 50, 5)
+    mem_results = grid.memory.search(query, k=k)
+    ledger_hits = []
+    q_tokens = tokenize(query)
+    for b in grid.ledger.tail(200):
+        payload_str = str(b["data"]["payload"])
+        score = cosine(q_tokens, tokenize(payload_str))
+        if score > 0.1:
+            ledger_hits.append({"hash": b["hash"][:16], "task": b["data"]["task"], "score": round(score, 3)})
+    ledger_hits.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "status": "OK",
+        "memory_hits": mem_results,
+        "ledger_hits": ledger_hits[:k],
+    }
+
+
 FEATURES = [
     core("task_scheduling", "Task Scheduling", B, _schedule, "Delayed feature execution."),
     core("trigger_based_actions", "Trigger-Based Actions", B, _triggers, "event -> feature hooks"),
@@ -412,4 +583,37 @@ FEATURES = [
     core("guardian_ai_monitor", "Guardian AI Monitor", B, _guardian),
     core("human_review_gate", "Human Review Gate", B, _human_review),
     core("red_team_safety_tester", "Red-Team Safety Tester", B, _red_team, min_role=OWNER),
+    # Extended 17 Features (bringing Block 5 to 63, and the total system matrix to 130 features)
+    core("data_analysis", "Data Analysis", B, _data_analysis, "Statistical calculations and distribution analysis."),
+    llm("risk_assessment", "Risk Assessment", B,
+        "Perform a comprehensive risk assessment: likelihood (1-5), impact (1-5), severity score, and mitigations."),
+    llm("impact_prediction", "Impact Prediction", B,
+        "Evaluate direct, indirect, and second-order systemic impacts across short, medium, and long term horizons."),
+    core("trend_forecasting", "Trend Forecasting", B, _trend_forecasting, "Linear slope projection and trend modeling."),
+    llm("root_cause_analysis", "Root Cause Analysis", B,
+        "Perform 5-Whys and Ishikawa root cause analysis to trace symptoms to foundational issues."),
+    core("final_say_protocol", "Final Say Protocol", B, _final_say,
+         "Owner absolute executive ruling overriding swarm consensus and gates.", min_role=OWNER),
+    core("grid_state_rollback", "Grid State Rollback", B, _grid_state_rollback,
+         "Rollback system memory and configuration to a previous snapshot.", min_role=OWNER),
+    integration("formal_proof_verification", "Formal Proof Verification", B,
+                "an interactive theorem prover bridge (e.g. Lean 4, Coq, or Z3)"),
+    llm("mathematical_gap_detection", "Mathematical Gap Detection", B,
+        "Scrutinize mathematical derivations step-by-step for subtle logical gaps and unstated assumptions."),
+    core("automated_code_testing_sandbox", "Automated Code Testing Sandbox", B, _code_testing_sandbox,
+         "Execute test suites inside isolated Python runner.", depends_on=("automated_testing_sandbox",)),
+    llm("hypothesis_tester", "Hypothesis Tester", B,
+        "Assess experimental data against hypotheses to determine validation or falsification."),
+    core("virtual_experiment_simulator", "Virtual Experiment Simulator", B, _virtual_experiment_simulator,
+         "Virtual parameter sweep and Monte Carlo simulation harness."),
+    llm("journal_submission_assistant", "Journal Submission Assistant", B,
+        "Format academic papers, prepare cover letters, and draft reviewer response matrices."),
+    core("sliding_window_attention", "Sliding Window Attention", B, _sliding_window_attention,
+         "Manage rolling window of recent execution logs and context token metrics."),
+    core("hierarchical_memory_system", "Hierarchical Memory System", B, _hierarchical_memory_system,
+         "Multi-tier memory: L1 working cache, L2 snapshots, and L3 immutable ledger."),
+    llm("conversation_summarizer", "Conversation Summarizer", B,
+        "Compress multi-turn dialogue into high-density state representations and action items."),
+    core("on_demand_memory_recall", "On-Demand Memory Recall", B, _on_demand_memory_recall,
+         "Unified dual-tier search querying both active memory and past ledger blocks."),
 ]

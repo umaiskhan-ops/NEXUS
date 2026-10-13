@@ -85,6 +85,22 @@ def parse_command(text: str) -> Tuple[str, dict, Optional[str]]:
         return intent, {"id": rest}, None
     if intent == "/features":
         return intent, {"block": rest} if rest else {}, None
+    if intent == "/add_model":
+        parts = rest.split()
+        if len(parts) >= 3:
+            return intent, {"name": parts[0], "role": parts[1], "model": parts[2]}, None
+        elif len(parts) == 2:
+            return intent, {"name": parts[0], "role": "Validator", "model": parts[1]}, None
+        return intent, {"text": rest}, None
+    if intent == "/remove_model":
+        return intent, {"name": rest.strip()}, None
+    if intent == "/register_worker":
+        wid, _, url = rest.partition(" ")
+        return intent, {"worker_id": wid.strip(), "url": url.strip() or "local"}, None
+    if intent == "/dispatch_worker":
+        wid, _, rem = rest.partition(" ")
+        fkey, _, body = rem.strip().partition(" ")
+        return intent, {"worker_id": wid.strip(), "feature": fkey.strip(), "task_payload": _parse_json_or_text(body)}, None
     return intent, {"text": rest} if rest else {}, None
 
 

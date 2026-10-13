@@ -1,0 +1,14 @@
+{
+  "peers": [
+    {
+      "name": "Alpha-Regional-Node",
+      "url": "http://192.168.1.100:8443",
+      "public_key": "node-alpha-ed25519-fingerprint"
+    },
+    {
+      "name": "Beta-Validation-Peer",
+      "url": "http://192.168.1.101:8443",
+      "public_key": "node-beta-ed25519-fingerprint"
+    }
+  ]
+}

@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .config import GridConfig
 from .features import Block, FeatureInputError, Kind, build_registry
+from .hub_spoke import LightweightWorkerNode, MasterHubCoordinator
 from .ledger import HashChainLedger
 from .models import BackendUnavailable, LLMBackend, ModelNode, ModelRouter, OllamaBackend
 from .security import (AccessControl, AuthGuard, ConstitutionalRuleEnforcer, EncryptionLayer, Role,
@@ -28,12 +29,13 @@ from .state import (ApprovalQueue, BudgetExceeded, MemoryStore, Scheduler, Snaps
 
 # Features that additionally require the master passphrase (restoring control must be hard; stopping is easy).
 PASSPHRASE_FEATURES = {"veto_power", "emergency_override", "access_control", "mission_change_rollbacks",
-                       "disaster_recovery_manager", "autonomous_mode_toggle"}
+                       "disaster_recovery_manager", "autonomous_mode_toggle", "final_say_protocol",
+                       "grid_state_rollback"}
 # Features that mutate state and are blocked while the grid is frozen.
 STATE_MUTATING = {"local_memory_management", "cross_session_memory_fusion", "user_preference_learning",
                   "parallel_reality_branching", "mission_change_rollbacks", "simulation_rollback",
                   "disaster_recovery_manager", "quantized_model_hot_swap", "precision_scalability_switch",
-                  "access_control", "cad_stl_output"}
+                  "access_control", "cad_stl_output", "grid_state_rollback"}
 LOCKDOWN_ALLOWED = {"emergency_override", "audit_trail", "full_transparency_ledger"}
 _BACKUP_NAME = re.compile(r"^\d{8}-\d{6}$")
 
@@ -61,6 +63,7 @@ class UltimateAgiSovereignGrid:
         self.scheduler = Scheduler()
         self.approvals = ApprovalQueue()
         self.triggers = TriggerEngine()
+        self.hub = MasterHubCoordinator(self.ledger, config.peer_shared_secret or "sovereign-hub-default-secret")
 
         nodes = [ModelNode(m["name"], m["role"], m["model"]) for m in config.mesh]
         self.router = ModelRouter(nodes, backend or OllamaBackend(config.ollama_url), self.budget,
@@ -400,7 +403,10 @@ class UltimateAgiSovereignGrid:
 
     # ------------------------------------------------------------ Telegram intent gateway
     HELP = ("Commands:\n/status_grid\n/features [block]\n/run <feature_key> <text | json>\n"
-            "/execute_autonomous_task <name> [| json]\n/tasks\n/approve <id> | /reject <id>\n/audit\n"
+            "/execute_autonomous_task <name> [| json]\n/tasks\n/models\n"
+            "/add_model <name> <role> <model_tag>\n/remove_model <name>\n"
+            "/workers\n/register_worker <id> [url]\n/dispatch_worker <id> <feature> <payload>\n"
+            "/approve <id> | /reject <id>\n/audit\n"
             "/kill_switch [reason]\n/shutdown\n/federal_veto <task_id|ALL> <passphrase>\n"
             "/emergency_override <passphrase>")
 
@@ -473,6 +479,81 @@ class UltimateAgiSovereignGrid:
             res = self.run_feature(sender_id, "audit_trail", {}, via="telegram")
             return {"tele_response": f"🧾 Audit: {res.get('status')} — {res.get('blocks')} blocks, "
                                      f"head {res.get('head')}"}
+
+        if intent == "/models":
+            active = "\n".join(f"  • {n.name} [{n.role}] -> {n.model} ({n.status})" for n in self.router.nodes)
+            available = self.router.available_models()
+            avail_str = ", ".join(available) if available else "(backend idle / none listed)"
+            return {"tele_response": f"🤖 ACTIVE SWARM NODES ({len(self.router.nodes)}):\n{active}\n\n"
+                                     f"📦 DISCOVERED IN BACKEND:\n{avail_str}\n\n"
+                                     f"Use /add_model <name> <role> <model_tag> to register a new model."}
+
+        if intent == "/add_model":
+            if role is not Role.OWNER:
+                return {"tele_response": "❌ Owner role required to add models."}
+            name = payload.get("name")
+            model_tag = payload.get("model")
+            model_role = payload.get("role", "Validator")
+            if not name or not model_tag:
+                return {"tele_response": "❌ Usage: /add_model <name> <role> <model_tag>\n"
+                                         "Example: /add_model Qwen-Coder Coder qwen2.5-coder:7b"}
+            res = self.router.add_node(name, model_role, model_tag)
+            self.ledger.append("model_added", res)
+            return {"tele_response": f"✅ Model node registered into mesh:\n{json.dumps(res, indent=1)}"}
+
+        if intent == "/remove_model":
+            if role is not Role.OWNER:
+                return {"tele_response": "❌ Owner role required to remove models."}
+            name = payload.get("name") or payload.get("text")
+            if not name:
+                return {"tele_response": "❌ Usage: /remove_model <node_name>"}
+            try:
+                res = self.router.remove_node(name)
+                self.ledger.append("model_removed", res)
+                return {"tele_response": f"🗑️ Model node removed: {name}"}
+            except KeyError:
+                return {"tele_response": f"❌ Unknown node: {name}"}
+
+        if intent == "/workers":
+            workers = self.hub.list_workers()
+            if not workers:
+                return {"tele_response": "🌐 No edge worker nodes registered. Use /register_worker <id> [url]"}
+            lines = [f"  • {w['worker_id']} [{w['status']}] Credits: {w['credits']} "
+                     f"(Burned: {w['burned_credits']}) Tasks: {w['tasks_completed']}" for w in workers]
+            return {"tele_response": f"🌐 EDGE WORKER NODES ({len(workers)}):\n" + "\n".join(lines)}
+
+        if intent == "/register_worker":
+            if role is not Role.OWNER:
+                return {"tele_response": "❌ Owner role required to register workers."}
+            wid = payload.get("worker_id") or payload.get("text")
+            if not wid:
+                return {"tele_response": "❌ Usage: /register_worker <worker_id> [url]"}
+            try:
+                rec = self.hub.register_worker(wid, payload.get("url", "local"))
+                return {"tele_response": f"✅ Worker registered: {rec.worker_id} (Initial stake: {rec.credits} credits)"}
+            except PermissionError as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/dispatch_worker":
+            if role is not Role.OWNER:
+                return {"tele_response": "❌ Owner role required to dispatch hub tasks."}
+            wid = payload.get("worker_id", "")
+            fkey = payload.get("feature", "")
+            task_payload = payload.get("task_payload", {})
+            if not wid or not fkey:
+                return {"tele_response": "❌ Usage: /dispatch_worker <worker_id> <feature_key> <text_or_json>"}
+            try:
+                signed_task = self.hub.create_signed_task(wid, fkey, task_payload)
+                worker_node = LightweightWorkerNode(
+                    wid, self.config.peer_shared_secret or "sovereign-hub-default-secret", self
+                )
+                response_packet = worker_node.execute_signed_task(signed_task)
+                settlement = self.hub.verify_and_settle(response_packet)
+                return {"tele_response": f"⚡ HUB-AND-SPOKE SETTLEMENT [{settlement['status']}]:\n"
+                                         f"{json.dumps(settlement, indent=1, default=str)[:3500]}",
+                        "settlement": settlement}
+            except (KeyError, PermissionError) as exc:
+                return {"tele_response": f"❌ Dispatch rejected: {exc}"}
 
         if intent == "/kill_switch":
             res = self.run_feature(sender_id, "kill_switch_protocol", {"text": payload.get("text", "telegram")},

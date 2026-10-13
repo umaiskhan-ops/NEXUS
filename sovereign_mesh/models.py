@@ -233,3 +233,26 @@ class ModelRouter:
         node.consecutive_failures = 0
         node.status = "READY"
         return {"node": node_name, "old_model": old, "new_model": new_model}
+
+    def add_node(self, name: str, role: str, model: str) -> dict:
+        existing = self.node(name)
+        if existing:
+            existing.role = role
+            existing.model = model
+            existing.status = "READY"
+            return {"status": "UPDATED", "node": existing.to_dict()}
+        new_node = ModelNode(name=name, role=role, model=model, status="READY")
+        self.nodes.append(new_node)
+        return {"status": "ADDED", "node": new_node.to_dict()}
+
+    def remove_node(self, name: str) -> dict:
+        node = self.node(name)
+        if not node:
+            raise KeyError(f"unknown node {name!r}")
+        self.nodes.remove(node)
+        return {"status": "REMOVED", "name": name}
+
+    def available_models(self) -> List[str]:
+        if hasattr(self.backend, "list_models"):
+            return self.backend.list_models()
+        return []

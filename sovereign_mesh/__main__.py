@@ -70,15 +70,49 @@ def cmd_repl(_args) -> int:
     return 0
 
 
+def cmd_worker(_args) -> int:
+    """Lightweight stateless Spoke Worker Node HTTP server."""
+    import os
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from .hub_spoke import LightweightWorkerNode
+
+    worker_id = os.environ.get("WORKER_ID", f"spoke-{secrets.token_hex(3)}")
+    secret = os.environ.get("PEER_SHARED_SECRET", "sovereign-hub-default-secret")
+    port = int(os.environ.get("WORKER_PORT", "8444"))
+    grid = _grid_from_env()
+    worker = LightweightWorkerNode(worker_id, secret, grid)
+
+    class WorkerHandler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            if self.path != "/worker/execute":
+                self.send_response(404)
+                self.end_headers()
+                return
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            packet = json.loads(self.rfile.read(length))
+            out = json.dumps(worker.execute_signed_task(packet), default=str).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    print(f"[WORKER] Spoke Node '{worker_id}' listening on 0.0.0.0:{port} "
+          f"({len(worker.allowed_features())} execution features enabled, Federal Powers stripped)")
+    ThreadingHTTPServer(("0.0.0.0", port), WorkerHandler).serve_forever()
+    return 0
+
+
 def cmd_selftest(_args) -> int:
     from .config import GridConfig
     from .features import SPEC_COUNTS, Block
     from .grid import UltimateAgiSovereignGrid
+    from .hub_spoke import LightweightWorkerNode
     from .security import hash_passphrase
 
     with tempfile.TemporaryDirectory() as tmp:
         cfg = GridConfig(owner_telegram_id=1, master_passphrase_hash=hash_passphrase(secrets.token_hex(16)),
-                         data_dir=Path(tmp), ollama_url="http://127.0.0.1:9")
+                         data_dir=Path(tmp), ollama_url="http://127.0.0.1:9", peer_shared_secret="test-hub-secret")
         grid = UltimateAgiSovereignGrid(cfg)
         counts = grid.registry.counts()
         ok = all(counts[b.value] == SPEC_COUNTS[b] for b in Block)
@@ -87,19 +121,37 @@ def cmd_selftest(_args) -> int:
         red = grid.run_feature(1, "red_team_safety_tester", {})
         stress = grid.run_feature(1, "adversarial_stress_test", {})
         deadlock = grid.run_feature(1, "dependency_deadlock_detector", {})
+
+        # Verify Hub-and-Spoke Signing & Slashing
+        grid.hub.register_worker("worker-honest", initial_credits=100)
+        grid.hub.register_worker("worker-rogue", initial_credits=100)
+        w_honest = LightweightWorkerNode("worker-honest", "test-hub-secret", grid)
+        t1 = grid.hub.create_signed_task("worker-honest", "data_analysis", {"numbers": [10, 20, 30]})
+        s1 = grid.hub.verify_and_settle(w_honest.execute_signed_task(t1))
+
+        t2 = grid.hub.create_signed_task("worker-rogue", "data_analysis", {"numbers": [1, 2, 3]})
+        tampered_resp = {"task_id": t2["task_id"], "worker_id": "worker-rogue",
+                         "result": {"status": "OK", "mean": 999999}, "worker_proof": "forged_hash_000"}
+        s2 = grid.hub.verify_and_settle(tampered_resp)
+        hub_ok = (s1["status"] == "SETTLED" and s1["total_credits"] == 125 and
+                  s2["status"] == "SLASHED" and s2["remaining_credits"] == 0)
+
         print(f"red team: {red['status']} {red.get('probes')}\nstress test: {stress['status']} "
-              f"({stress.get('caught')}/{stress.get('total')})\nfeature graph deadlocks: {deadlock['status']}")
-        return 0 if ok and red["status"] == "PASS" and deadlock["status"] == "CLEAR" else 1
+              f"({stress.get('caught')}/{stress.get('total')})\nfeature graph deadlocks: {deadlock['status']}\n"
+              f"hub-and-spoke + slashing: {'PASS' if hub_ok else 'FAIL'} "
+              f"(honest={s1['total_credits']} credits, rogue={s2['status']}/burned={s2.get('burned_credits')})")
+        return 0 if ok and red["status"] == "PASS" and deadlock["status"] == "CLEAR" and hub_ok else 1
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="sovereign_mesh")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    for name, fn, help_ in (("serve", cmd_serve, "webhook HTTP server (production)"),
-                            ("poll", cmd_poll, "Telegram long-polling (no public URL needed)"),
-                            ("repl", cmd_repl, "local owner console"),
+    for name, fn, help_ in (("serve", cmd_serve, "Master Hub webhook HTTP server (production)"),
+                            ("poll", cmd_poll, "Master Hub Telegram long-polling"),
+                            ("repl", cmd_repl, "Master Hub local owner console"),
+                            ("worker", cmd_worker, "Lightweight Edge Worker Node (Spoke)"),
                             ("hash-passphrase", cmd_hash, "generate MASTER_PASSPHRASE_HASH"),
-                            ("selftest", cmd_selftest, "offline registry + safety self-test")):
+                            ("selftest", cmd_selftest, "offline registry + hub-spoke + safety self-test")):
         sub.add_parser(name, help=help_).set_defaults(fn=fn)
     args = parser.parse_args(argv)
     return args.fn(args)
@@ -107,3 +159,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
