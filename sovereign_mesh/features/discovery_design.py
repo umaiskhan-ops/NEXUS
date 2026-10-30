@@ -59,8 +59,11 @@ def _feedback_guard(grid, p):
     series = p.get("series")
     if not isinstance(series, list) or len(series) < 3:
         raise FeatureInputError("payload 'series' must be a list of >= 3 numbers")
-    xs = [float(x) for x in series]
-    lo, hi = float(p.get("min", float("-inf"))), float(p.get("max", float("inf")))
+    try:
+        xs = [float(x) for x in series]
+        lo, hi = float(p.get("min", float("-inf"))), float(p.get("max", float("inf")))
+    except (TypeError, ValueError) as exc:
+        raise FeatureInputError("series and min/max bounds must be numeric") from exc
     if any(x < lo or x > hi for x in xs):
         return {"status": "TRIP", "action": "HALT_ACTUATION", "reason": "value out of safe bounds"}
     diffs = [b - a for a, b in zip(xs, xs[1:])]

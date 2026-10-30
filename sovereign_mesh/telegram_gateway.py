@@ -94,26 +94,48 @@ def parse_command(text: str) -> Tuple[str, dict, Optional[str]]:
         elif len(parts) == 2:
             return intent, {"name": parts[0], "role": "Validator", "model": parts[1]}, None
         return intent, {"text": rest}, None
+    if intent in {"/add_models_bulk", "/add_300_models"}:
+        cnt = 300
+        if rest.strip().isdigit():
+            cnt = int(rest.strip())
+        return "/add_models_bulk", {"count": cnt}, None
     if intent == "/remove_model":
         return intent, {"name": rest.strip()}, None
     if intent == "/register_worker":
-        wid, _, url = rest.partition(" ")
-        return intent, {"worker_id": wid.strip(), "url": url.strip() or "local"}, None
+        parts = rest.split()
+        wid = parts[0] if len(parts) >= 1 else ""
+        url = parts[1] if len(parts) >= 2 else "local"
+        ref = parts[2] if len(parts) >= 3 else ""
+        return intent, {"worker_id": wid, "url": url, "referred_by": ref}, None
     if intent == "/dispatch_worker":
         wid, _, rem = rest.partition(" ")
         fkey, _, body = rem.strip().partition(" ")
         return intent, {"worker_id": wid.strip(), "feature": fkey.strip(), "task_payload": _parse_json_or_text(body)}, None
-    if intent in {"/balance", "/my_tier"}:
+    if intent in {"/balance", "/my_tier", "/referral", "/referrals"}:
         return intent, {"worker_id": rest.strip()} if rest else {}, None
+    if intent in {"/add_credits", "/grant_credits"}:
+        parts = rest.split(None, 2)
+        if len(parts) >= 2:
+            try:
+                return "/add_credits", {"worker_id": parts[0], "amount": int(parts[1]), "reason": parts[2] if len(parts) > 2 else "owner_grant"}, None
+            except ValueError:
+                pass
+        return "/add_credits", _parse_json_or_text(rest), None
     if intent == "/spend_credits":
         parts = rest.split(None, 2)
         if len(parts) >= 2:
-            return intent, {"worker_id": parts[0], "amount": int(parts[1]), "reason": parts[2] if len(parts) > 2 else "manual_spend"}, None
+            try:
+                return intent, {"worker_id": parts[0], "amount": int(parts[1]), "reason": parts[2] if len(parts) > 2 else "manual_spend"}, None
+            except ValueError:
+                pass
         return intent, {"text": rest}, None
     if intent == "/transfer_credits":
         parts = rest.split()
         if len(parts) >= 3:
-            return intent, {"from_worker": parts[0], "to_worker": parts[1], "amount": int(parts[2])}, None
+            try:
+                return intent, {"from_worker": parts[0], "to_worker": parts[1], "amount": int(parts[2])}, None
+            except ValueError:
+                pass
         return intent, {"text": rest}, None
     if intent == "/barter_task":
         wid, _, rem = rest.partition(" ")
@@ -125,11 +147,94 @@ def parse_command(text: str) -> Tuple[str, dict, Optional[str]]:
     if intent == "/deposit_revenue":
         parts = rest.split()
         if len(parts) >= 2:
-            return intent, {"client": parts[0], "amount": float(parts[1]), "job_id": parts[2] if len(parts) > 2 else ""}, None
+            try:
+                return intent, {"client": parts[0], "amount": float(parts[1]), "job_id": parts[2] if len(parts) > 2 else ""}, None
+            except ValueError:
+                pass
         return intent, {"text": rest}, None
     if intent == "/settle_revenue":
-        ratio = float(rest.strip()) if rest.strip() else 0.70
+        try:
+            ratio = float(rest.strip()) if rest.strip() else 0.70
+        except ValueError:
+            ratio = 0.70
         return intent, {"split_ratio": ratio}, None
+    if intent in {"/top_miners", "/leaderboard"}:
+        limit = int(rest.strip()) if rest.strip().isdigit() else 10
+        return "/top_miners", {"limit": limit}, None
+    if intent in {"/reward_top_miners", "/buyback_top3"}:
+        parts = rest.split()
+        pkr = float(parts[0]) if len(parts) >= 1 and parts[0].replace(".", "", 1).isdigit() else 500.0
+        cr = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 100
+        return "/reward_top_miners", {"reward_pkr_each": pkr, "credits_bought_each": cr}, None
+    if intent == "/p2p_sell":
+        parts = rest.split(None, 3)
+        if len(parts) >= 3:
+            try:
+                return intent, {
+                    "worker_id": parts[0],
+                    "amount": int(parts[1]),
+                    "price": float(parts[2]),
+                    "payment_method": parts[3] if len(parts) > 3 else "EasyPaisa / JazzCash",
+                }, None
+            except ValueError:
+                pass
+        return intent, {"text": rest}, None
+    if intent == "/p2p_buy_order":
+        parts = rest.split(None, 3)
+        if len(parts) >= 3:
+            try:
+                return intent, {
+                    "buyer_id": parts[0],
+                    "amount": int(parts[1]),
+                    "price": float(parts[2]),
+                    "payment_method": parts[3] if len(parts) > 3 else "EasyPaisa / JazzCash",
+                }, None
+            except ValueError:
+                pass
+        return intent, {"text": rest}, None
+    if intent == "/p2p_sell_to_buyer":
+        parts = rest.split(None, 2)
+        if len(parts) >= 2:
+            return intent, {
+                "order_id": parts[0],
+                "seller_id": parts[1],
+                "payment_method": parts[2] if len(parts) > 2 else "",
+            }, None
+        return intent, {"text": rest}, None
+    if intent == "/p2p_buy":
+        parts = rest.split()
+        if len(parts) >= 2:
+            return intent, {"order_id": parts[0], "buyer_id": parts[1]}, None
+        return intent, {"text": rest}, None
+    if intent == "/p2p_pay":
+        parts = rest.split(None, 2)
+        if len(parts) >= 3:
+            return intent, {"order_id": parts[0], "buyer_id": parts[1], "ref": parts[2]}, None
+        return intent, {"text": rest}, None
+    if intent in {"/dispute", "/p2p_dispute"}:
+        parts = rest.split(None, 2)
+        if len(parts) >= 2:
+            return "/dispute", {"order_id": parts[0], "caller_id": parts[1], "reason": parts[2] if len(parts) > 2 else "Payment / Screenshot Dispute"}, None
+        elif len(parts) == 1:
+            return "/dispute", {"order_id": parts[0], "reason": "Payment / Screenshot Dispute"}, None
+        return "/dispute", {"text": rest}, None
+    if intent in {"/p2p_release", "/p2p_cancel"}:
+        parts = rest.split()
+        if len(parts) >= 1:
+            return intent, {"order_id": parts[0], "seller_id": parts[1] if len(parts) > 1 else ""}, None
+        return intent, {"text": rest}, None
+    if intent in {"/brain_matrix", "/brain"}:
+        return "/brain_matrix", {}, None
+    if intent == "/self_play":
+        return "/self_play", {"topic": rest.strip() or "Distributed Consensus & Sovereign Mesh Autonomy"}, None
+    if intent in {"/brain_sync"}:
+        parts = rest.split()
+        shard = parts[0] if len(parts) >= 1 else "CODE_DEBUG_EXEC"
+        return "/brain_sync", {"domain_shard": shard}, None
+    if intent in {"/debate", "/roundtable"}:
+        return "/debate", {"question": rest.strip()}, None
+    if intent in {"/vote", "/consensus", "/verify_task"}:
+        return "/vote", {"proposal": rest.strip()}, None
     return intent, {"text": rest} if rest else {}, None
 
 
@@ -156,18 +261,20 @@ def handle_update(grid, client: Optional[TelegramClient], update: dict) -> Optio
     else:
         result = grid.process_telegram_inbound_signal(sender, intent, payload, passphrase)
         # Free-text NLU: follow through for read-only intents only.
-        nlu = result.get("result", {}) if payload.get("feature") == "natural_language_understanding" else {}
+        raw_nlu = result.get("result") if payload.get("feature") == "natural_language_understanding" else None
+        nlu = raw_nlu if isinstance(raw_nlu, dict) else {}
         if nlu.get("intent") in NLU_SAFE_INTENTS:
             result = grid.process_telegram_inbound_signal(sender, nlu["intent"], {}, None)
 
-    if client and secret_bearing and msg.get("message_id"):
-        client.delete_message(chat["id"], msg["message_id"])  # scrub the passphrase from chat history
+    chat_id = chat.get("id")
+    if client and secret_bearing and msg.get("message_id") and chat_id is not None:
+        client.delete_message(chat_id, msg["message_id"])  # scrub the passphrase from chat history
 
     reply_text = result.get("tele_response")
     if result.get("drop") or not reply_text or grid.silent_observer:
         return None
-    if client:
-        client.send_message(chat["id"], reply_text)
+    if client and chat_id is not None:
+        client.send_message(chat_id, reply_text)
     return reply_text
 
 

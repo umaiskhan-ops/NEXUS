@@ -26,9 +26,22 @@ def cmd_hash(_args) -> int:
     return 0
 
 
-def cmd_serve(_args) -> int:
+def cmd_serve(args) -> int:
     from .server import serve
-    serve(_grid_from_env())
+    grid = _grid_from_env()
+    if getattr(args, "tunnel", False):
+        grid.config.enable_tunnel = True
+    open_b = getattr(args, "open_browser", False)
+    serve(grid, open_browser=open_b)
+    return 0
+
+
+def cmd_start(args) -> int:
+    from .server import serve
+    grid = _grid_from_env()
+    if getattr(args, "tunnel", False):
+        grid.config.enable_tunnel = True
+    serve(grid, open_browser=not getattr(args, "no_browser", False))
     return 0
 
 
@@ -154,19 +167,33 @@ def cmd_selftest(_args) -> int:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="sovereign_mesh")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    for name, fn, help_ in (("serve", cmd_serve, "Master Hub webhook HTTP server (production)"),
-                            ("poll", cmd_poll, "Master Hub Telegram long-polling"),
+    parser = argparse.ArgumentParser(
+        prog="sovereign_mesh",
+        description="SUP Agentic Mesh (Powered by NEXUS) — Unified 1-Command Launcher"
+    )
+    parser.add_argument("--no-browser", action="store_true", help="Do not auto-open browser on startup")
+    parser.add_argument("--tunnel", action="store_true", help="Launch free Cloudflare HTTPS tunnel for worldwide remote worker access")
+    sub = parser.add_subparsers(dest="cmd", required=False)
+    for name, fn, help_ in (("start", cmd_start, "Start ALL systems (Web Studio + Owner Telegram + Local Worker + Browser)"),
+                            ("serve", cmd_serve, "Start ALL systems (Web Studio + Owner Telegram + Local Worker)"),
+                            ("poll", cmd_poll, "Master Hub Telegram long-polling only"),
                             ("repl", cmd_repl, "Master Hub local owner console"),
                             ("worker", cmd_worker, "Lightweight Edge Worker Node (Spoke)"),
                             ("hash-passphrase", cmd_hash, "generate MASTER_PASSPHRASE_HASH"),
                             ("selftest", cmd_selftest, "offline registry + hub-spoke + safety self-test")):
-        sub.add_parser(name, help=help_).set_defaults(fn=fn)
+        p = sub.add_parser(name, help=help_)
+        if name in {"start", "serve"}:
+            p.add_argument("--no-browser", action="store_true", help="Do not auto-open browser")
+            p.add_argument("--open-browser", action="store_true", help="Auto-open Web Studio in browser")
+            p.add_argument("--tunnel", action="store_true", help="Launch Cloudflare HTTPS tunnel")
+        p.set_defaults(fn=fn)
     args = parser.parse_args(argv)
+    if not getattr(args, "fn", None):
+        return cmd_start(args)
     return args.fn(args)
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
 

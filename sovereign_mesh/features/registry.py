@@ -54,7 +54,7 @@ TIER_CREDIT_THRESHOLDS: Dict[FeatureTier, int] = {
 SOVEREIGN_VIP_KEYS: Set[str] = {
     "mission_control", "veto_power", "approval_gates", "emergency_override", "shutdown_authority",
     "final_say_protocol", "kill_switch_protocol", "token_budget_controller",
-    "virtual_experiment_simulator", "multi_agent_debate", "consensus_engine",
+    "virtual_experiment_simulator", "multi_agent_debate", "roundtable_debate", "consensus_engine",
     "conflict_resolution_protocol", "chaos_engineering_injector", "adversarial_stress_test",
     "printer_3d_control", "robotic_arm_ros2", "cnc_machine_control",
     "load_testing_engine", "red_team_safety_tester", "recursive_self_improvement",
@@ -62,11 +62,13 @@ SOVEREIGN_VIP_KEYS: Set[str] = {
 }
 
 PRO_KEYS: Set[str] = {
-    "code_generation", "ast_static_analyzer", "automated_refactoring", "unit_test_generator",
+    "code_generation", "code_generation_core", "ast_static_analyzer", "automated_refactoring",
+    "unit_test_generator", "test_generation_sandbox", "performance_optimization_engine",
     "trend_forecasting", "data_analysis", "openapi_contract_generation", "microservice_decomposition",
     "schema_designer", "system_scalability_blueprint", "threat_modeling", "performance_profiler",
     "automated_testing_sandbox", "version_control_integration", "workflow_automation",
     "task_scheduling", "trigger_based_actions", "competitive_benchmarking", "market_gap_analyzer",
+    "gap_analysis",
 }
 
 
@@ -166,6 +168,8 @@ class FeatureRegistry:
 # ---------------------------------------------------------------- helpers
 def require_text(payload: dict, field: str = "text") -> str:
     text = payload.get(field)
+    if (not isinstance(text, str) or not text.strip()) and field == "text":
+        text = payload.get("prompt")
     if not isinstance(text, str) or not text.strip():
         raise FeatureInputError(f"payload field '{field}' (non-empty string) is required")
     return text
@@ -189,7 +193,7 @@ def core(key: str, name: str, block: Block, handler: Handler, description: str =
 
 def llm(key: str, name: str, block: Block, system_prompt: str, role: Optional[str] = None, **kw) -> Feature:
     def handler(grid, payload: dict) -> dict:
-        text = payload.get("text") or json.dumps({k: v for k, v in payload.items() if k != "text"})
+        text = payload.get("text") or payload.get("prompt") or json.dumps({k: v for k, v in payload.items() if k not in ("text", "prompt")})
         if not text or text == "{}":
             raise FeatureInputError("payload 'text' is required")
         res = grid.router.ask(text, system=system_prompt, role=role)

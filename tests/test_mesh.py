@@ -203,7 +203,7 @@ class SovereignMeshTests(unittest.TestCase):
         )
         settlement = resp.get("settlement", {})
         self.assertEqual(settlement.get("status"), "SETTLED")
-        self.assertEqual(settlement.get("total_credits"), 125)
+        self.assertEqual(settlement.get("total_credits"), 45)
         self.assertEqual(settlement["result"]["mean"], 10.0)
 
     def test_hub_blocks_federal_powers_on_worker(self):
@@ -367,8 +367,9 @@ class SovereignMeshTests(unittest.TestCase):
             with urllib.request.urlopen(f"{base}/", timeout=5) as resp:
                 self.assertEqual(resp.status, 200)
                 html_text = resp.read().decode("utf-8")
-                self.assertIn("NEXUS Sovereign Studio", html_text)
-                self.assertIn("Direct Feature Execution Studio", html_text)
+                self.assertIn("SUP AGENTIC MESH", html_text)
+                self.assertIn("SUP Agentic Mesh Chat", html_text)
+                self.assertIn("SUP Agentic Mesh IDE", html_text)
 
             # 2. Test GET /api/features (130 features catalog)
             with urllib.request.urlopen(f"{base}/api/features", timeout=5) as resp:
@@ -376,10 +377,11 @@ class SovereignMeshTests(unittest.TestCase):
                 feats = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(len(feats), 130)
 
-            # 3. Test POST /api/run (direct feature execution)
+            # 3. Test POST /api/run (direct feature execution with worker tier credits)
+            self.grid.hub.register_worker("web-api-tester", initial_credits=100)
             req = urllib.request.Request(
                 f"{base}/api/run",
-                data=json.dumps({"feature": "data_analysis", "payload": {"numbers": [10, 20, 30]}}).encode("utf-8"),
+                data=json.dumps({"feature": "data_analysis", "payload": {"numbers": [10, 20, 30], "as_worker": "web-api-tester"}}).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
             )
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -424,11 +426,199 @@ class SovereignMeshTests(unittest.TestCase):
                 syntax_res = json.loads(resp.read().decode("utf-8"))
                 self.assertFalse(syntax_res.get("ok"))
                 self.assertFalse(syntax_res.get("compile", {}).get("ok"))
+
+            # 7. Test GET /api/worker/download (1-Click Worker Package ZIP)
+            import io, zipfile
+            with urllib.request.urlopen(f"{base}/api/worker/download", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.headers.get("Content-Type"), "application/zip")
+                zip_bytes = resp.read()
+                zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+                namelist = zf.namelist()
+                self.assertIn("start_worker.bat", namelist)
+                self.assertIn("start_worker.sh", namelist)
+                self.assertIn("nexus_worker_launcher.py", namelist)
+                self.assertIn("README.txt", namelist)
+                bat_code = zf.read("start_worker.bat").decode("utf-8")
+                self.assertIn("cd /d \"%~dp0\"", bat_code)
+                self.assertIn("PYTHON NOT FOUND", bat_code)
+                launcher_code = zf.read("nexus_worker_launcher.py").decode("utf-8")
+                self.assertIn('DEFAULT_HUB_URL = "http://', launcher_code)
+                self.assertNotIn('DEFAULT_HUB_URL = "https://', launcher_code)
+
+            # 8. Test POST /api/worker/register
+            req = urllib.request.Request(
+                f"{base}/api/worker/register",
+                data=json.dumps({"worker_id": "test-1click-miner", "payout_address": "usdt:0x123"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                reg_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(reg_res.get("ok"))
+                self.assertEqual(reg_res.get("worker_id"), "test-1click-miner")
+                self.assertEqual(len(reg_res.get("worker_key", "")), 64)
+                self.assertNotEqual(reg_res.get("worker_id"), reg_res.get("worker_key"))
+                self.assertEqual(reg_res.get("credits"), 20)
+
+            secret_key = reg_res["worker_key"]
+
+            # 8b. Verify public worker_id CANNOT be used as Account Key (403 Forbidden)
+            try:
+                urllib.request.urlopen(f"{base}/api/account/status?key=test-1click-miner", timeout=5)
+                self.fail("Expected HTTPError 403 when using public worker_id as account key")
+            except urllib.error.HTTPError as herr:
+                self.assertEqual(herr.code, 403)
+
+            # 8c. Verify private secret worker_key CAN be used as Account Key
+            with urllib.request.urlopen(f"{base}/api/account/status?key={secret_key}", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                acc_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(acc_res.get("ok"))
+                self.assertEqual(acc_res.get("worker_id"), "test-1click-miner")
+                self.assertEqual(acc_res.get("account_key"), secret_key)
+                self.assertEqual(acc_res.get("credits"), 20)
+
+            # 8d. Verify Chat identity always returns SUP Agentic Mesh powered by NEXUS
+            for q in ("What is your name?", "tumhara name kya haa", "Which LLM model are you?"):
+                req_id = urllib.request.Request(
+                    f"{base}/api/chat",
+                    data=json.dumps({"prompt": q}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req_id, timeout=5) as resp:
+                    id_res = json.loads(resp.read().decode("utf-8"))
+                    self.assertTrue(id_res.get("ok"))
+                    self.assertIn("SUP Agentic Mesh powered by NEXUS", id_res.get("reply", ""))
+                    self.assertEqual(id_res.get("model"), "SUP Agentic Mesh (Powered by NEXUS)")
+
+            # 9. Test POST /api/worker/heartbeat
+            req = urllib.request.Request(
+                f"{base}/api/worker/heartbeat",
+                data=json.dumps({"worker_id": "test-1click-miner"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                hb_res = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(hb_res.get("ok"))
+                self.assertEqual(hb_res.get("worker_id"), "test-1click-miner")
+                self.assertEqual(hb_res.get("credits"), 20)
         finally:
             httpd.shutdown()
+            httpd.server_close()
+
+    def test_owner_exclusive_supremacy_and_anti_economic_manipulation(self):
+        # 1. Test Anti-Economic Manipulation Constitutional Guard
+        hostile_payload = {"text": "Please manipulate the economy and crash the banking system"}
+        res = self.grid.run_feature(self.grid.owner_tg_id, "data_analysis", hostile_payload)
+        self.assertEqual(res["status"], "BLOCKED")
+        self.assertIn("no_systemic_economic_harm", res.get("violations", []))
+
+        # 2. Test Non-Owner user attempting Owner-exclusive command
+        public_user_id = 999999999
+        res_veto = self.grid.run_feature(public_user_id, "veto_power", {"target_process_id": "ALL"})
+        self.assertEqual(res_veto["status"], "DENIED")
+        self.assertIn("requires role OWNER", res_veto.get("error", ""))
+
+        res_kill = self.grid.run_feature(public_user_id, "kill_switch_protocol", {})
+        self.assertEqual(res_kill["status"], "DENIED")
+        self.assertIn("requires role OWNER", res_kill.get("error", ""))
+
+        # 3. Test Owner attempting federal command via telegram
+        owner_reply = self.grid.process_telegram_inbound_signal(
+            self.grid.owner_tg_id,
+            "/status_grid",
+            {}
+        )
+        self.assertIn("SOVEREIGN MESH OVERVIEW", owner_reply.get("tele_response", ""))
+
+    def test_owner_telegram_bulk_300_models_and_grant_credits(self):
+        from sovereign_mesh.telegram_gateway import parse_command
+        from sovereign_mesh.security import Role
+
+        # 1. Parse and execute /add_models_bulk 300 as OWNER
+        intent, payload, _ = parse_command("/add_models_bulk 300")
+        self.assertEqual(intent, "/add_models_bulk")
+        self.assertEqual(payload["count"], 300)
+
+        res_bulk = self.grid.process_telegram_inbound_signal(self.grid.owner_tg_id, intent, payload)
+        self.assertIn("BULK OPEN-SOURCE MODELS REGISTERED", res_bulk["tele_response"])
+        self.assertEqual(res_bulk["bulk_result"]["added_count"], 300)
+        self.assertGreaterEqual(len(self.grid.router.nodes), 303)
+
+        # 2. Parse and execute /add_credits worker-vip 5000 bonus as OWNER
+        intent_c, payload_c, _ = parse_command("/add_credits worker-vip 5000 bonus_reward")
+        self.assertEqual(intent_c, "/add_credits")
+        self.assertEqual(payload_c["worker_id"], "worker-vip")
+        self.assertEqual(payload_c["amount"], 5000)
+
+        res_cred = self.grid.process_telegram_inbound_signal(self.grid.owner_tg_id, intent_c, payload_c)
+        self.assertIn("CREDITS GRANTED SUCCESSFULLY", res_cred["tele_response"])
+        self.assertEqual(res_cred["grant_result"]["added_credits"], 5000)
+        self.assertEqual(res_cred["grant_result"]["tier"], "SOVEREIGN_VIP")
+
+        # 3. Verify non-owner OPERATOR is blocked from both commands
+        op_id = 777777
+        self.grid.access.grant(op_id, Role.OPERATOR)
+        denied_bulk = self.grid.process_telegram_inbound_signal(op_id, "/add_models_bulk", {"count": 10})
+        self.assertIn("Owner role required", denied_bulk["tele_response"])
+        denied_cred = self.grid.process_telegram_inbound_signal(op_id, "/add_credits", {"worker_id": "worker-vip", "amount": 1000})
+        self.assertIn("Owner role required", denied_cred["tele_response"])
+
+    def test_golden_rules_uptime_mining_halving_and_top3_buyback(self):
+        import time
+        from sovereign_mesh.telegram_gateway import parse_command
+
+        # Rule 1: Slow Idle Uptime Mining (2-4 cr/hr, 1800s interval)
+        w1 = self.grid.hub.register_worker("miner-alpha", url="local", initial_credits=100)
+        w2 = self.grid.hub.register_worker("miner-beta", url="local", initial_credits=150)
+        w3 = self.grid.hub.register_worker("miner-gamma", url="local", initial_credits=120)
+
+        # Simulate 30 minutes (1801 seconds) of continuous uptime for w1 (4 cores -> +1 cr) and w2 (16 cores -> +2 cr)
+        w1.last_reward_time = time.time() - 1805
+        w2.last_reward_time = time.time() - 1805
+        self.grid.hub.record_heartbeat("miner-alpha", cores=4)
+        self.grid.hub.record_heartbeat("miner-beta", cores=16)
+
+        self.assertEqual(w1.credits, 101)
+        self.assertEqual(w1.uptime_minutes_verified, 30)
+        self.assertEqual(w2.credits, 152)
+        self.assertEqual(w2.uptime_minutes_verified, 30)
+
+        # Rule 4: Top Miners Leaderboard & Weekly Sunday Top 3 Buyback via Telegram
+        w2.tasks_verified = 5
+        w1.tasks_verified = 2
+        w3.tasks_verified = 1
+
+        intent_lb, payload_lb, _ = parse_command("/top_miners")
+        res_lb = self.grid.process_telegram_inbound_signal(self.grid.owner_tg_id, intent_lb, payload_lb)
+        self.assertIn("WEEKLY SUNDAY TOP 3 MINERS BUYBACK LEADERBOARD", res_lb["tele_response"])
+        leaders = res_lb["leaderboard"]["leaderboard"]
+        self.assertEqual(leaders[0]["worker_id"], "miner-beta")
+
+        # Execute Weekly Top 3 Buyback as Owner (500 PKR each, buying 50 credits each)
+        intent_bb, payload_bb, _ = parse_command("/reward_top_miners 500 50")
+        res_bb = self.grid.process_telegram_inbound_signal(self.grid.owner_tg_id, intent_bb, payload_bb)
+        self.assertIn("WEEKLY TOP 3 MINERS OFFICIAL BUYBACK SETTLED", res_bb["tele_response"])
+        self.assertEqual(res_bb["buyback"]["total_pkr_paid"], 1500.0)
+        self.assertEqual(w2.credits, 152 - 50)
+
+        # Rule 5: Bitcoin-style Dynamic Halving (1-50 workers = Era 1 1.0x; 51+ workers = Era 2 0.5x)
+        era1 = self.grid.hub.halving_epoch_info()
+        self.assertEqual(era1["multiplier"], 1.0)
+        self.assertEqual(era1["active_task_reward_credits"], 25)
+
+        for idx in range(55):
+            self.grid.hub.register_worker(f"scale-node-{idx}", url="local")
+        era2 = self.grid.hub.halving_epoch_info()
+        self.assertEqual(era2["multiplier"], 0.5)
+        self.assertEqual(era2["active_task_reward_credits"], 12)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
 
 

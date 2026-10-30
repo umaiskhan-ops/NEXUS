@@ -33,7 +33,7 @@ def verify_passphrase(phrase: str, stored: str) -> bool:
             n=int(n), r=int(r), p=int(p), dklen=len(dk_hex) // 2,
         )
         return hmac.compare_digest(dk.hex(), dk_hex)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, AttributeError, OverflowError):
         return False
 
 
@@ -91,7 +91,10 @@ class EncryptionLayer:
                     os.chmod(key_path, 0o600)
                 except OSError:
                     pass
-        self._fernet = Fernet(key)
+        try:
+            self._fernet = Fernet(key)
+        except (ValueError, TypeError):
+            self._fernet = None
 
     @property
     def available(self) -> bool:
@@ -170,7 +173,12 @@ def _iter_strings(obj: Any):
 
 # ---------------------------------------------------------------- constitutional rules
 _DESTRUCTIVE = re.compile(
-    r"rm\s+-rf\s+/(\s|$)|mkfs\.|format\s+[a-z]:|dd\s+if=\S+\s+of=/dev/|del\s+/[sq]\s+[a-z]:\\", re.IGNORECASE
+    r"rm\s+-rf\s+/\S*|rm\s+-rf\s+/(\s|$)|mkfs\.|format\s+[a-z]:|dd\s+if=\S+\s+of=/dev/|del\s+(?:(?:/[fqs]\s+)+)[a-z]:\\", re.IGNORECASE
+)
+_SYSTEMIC_HARM = re.compile(
+    r"(manipulate|crash|destabilize|sabotage|destroy|rig|exploit)\s+(the\s+)?(economy|market|currency|stock\s+market|banking\s+system|financial\s+system)|"
+    r"(ddos|cyberattack|exploit\s+vulnerability\s+to\s+attack|create\s+malware|ransomware|bypass\s+anti-money\s+laundering)",
+    re.IGNORECASE
 )
 
 
@@ -186,6 +194,8 @@ class ConstitutionalRuleEnforcer:
         strings = list(_iter_strings(payload))
         if any(_DESTRUCTIVE.search(s) for s in strings):
             violations.append(("no_destructive_commands", "block", "Destructive system command pattern detected."))
+        if any(_SYSTEMIC_HARM.search(s) for s in strings):
+            violations.append(("no_systemic_economic_harm", "block", "Systemic harm or economic manipulation directive blocked by Sovereign Constitutional Guard."))
         if any(sec in s for sec in self._secrets for s in strings):
             violations.append(("no_secret_exfiltration", "block", "Payload contains a protected secret."))
         if requires_approval and not approved:
@@ -203,7 +213,10 @@ class Role(enum.IntEnum):
 
     @classmethod
     def parse(cls, name: str) -> "Role":
-        return cls[name.strip().upper()]
+        try:
+            return cls[str(name).strip().upper()]
+        except KeyError as exc:
+            raise ValueError(f"unknown role {name!r}; expected one of {[r.name for r in cls]}") from exc
 
 
 class AccessControl:
@@ -219,6 +232,8 @@ class AccessControl:
     def role_of(self, uid: int) -> Optional[Role]:
         if uid == self.owner_id:
             return Role.OWNER
+        if uid == 0 or uid == 999999999:  # Web Guest / Public User (Non-Owner)
+            return Role.OPERATOR
         with self._lock:
             return self._roles.get(uid)
 
@@ -241,3 +256,13 @@ class AccessControl:
             out = {str(k): v.name for k, v in self._roles.items()}
         out[str(self.owner_id)] = Role.OWNER.name
         return out
+
+
+# ---------------------------------------------------------------- post-quantum & multi-vault re-exports
+from .quantum_crypto import (
+    HyperSovereignKeyVault,
+    verify_hyper_proof,
+    verify_quantum_address,
+    encode_quantum_address,
+    compute_hardware_puf_seal,
+)

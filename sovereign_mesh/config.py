@@ -5,7 +5,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 # NOTE: "Llama-3.2-8B" does not exist (Llama 3.2 ships 1B/3B/11B/90B); the 8B model is Llama 3.1.
 DEFAULT_MESH: List[dict] = [
@@ -48,6 +48,11 @@ class GridConfig:
     enable_code_execution: bool = False
     simulate_offline_consensus: bool = False
     token_budget: int = 500_000
+    enable_tunnel: bool = False
+    public_hub_url: str = ""
+    bootstrap_anchor_url: str = ""
+    github_gist_id: str = ""
+    github_gist_token: str = ""
 
     @classmethod
     def from_env(cls, env_path: Optional[Path] = None) -> "GridConfig":
@@ -65,9 +70,11 @@ class GridConfig:
                 if k and k not in os.environ:
                     os.environ[k] = v
 
-        owner = os.environ.get("OWNER_TELEGRAM_ID", "").strip()
-        if not owner.lstrip("-").isdigit():
-            raise ConfigError("OWNER_TELEGRAM_ID must be your numeric Telegram user id")
+        owner_raw = os.environ.get("OWNER_TELEGRAM_ID", "").strip()
+        try:
+            owner_id = int(owner_raw)
+        except ValueError as exc:
+            raise ConfigError("OWNER_TELEGRAM_ID must be your numeric Telegram user id") from exc
 
         pw_hash = os.environ.get("MASTER_PASSPHRASE_HASH", "").strip()
         if not pw_hash:
@@ -82,39 +89,61 @@ class GridConfig:
 
         mesh = [dict(m) for m in DEFAULT_MESH]
         if os.environ.get("MESH_CONFIG_JSON"):
-            mesh = json.loads(os.environ["MESH_CONFIG_JSON"])
+            try:
+                mesh = json.loads(os.environ["MESH_CONFIG_JSON"])
+            except ValueError as exc:
+                raise ConfigError(f"Invalid MESH_CONFIG_JSON: {exc}") from exc
 
         peers: List[dict] = []
         peers_file = os.environ.get("PEERS_FILE", "").strip()
         if peers_file and Path(peers_file).exists():
-            peers = json.loads(Path(peers_file).read_text(encoding="utf-8")).get("peers", [])
+            try:
+                raw_peers = json.loads(Path(peers_file).read_text(encoding="utf-8"))
+                peers = raw_peers.get("peers", []) if isinstance(raw_peers, dict) else []
+            except ValueError as exc:
+                raise ConfigError(f"Invalid PEERS_FILE JSON: {exc}") from exc
 
         collaborators: Dict[int, str] = {}
         for item in filter(None, os.environ.get("COLLABORATORS", "").split(",")):
             uid, _, role = item.partition(":")
-            collaborators[int(uid.strip())] = (role.strip() or "observer").lower()
+            try:
+                collaborators[int(uid.strip())] = (role.strip() or "observer").lower()
+            except ValueError as exc:
+                raise ConfigError(f"Invalid COLLABORATORS entry {item!r}: {exc}") from exc
+
+        try:
+            port_val = int(os.environ.get("PORT") or "8443")
+            timeout_val = float(os.environ.get("LLM_TIMEOUT_S") or "120")
+            budget_val = int(os.environ.get("TOKEN_BUDGET") or "500000")
+        except ValueError as exc:
+            raise ConfigError(f"Invalid numeric config in PORT/LLM_TIMEOUT_S/TOKEN_BUDGET: {exc}") from exc
 
         return cls(
-            owner_telegram_id=int(owner),
+            owner_telegram_id=owner_id,
             master_passphrase_hash=pw_hash,
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             webhook_secret=os.environ.get("TELEGRAM_WEBHOOK_SECRET", ""),
             public_webhook_url=os.environ.get("PUBLIC_WEBHOOK_URL", ""),
             dashboard_token=os.environ.get("DASHBOARD_TOKEN", ""),
             peer_shared_secret=os.environ.get("PEER_SHARED_SECRET", ""),
-            host=os.environ.get("HOST", "0.0.0.0"),
-            port=int(os.environ.get("PORT", "8443")),
-            ollama_url=os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+            host=os.environ.get("HOST") or "0.0.0.0",
+            port=port_val,
+            ollama_url=os.environ.get("OLLAMA_URL") or "http://localhost:11434",
             llm_api_key=(os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
                          or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GROQ_API_KEY") or "").strip(),
             llm_base_url=(os.environ.get("LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
                           or "https://openrouter.ai/api/v1").strip(),
-            llm_timeout_s=float(os.environ.get("LLM_TIMEOUT_S", "120")),
+            llm_timeout_s=timeout_val,
             mesh=mesh,
-            data_dir=Path(os.environ.get("DATA_DIR", "./data")),
+            data_dir=Path(os.environ.get("DATA_DIR") or "./data"),
             peers=peers,
             collaborators=collaborators,
             enable_code_execution=_env_bool("ENABLE_CODE_EXECUTION"),
             simulate_offline_consensus=_env_bool("SIMULATE_OFFLINE_CONSENSUS"),
-            token_budget=int(os.environ.get("TOKEN_BUDGET", "500000")),
+            token_budget=budget_val,
+            enable_tunnel=_env_bool("ENABLE_TUNNEL"),
+            public_hub_url=(os.environ.get("PUBLIC_HUB_URL") or os.environ.get("CLOUDFLARE_TUNNEL_URL") or "").strip(),
+            bootstrap_anchor_url=(os.environ.get("BOOTSTRAP_ANCHOR_URL") or os.environ.get("NEXUS_BOOTSTRAP_URL") or "").strip(),
+            github_gist_id=(os.environ.get("GITHUB_GIST_ID") or os.environ.get("NEXUS_GIST_ID") or "").strip(),
+            github_gist_token=(os.environ.get("GITHUB_GIST_TOKEN") or os.environ.get("NEXUS_GIST_TOKEN") or "").strip(),
         )

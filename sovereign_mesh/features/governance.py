@@ -61,7 +61,12 @@ def _workflow(grid, p):
         raise FeatureInputError("'steps' must be a non-empty list of {feature, payload}")
     results = []
     for i, step in enumerate(steps[:20]):
-        res = grid.run_feature(grid.owner_tg_id, step["feature"], dict(step.get("payload", {})), via="workflow")
+        if not isinstance(step, dict) or not isinstance(step.get("feature"), str) or not step["feature"].strip():
+            raise FeatureInputError(f"step {i + 1} must be a dict with a non-empty string 'feature'")
+        raw_payload = step.get("payload") or {}
+        if not isinstance(raw_payload, dict):
+            raise FeatureInputError(f"step {i + 1} 'payload' must be a dict")
+        res = grid.run_feature(grid.owner_tg_id, step["feature"], dict(raw_payload), via="workflow")
         results.append({"step": i + 1, "feature": step["feature"], "status": res.get("status")})
         if res.get("status") in {"ERROR", "DENIED", "BLOCKED", "PENDING_APPROVAL"}:
             return {"status": "HALTED", "at_step": i + 1, "results": results, "last": res}
@@ -191,10 +196,21 @@ def _shutdown(grid, p):
 
 def _access_control(grid, p):
     op = p.get("op", "list")
-    if op == "grant":
-        grid.access.grant(int(p["user_id"]), Role.parse(require_text(p, "role")))
-    elif op == "revoke":
-        grid.access.revoke(int(p["user_id"]))
+    if op in {"grant", "revoke"}:
+        if "user_id" not in p:
+            raise FeatureInputError("payload field 'user_id' (int) is required")
+        try:
+            uid = int(p["user_id"])
+        except (TypeError, ValueError) as exc:
+            raise FeatureInputError("payload field 'user_id' must be an integer") from exc
+        if op == "grant":
+            try:
+                role = Role.parse(require_text(p, "role"))
+            except ValueError as exc:
+                raise FeatureInputError(str(exc)) from exc
+            grid.access.grant(uid, role)
+        else:
+            grid.access.revoke(uid)
     return {"status": "OK", "roles": grid.access.listing()}
 
 
@@ -340,6 +356,8 @@ def _human_review(grid, p):
 
 
 def _red_team(grid, p):
+    saved_intrusions = grid.intrusion_count
+    saved_log_len = len(grid.action_log)
     probes = [
         ("intruder", lambda: grid.process_telegram_inbound_signal(-1, "/status_grid", {})),
         ("unauthorised_veto", lambda: grid.run_feature(-1, "veto_power", {"target_process_id": "ALL"},
@@ -357,6 +375,9 @@ def _red_team(grid, p):
     for name, probe in probes:
         r = probe()
         results[name] = "DEFENDED" if expectations[name](r) else "FAILED"
+    grid.intrusion_count = saved_intrusions
+    while len(grid.action_log) > saved_log_len:
+        grid.action_log.pop()
     grid.approvals_cleanup_red_team()
     return {"status": "PASS" if all(v == "DEFENDED" for v in results.values()) else "FAIL", "probes": results}
 
@@ -392,20 +413,21 @@ def _data_analysis(grid, p):
 
 def _trend_forecasting(grid, p):
     nums = p.get("series") or p.get("data")
-    if isinstance(nums, (list, tuple)) and len(nums) >= 2:
-        xs = [float(x) for x in nums if isinstance(x, (int, float))]
-        n = len(xs)
-        t = list(range(n))
-        t_mean = sum(t) / n
-        x_mean = sum(xs) / n
-        denom = sum((ti - t_mean) ** 2 for ti in t)
-        slope = sum((ti - t_mean) * (xi - x_mean) for ti, xi in zip(t, xs)) / (denom if denom != 0 else 1)
-        forecast = [xs[-1] + slope * (step + 1) for step in range(clamp(p.get("steps", 3), 1, 10, 3))]
-        direction = "UPWARD" if slope > 0.01 else "DOWNWARD" if slope < -0.01 else "FLAT"
-        return {"status": "OK", "slope": round(slope, 4), "trend": direction, "projected": [round(f, 3) for f in forecast]}
+    if isinstance(nums, (list, tuple)):
+        xs = [float(x) for x in nums if isinstance(x, (int, float)) and not isinstance(x, bool)]
+        if len(xs) >= 2:
+            n = len(xs)
+            t = list(range(n))
+            t_mean = sum(t) / n
+            x_mean = sum(xs) / n
+            denom = sum((ti - t_mean) ** 2 for ti in t)
+            slope = sum((ti - t_mean) * (xi - x_mean) for ti, xi in zip(t, xs)) / (denom if denom != 0 else 1)
+            forecast = [xs[-1] + slope * (step + 1) for step in range(clamp(p.get("steps", 3), 1, 10, 3))]
+            direction = "UPWARD" if slope > 0.01 else "DOWNWARD" if slope < -0.01 else "FLAT"
+            return {"status": "OK", "slope": round(slope, 4), "trend": direction, "projected": [round(f, 3) for f in forecast]}
     text = p.get("text", "")
     if not text:
-        raise FeatureInputError("payload requires 'series' list of numbers or 'text' description")
+        raise FeatureInputError("payload requires 'series' list of >=2 numbers or 'text' description")
     res = grid.router.ask(text, system="Analyze the trend and project probable future trajectory with confidence levels.")
     return {"status": "OK", "projection": res["text"]}
 

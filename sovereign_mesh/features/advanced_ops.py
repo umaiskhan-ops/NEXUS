@@ -191,8 +191,12 @@ def _format_enforcer(grid, p):
         obj = json.loads(raw) if isinstance(raw, str) else raw
     except json.JSONDecodeError as exc:
         return {"status": "INVALID", "error": f"not JSON: {exc}"}
-    required = p.get("required_keys", [])
-    missing = [k for k in required if not isinstance(obj, dict) or k not in obj]
+    if not isinstance(obj, dict):
+        return {"status": "INVALID", "error": "output must be a JSON object/dict", "missing_keys": list(p.get("required_keys") or [])}
+    required = p.get("required_keys") or []
+    if not isinstance(required, (list, tuple)):
+        raise FeatureInputError("'required_keys' must be a list of strings")
+    missing = [k for k in required if k not in obj]
     return {"status": "VALID" if not missing else "INVALID", "missing_keys": missing}
 
 

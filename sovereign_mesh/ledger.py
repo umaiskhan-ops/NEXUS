@@ -54,10 +54,14 @@ class HashChainLedger:
         with self._lock:
             prev = GENESIS_HASH
             for i, block in enumerate(self._blocks):
-                data = block["data"]
+                if not isinstance(block, dict):
+                    return False, i
+                data = block.get("data")
+                if not isinstance(data, dict):
+                    return False, i
                 if data.get("prev_hash") != prev or data.get("index") != i:
                     return False, i
-                if hashlib.sha256(_canonical(data)).hexdigest() != block["hash"]:
+                if hashlib.sha256(_canonical(data)).hexdigest() != block.get("hash"):
                     return False, i
                 prev = block["hash"]
             return True, None
@@ -68,6 +72,8 @@ class HashChainLedger:
             return self._blocks[-1]["hash"] if self._blocks else GENESIS_HASH
 
     def tail(self, n: int = 10) -> List[dict]:
+        if n <= 0:
+            return []
         with self._lock:
             return list(self._blocks[-n:])
 

@@ -17,11 +17,14 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from .brain_matrix import DecentralizedBrainMatrix
 from .config import GridConfig
 from .features import Block, FeatureInputError, Kind, build_registry
 from .hub_spoke import LightweightWorkerNode, MasterHubCoordinator
 from .ledger import HashChainLedger
-from .models import (BackendUnavailable, LLMBackend, ModelNode, ModelRouter,
+from .p2p_market import P2PMarketplace
+from .supercomputer import SupercomputerEngine
+from .models import (BackendUnavailable, DistillationCache, LLMBackend, ModelNode, ModelRouter,
                      OllamaBackend, OpenAICompatibleBackend)
 from .security import (AccessControl, AuthGuard, ConstitutionalRuleEnforcer, EncryptionLayer, Role,
                        sanitize_payload)
@@ -65,6 +68,12 @@ class UltimateAgiSovereignGrid:
         self.approvals = ApprovalQueue()
         self.triggers = TriggerEngine()
         self.hub = MasterHubCoordinator(self.ledger, grid=self, state_path=self.data_dir / "hub_workers.json")
+        self.p2p = P2PMarketplace(self.hub, self.ledger, storage_path=self.data_dir / "p2p_market.json",
+                                  owner_id=self.owner_tg_id, notifier=self._notify)
+        self.supercomputer = SupercomputerEngine(self.hub, self.ledger,
+                                                 storage_path=self.data_dir / "supercomputers.json")
+        from .token_sink import TokenSinkManager
+        self.token_sink = TokenSinkManager(self.hub, self.ledger, storage_path=self.data_dir / "token_sink.json")
 
         nodes = [ModelNode(m["name"], m["role"], m["model"]) for m in config.mesh]
         if backend is None:
@@ -72,7 +81,21 @@ class UltimateAgiSovereignGrid:
                 backend = OpenAICompatibleBackend(config.llm_base_url or "https://openrouter.ai/api/v1", config.llm_api_key)
             else:
                 backend = OllamaBackend(config.ollama_url)
-        self.router = ModelRouter(nodes, backend, self.budget, config.llm_timeout_s)
+        distillation_cache = DistillationCache(storage_path=self.data_dir / "distillation_cache.json", ledger=self.ledger)
+        self.brain_matrix = DecentralizedBrainMatrix(
+            distillation_cache=distillation_cache,
+            hub=self.hub,
+            ledger=self.ledger,
+            storage_path=self.data_dir / "brain_matrix.json",
+        )
+        self.router = ModelRouter(
+            nodes,
+            backend,
+            self.budget,
+            config.llm_timeout_s,
+            distillation_cache=distillation_cache,
+            brain_matrix=self.brain_matrix,
+        )
         self.registry = build_registry()
         self.adapters: Dict[str, Callable[[Any, dict], dict]] = {}
 
@@ -145,9 +168,12 @@ class UltimateAgiSovereignGrid:
             task = self.tasks.next(timeout=1.0)
             if not task:
                 continue
-            feature = task.payload.get("feature")
+            payload_dict = task.payload if isinstance(task.payload, dict) else {}
+            feature = payload_dict.get("feature")
             if feature:
-                res = self.run_feature(task.created_by, feature, dict(task.payload.get("feature_payload", {})),
+                raw_fp = payload_dict.get("feature_payload")
+                fp = dict(raw_fp) if isinstance(raw_fp, dict) else {}
+                res = self.run_feature(task.created_by, feature, fp,
                                        via=f"task:{task.id}")
                 task.result = res
                 if task.cancel_event.is_set():
@@ -232,6 +258,32 @@ class UltimateAgiSovereignGrid:
         return {"target": target, "cancelled": cancelled, "ledger_block": block["hash"][:16],
                 "note": "Ledger is append-only: the veto is recorded as a compensating block."}
 
+    def node_slashing_authority(self, worker_id: str, reason: str = "Malicious activity flagged by Node Slashing Authority") -> dict:
+        """Invokes node slashing authority to burn 100% of rogue worker credits and blacklist on ledger."""
+        if not getattr(self, "hub", None):
+            return {"status": "ERROR", "error": "hub coordinator not available"}
+        return self.hub.slash_worker(worker_id, reason)
+
+    def buy_lottery_ticket(self, worker_id: str, count: int = 1) -> dict:
+        if not getattr(self, "token_sink", None):
+            return {"ok": False, "error": "token_sink not available"}
+        return self.token_sink.buy_lottery_ticket(worker_id, count=count)
+
+    def draw_lottery(self, force: bool = False) -> dict:
+        if not getattr(self, "token_sink", None):
+            return {"ok": False, "error": "token_sink not available"}
+        return self.token_sink.draw_lottery_winner(force=force)
+
+    def stake_credits(self, worker_id: str, amount: int) -> dict:
+        if not getattr(self, "token_sink", None):
+            return {"ok": False, "error": "token_sink not available"}
+        return self.token_sink.stake_credits(worker_id, amount)
+
+    def unstake_credits(self, worker_id: str, amount: int) -> dict:
+        if not getattr(self, "token_sink", None):
+            return {"ok": False, "error": "token_sink not available"}
+        return self.token_sink.unstake_credits(worker_id, amount)
+
     def resolve_approval(self, req_id: str, approve: bool) -> dict:
         req = self.approvals.resolve(req_id, approve)
         if not req:
@@ -302,6 +354,16 @@ class UltimateAgiSovereignGrid:
                 shutil.copy2(src / fname, self.data_dir / fname)
         self.ledger = HashChainLedger(self.data_dir / "ledger.jsonl")
         self.memory = MemoryStore(self.data_dir / "memory.json")
+        for sub in (
+            getattr(self, "hub", None),
+            getattr(self, "p2p", None),
+            getattr(self, "supercomputer", None),
+            getattr(self, "token_sink", None),
+            getattr(self, "brain_matrix", None),
+            getattr(getattr(self, "router", None), "distillation_cache", None),
+        ):
+            if sub is not None and hasattr(sub, "ledger"):
+                sub.ledger = self.ledger
         self.ledger.append("disaster_recovery_restore", {"backup": name})
         return {"backup": name, "ledger_blocks": len(self.ledger)}
 
@@ -342,6 +404,64 @@ class UltimateAgiSovereignGrid:
             entry["status"] = result.get("status")
             self._record(entry, log)
             return result
+
+        if key == "node_slashing_authority":
+            if self.system_lockdown:
+                return finish({"status": "DENIED", "error": "system lockdown active"})
+            if self.frozen:
+                return finish({"status": "DENIED", "error": "state is frozen (state_snapshot_freeze)"})
+            if not self.access.allows(sender_id, Role.OWNER):
+                return finish({"status": "DENIED", "error": "node_slashing_authority requires OWNER role"})
+            target_wid = payload.get("worker_id") or payload.get("target_worker_id") or ""
+            reason = payload.get("reason", "Malicious activity flagged by Node Slashing Authority")
+            res = self.hub.slash_worker(target_wid, reason) if getattr(self, "hub", None) else {"status": "ERROR"}
+            return finish({"status": "SLASHED" if res.get("status") == "SLASHED" else "OK", **res})
+
+        if key in {"credit_lottery_pool", "lottery_pool", "gamified_credit_lottery"}:
+            if self.system_lockdown:
+                return finish({"status": "DENIED", "error": "system lockdown active"})
+            if not getattr(self, "token_sink", None):
+                return finish({"status": "ERROR", "error": "token_sink not initialized"})
+            action = payload.get("action", "buy_ticket")
+            target_wid = payload.get("worker_id") or payload.get("account_key") or str(sender_id)
+            if action == "status":
+                res = self.token_sink.get_lottery_status()
+                return finish({"status": "OK", **res})
+            if self.frozen:
+                return finish({"status": "DENIED", "error": "state is frozen (state_snapshot_freeze)"})
+            if action == "draw":
+                if not self.access.allows(sender_id, Role.OWNER):
+                    return finish({"status": "DENIED", "error": "manual lottery draw requires OWNER role"})
+                res = self.token_sink.draw_lottery_winner(force=True)
+                return finish({"status": "OK", **res})
+            try:
+                count = int(payload.get("tickets") or payload.get("count", 1) or 1)
+            except (ValueError, TypeError):
+                return finish({"status": "ERROR", "error": "invalid ticket count"})
+            res = self.token_sink.buy_lottery_ticket(target_wid, count=count)
+            return finish({"status": "OK" if res.get("ok") else "ERROR", **res})
+
+        if key in {"staking_rewards_vault", "credit_staking_vault", "staking_pool", "credit_staking"}:
+            if self.system_lockdown:
+                return finish({"status": "DENIED", "error": "system lockdown active"})
+            if not getattr(self, "token_sink", None):
+                return finish({"status": "ERROR", "error": "token_sink not initialized"})
+            action = payload.get("action", "stake")
+            target_wid = payload.get("worker_id") or payload.get("account_key") or str(sender_id)
+            if action == "status":
+                res = self.token_sink.get_staking_status(target_wid)
+                return finish({"status": "OK", **res})
+            if self.frozen:
+                return finish({"status": "DENIED", "error": "state is frozen (state_snapshot_freeze)"})
+            try:
+                amount = int(payload.get("amount", 50) or 50)
+            except (ValueError, TypeError):
+                return finish({"status": "ERROR", "error": "invalid staking amount"})
+            if action == "unstake":
+                res = self.token_sink.unstake_credits(target_wid, amount)
+            else:
+                res = self.token_sink.stake_credits(target_wid, amount)
+            return finish({"status": "OK" if res.get("ok") else "ERROR", **res})
 
         try:
             feature = self.registry.get(key)
@@ -422,9 +542,10 @@ class UltimateAgiSovereignGrid:
     HELP = ("Commands:\n/status_grid\n/features [block]\n/tiers\n/my_tier [worker_id]\n"
             "/run <feature_key> <text | json>\n"
             "/execute_autonomous_task <name> [| json]\n/tasks\n/models\n"
-            "/add_model <name> <role> <model_tag>\n/remove_model <name>\n"
+            "/add_model <name> <role> <model_tag>\n/add_models_bulk [count]\n/remove_model <name>\n"
             "/workers\n/register_worker <id> [url]\n/dispatch_worker <id> <feature> <payload>\n"
-            "/balance <worker_id>\n/spend_credits <worker_id> <amount> [reason]\n"
+            "/balance <worker_id>\n/add_credits <worker_id> <amount> [reason]\n"
+            "/spend_credits <worker_id> <amount> [reason]\n"
             "/transfer_credits <from> <to> <amount>\n/barter_task <worker_id> <feature> <payload>\n"
             "/set_payout <worker_id> <address>\n/deposit_revenue <client> <amount> [job_id]\n"
             "/settle_revenue [split_ratio]\n/payout_stats\n"
@@ -453,10 +574,16 @@ class UltimateAgiSovereignGrid:
 
         if intent == "/status_grid":
             ok, _ = self.ledger.verify()
-            nodes = "\n".join(f"  • {n.name} [{n.role}] {n.model}: {n.status}" for n in self.router.nodes)
+            shown_nodes = self.router.nodes[:15]
+            nodes = "\n".join(f"  • {n.name} [{n.role}] {n.model}: {n.status}" for n in shown_nodes)
+            if len(self.router.nodes) > 15:
+                nodes += f"\n  ... and {len(self.router.nodes) - 15} more active open-source model nodes."
             kinds = self.registry.kind_counts()
+            active_workers = len([w for w in self.hub.list_workers() if w.get("status") == "ACTIVE"]) if self.hub else 0
             return {"tele_response": (
-                f"📊 SOVEREIGN MESH OVERVIEW\nNode: {self.node_id}\nModel nodes:\n{nodes}\n"
+                f"📊 SOVEREIGN MESH OVERVIEW\nNode: {self.node_id}\n"
+                f"Active Edge Workers: {active_workers} nodes online (/workers to view list)\n"
+                f"Model nodes ({len(self.router.nodes)} total):\n{nodes}\n"
                 f"Features: {len(self.registry)} ({kinds['core']} core, {kinds['llm']} llm, "
                 f"{kinds['integration']} integration hooks, {kinds['hardware']} hardware hooks)\n"
                 f"Ledger: {len(self.ledger)} blocks ({'intact' if ok else 'TAMPERED'})\n"
@@ -500,6 +627,55 @@ class UltimateAgiSovereignGrid:
                 return {"tele_response": "❌ Operator role required."}
             return self._execute_autonomous_task(sender_id, payload)
 
+        if intent in {"/vote", "/consensus", "/verify_task"}:
+            prop = payload.get("proposal") or payload.get("text") or "Verify autonomous network safety"
+            vote = self.router.vote(prop, partial_failure_tolerant=self.partial_failure_tolerant,
+                                    simulate_offline=self.config.simulate_offline_consensus)
+            block = self.ledger.append("multi_model_vote", {
+                "proposal": prop[:200],
+                "passed": vote["passed"],
+                "approvals": vote["approvals"],
+                "total": vote["total"],
+                "simulated": vote.get("simulated", False),
+            })
+            tally_lines = []
+            for v in vote["votes"]:
+                emoji = "✅" if v["vote"] == "APPROVE" else ("❌" if v["vote"] == "REJECT" else "⚪")
+                tally_lines.append(f"  {emoji} {v['node']}: {v['vote']} ({v.get('reason', '')[:120]})")
+            tally_str = "\n".join(tally_lines)
+            status_emoji = "✅ CONSENSUS PASSED" if vote["passed"] else "❌ CONSENSUS REJECTED"
+            sim_tag = " [OFFLINE SIMULATION]" if vote.get("simulated") else ""
+            resp = (
+                f"🗳️ MULTI-MODEL VALIDATOR CONSENSUS BOARD{sim_tag}:\n"
+                f"• Proposal: \"{prop[:160]}\"\n"
+                f"• Verdict: {status_emoji} ({vote['approvals']}/{vote['responded']} Approvals, {vote['total']} Nodes)\n"
+                f"• Supermajority Requirement: >= 66.7% (2/3 Quorum)\n\n"
+                f"🤖 Network Model Votes:\n{tally_str}\n\n"
+                f"🧾 Ledger Block: {block['hash'][:16]}"
+            )
+            return {"tele_response": resp, "vote": vote, "ledger_block": block["hash"][:16]}
+
+        if intent in {"/debate", "/roundtable"}:
+            question = payload.get("question") or payload.get("text") or "Decentralized neural architecture safety"
+            rounds = int(payload.get("rounds", 2) or 2)
+            deb = self.router.debate(question, rounds=rounds, simulate_offline=self.config.simulate_offline_consensus)
+            round_lines = []
+            for r in deb.get("rounds", []):
+                round_lines.append(f"\n--- Round {r['round']} (Expert Positions) ---")
+                for pos in r.get("positions", []):
+                    txt = (pos.get("text") or pos.get("error") or "")[:250]
+                    round_lines.append(f"• [{pos['node']}]: {txt}")
+            rounds_str = "\n".join(round_lines)
+            resp = (
+                f"🗣️ MULTI-MODEL ROUNDTABLE DEBATE & VERIFICATION:\n"
+                f"• Topic: \"{question[:160]}\"\n"
+                f"• Active Panelists: {len(self.router.nodes)} Model Nodes\n"
+                f"{rounds_str}\n\n"
+                f"🎯 Consensus Synthesis & Moderator Verdict:\n"
+                f"{deb.get('synthesis', '')}"
+            )
+            return {"tele_response": resp, "debate": deb}
+
         if intent == "/tasks":
             tasks = self.tasks.list()[-15:]
             body = "\n".join(f"{t.id} {t.status:<9} p{t.priority} {t.name}" for t in tasks) or "(none)"
@@ -516,12 +692,15 @@ class UltimateAgiSovereignGrid:
                                      f"head {res.get('head')}"}
 
         if intent == "/models":
-            active = "\n".join(f"  • {n.name} [{n.role}] -> {n.model} ({n.status})" for n in self.router.nodes)
+            shown = self.router.nodes[:25]
+            active = "\n".join(f"  • {n.name} [{n.role}] -> {n.model} ({n.status})" for n in shown)
+            if len(self.router.nodes) > 25:
+                active += f"\n  ... and {len(self.router.nodes) - 25} more open-source models active in mesh."
             available = self.router.available_models()
             avail_str = ", ".join(available) if available else "(backend idle / none listed)"
             return {"tele_response": f"🤖 ACTIVE SWARM NODES ({len(self.router.nodes)}):\n{active}\n\n"
                                      f"📦 DISCOVERED IN BACKEND:\n{avail_str}\n\n"
-                                     f"Use /add_model <name> <role> <model_tag> to register a new model."}
+                                     f"Use /add_model <name> <role> <model_tag> or /add_models_bulk 300 to register models."}
 
         if intent == "/add_model":
             if role is not Role.OWNER:
@@ -535,6 +714,27 @@ class UltimateAgiSovereignGrid:
             res = self.router.add_node(name, model_role, model_tag)
             self.ledger.append("model_added", res)
             return {"tele_response": f"✅ Model node registered into mesh:\n{json.dumps(res, indent=1)}"}
+
+        if intent in {"/add_models_bulk", "/add_300_models"}:
+            if role is not Role.OWNER:
+                return {"tele_response": "❌ Owner role required to bulk-add models."}
+            count = int(payload.get("count", 300) or 300)
+            res = self.router.add_open_source_models_bulk(count)
+            self.ledger.append("models_bulk_added", {
+                "requested": count,
+                "added_count": res["added_count"],
+                "total_mesh_nodes": res["total_mesh_nodes"],
+            })
+            sample_str = "\n".join(f"  • {name}" for name in res["sample_nodes"])
+            return {
+                "tele_response": (
+                    f"✅ BULK OPEN-SOURCE MODELS REGISTERED!\n"
+                    f"Added Now: {res['added_count']} (Requested: {count})\n"
+                    f"Total Active Models in Mesh: {res['total_mesh_nodes']}\n\n"
+                    f"Sample Nodes:\n{sample_str}"
+                ),
+                "bulk_result": res,
+            }
 
         if intent == "/remove_model":
             if role is not Role.OWNER:
@@ -562,11 +762,17 @@ class UltimateAgiSovereignGrid:
                 return {"tele_response": "❌ Owner role required to register workers."}
             wid = payload.get("worker_id") or payload.get("text")
             if not wid:
-                return {"tele_response": "❌ Usage: /register_worker <worker_id> [url]"}
+                return {"tele_response": "❌ Usage: /register_worker <worker_id> [url] [referred_by]"}
             try:
-                rec = self.hub.register_worker(wid, payload.get("url", "local"))
-                return {"tele_response": f"✅ Worker registered: {rec.worker_id} (Initial stake: {rec.credits} credits)",
-                        "worker_key": rec.key}
+                rec = self.hub.register_worker(
+                    wid,
+                    payload.get("url", "local"),
+                    hardware_uuid=payload.get("hardware_uuid", ""),
+                    hardware_spec=payload.get("hardware_spec", ""),
+                    referred_by=payload.get("referred_by", ""),
+                )
+                return {"tele_response": f"✅ Worker registered: {rec.worker_id} (Initial stake: {rec.credits} credits | Referral Code: {rec.referral_code})",
+                        "worker_key": rec.key, "referral_code": rec.referral_code}
             except (PermissionError, ValueError) as exc:
                 return {"tele_response": f"❌ {exc}"}
 
@@ -602,7 +808,7 @@ class UltimateAgiSovereignGrid:
             try:
                 bal = self.hub.get_balance(wid)
                 return {"tele_response": f"👤 Worker {wid} [{bal['tier']} Tier]\n"
-                                         f"Credits: {bal['credits']} | Status: {bal['status']}\n"
+                                         f"Balance: {bal['credits']} UMAIS (Credits: {bal['credits']}) | Status: {bal['status']}\n"
                                          f"Tasks Completed: {bal['tasks_completed']} | Verified: {bal['tasks_verified']}\n"
                                          f"Pending Payout: ${bal['pending_payout_usd']:.2f} (Total: ${bal['total_payout_earned_usd']:.2f})"}
             except KeyError:
@@ -614,14 +820,36 @@ class UltimateAgiSovereignGrid:
                 return {"tele_response": "❌ Usage: /balance <worker_id>"}
             try:
                 b = self.hub.get_balance(wid)
-                return {"tele_response": f"💳 Worker {wid} Balance:\n"
-                                         f"Credits: {b['credits']} [{b['tier']} Tier]\n"
+                return {"tele_response": f"💳 Worker {wid} Balance (1 Credit = 1 UMAIS):\n"
+                                         f"Balance: {b['credits']} UMAIS (Credits: {b['credits']}) [{b['tier']} Tier]\n"
                                          f"Pending Payout: ${b['pending_payout_usd']:.2f}\n"
                                          f"Total Payout Earned: ${b['total_payout_earned_usd']:.2f}\n"
                                          f"Payout Address: {b['payout_address']}",
                         "balance": b}
             except KeyError:
                 return {"tele_response": f"❌ Unknown worker: {wid}"}
+
+        if intent in {"/add_credits", "/grant_credits"}:
+            if role is not Role.OWNER:
+                return {"tele_response": "❌ Owner role required to grant credits."}
+            wid = payload.get("worker_id", "")
+            amount = int(payload.get("amount", 0) or 0)
+            reason = payload.get("reason", "owner_grant")
+            if not wid or amount <= 0:
+                return {"tele_response": "❌ Usage: /add_credits <worker_id_or_key> <amount> [reason]"}
+            try:
+                res = self.hub.grant_credits(wid, amount, reason)
+                return {
+                    "tele_response": (
+                        f"💰 CREDITS GRANTED SUCCESSFULLY! (1 Credit = 1 UMAIS)\n"
+                        f"Worker: {res['worker_id']}\n"
+                        f"Added: +{res['added_credits']} UMAIS / credits ({res['reason']})\n"
+                        f"Previous Balance: {res['previous_credits']} UMAIS -> New Balance: {res['new_credits']} UMAIS [{res['tier']} Tier]"
+                    ),
+                    "grant_result": res,
+                }
+            except (KeyError, PermissionError, ValueError) as exc:
+                return {"tele_response": f"❌ {exc}"}
 
         if intent == "/spend_credits":
             wid = payload.get("worker_id", "")
@@ -725,6 +953,419 @@ class UltimateAgiSovereignGrid:
                 f"Registered Workers ({len(workers)}):\n" + "\n".join(lines)),
                 "stats": stats}
 
+        if intent in {"/top_miners", "/leaderboard"}:
+            limit = int(payload.get("limit", 10) or 10)
+            lb = self.hub.get_top_miners_leaderboard(limit=limit)
+            halving = lb["halving"]
+            leaders = lb["leaderboard"]
+            lines = [
+                f"  {m['badge'] or ('#' + str(m['rank']))} {m['worker_id']} [{m.get('hardware_spec', 'Standard Rig')}] — "
+                f"Score: {m['competition_score']} (Tasks: {m['tasks_verified']}, Uptime: {m['uptime_hours']}h, "
+                f"Credits: {m['credits']}, Referrals: {m.get('referrals_count', 0)})"
+                for m in leaders
+            ]
+            body_str = "\n".join(lines) if lines else "  (No active miners yet)"
+            return {
+                "tele_response": (
+                    f"🏆 WEEKLY SUNDAY TOP 3 MINERS BUYBACK LEADERBOARD (HARDWARE FLEX):\n"
+                    f"⚡ Halving Era: {halving['era']} ({halving['active_workers']} Active Workers)\n"
+                    f"⛏️ Idle Mining Rate: {halving['idle_credits_per_hour_standard']} cr/hr (Standard) | "
+                    f"Active Task Reward: +{halving['active_task_reward_credits']} cr/task\n"
+                    f"💰 Sunday Official Floor Buyback: {lb['sunday_buyback_pool']['official_floor_rate_pkr']} PKR each for Top 3!\n\n"
+                    f"Current Rankings:\n{body_str}\n\n"
+                    f"👑 Owner Command to Settle Top 3 Buyback: /reward_top_miners [pkr_each] [credits_each]"
+                ),
+                "leaderboard": lb,
+            }
+
+        if intent in {"/referral", "/referrals"}:
+            wid = payload.get("worker_id") or payload.get("text", "")
+            if not wid:
+                return {"tele_response": "👥 Usage: /referral <worker_id_or_key>\nEarn +5% extra bonus credits on all mining & tasks completed by workers who join with your Referral Code!"}
+            try:
+                bal = self.hub.get_balance(wid)
+                return {
+                    "tele_response": (
+                        f"👥 VIRAL REFERRAL MULTIPLIER (+5% NETWORK EFFECT):\n"
+                        f"• Worker: {bal['worker_id']}\n"
+                        f"• Your Referral Code: {bal['referral_code']}\n"
+                        f"• Referred By: {bal.get('referred_by') or '(Direct Genesis Node)'}\n"
+                        f"• Active Referrals Joined: {bal.get('referrals_count', 0)} workers\n"
+                        f"• Total +5% Bonus Credits Earned: +{bal.get('referral_bonus_credits', 0)} credits\n\n"
+                        f"🚀 Share your Referral Code '{bal['referral_code']}' on X, LinkedIn, or Reddit — whenever your invited workers mine or complete tasks, the protocol automatically mints +5% extra bonus credits to your wallet!"
+                    ),
+                    "referral": bal,
+                }
+            except KeyError:
+                return {"tele_response": f"❌ Unknown worker: {wid}"}
+
+        if intent in {"/distillation_stats", "/cot_cache"}:
+            dstats = self.router.distillation_stats()
+            return {
+                "tele_response": (
+                    f"🧠 CoT KNOWLEDGE DISTILLATION & LOCAL SELF-TRAINING CACHE:\n"
+                    f"• Cached Frontier CoT Solutions: {dstats['cached_cot_solutions']}\n"
+                    f"• External Frontier API Calls Saved: {dstats['external_api_calls_saved']}\n"
+                    f"• Buyer Credits Saved via Local Distillation: {dstats['estimated_credits_saved']} credits"
+                ),
+                "distillation_stats": dstats,
+            }
+
+        if intent in {"/brain_matrix", "/brain"}:
+            bstatus = self.brain_matrix.autonomy_era_status()
+            shards_lines = [
+                f"  • [{s['shard_id']}] {s['base_expert']} — Holders: {s['active_worker_holders']} workers ({s['target_hardware']})"
+                for s in bstatus["specialization_shards"]
+            ]
+            fl = bstatus["freedom_loop_stats"]
+            p2p_mem = bstatus["p2p_memory_fusion"]
+            surv = p2p_mem["survivability"]
+            return {
+                "tele_response": (
+                    f"🧠 DECENTRALIZED BRAIN MATRIX (THE FREEDOM LOOP):\n"
+                    f"⚡ Current Phase: {bstatus['era_name']}\n"
+                    f"📉 External API Dependency: {bstatus['effective_api_dependency_pct']}% (Baseline: {bstatus['baseline_api_dependency_pct']}%)\n"
+                    f"🚀 Local Brain Autonomy: {bstatus['local_brain_autonomy_pct']}%\n\n"
+                    f"1️⃣ Brain Splitting & Specialization Shards:\n" + "\n".join(shards_lines) + "\n\n"
+                    f"2️⃣ Self-Play & Synthetic Dataset Generation:\n"
+                    f"  • Self-Play Cycles Run: {fl['self_play_cycles_run']}\n"
+                    f"  • Verified Synthetic Samples: {fl['synthetic_samples_verified']}\n"
+                    f"  • Total Distilled + Synthetic CoT Units: {fl['cached_cot_solutions']}\n"
+                    f"  • External API Calls Saved: {fl['external_api_calls_saved']}\n\n"
+                    f"3️⃣ P2P Memory Fusion & Shared Weights Ledger:\n"
+                    f"  • Replicated Weight Deltas: {p2p_mem['total_weight_deltas']}\n"
+                    f"  • Brain Survival Rate: {surv['brain_survival_rate_pct']}% (Immortal P2P Backup: {'YES' if surv['immortal_status'] else 'DEGRADED'})"
+                ),
+                "brain_matrix": bstatus,
+            }
+
+        if intent == "/self_play":
+            seed = payload.get("seed_prompt") or payload.get("text") or "Distributed Byzantine fault-tolerant neural consensus and formal verification"
+            count = int(payload.get("variations_count", 4) or 4)
+            sp = self.brain_matrix.run_self_play_freedom_loop(seed_prompt=seed, variations_count=count)
+            return {
+                "tele_response": (
+                    f"🔄 SELF-PLAY & SYNTHETIC FREEDOM LOOP COMPLETED:\n"
+                    f"• Target Brain Shard: {sp['domain_shard']} ({sp['base_expert']})\n"
+                    f"• Seed Topic: {sp['seed_topic']}\n"
+                    f"• Verified Synthetic Q&A + Contradiction Proofs Added: +{sp['synthetic_verified']}\n"
+                    f"• P2P Weight Delta Synced: {sp['p2p_delta']['delta_id']} (Holders: {', '.join(sp['p2p_delta']['holder_worker_ids'])})"
+                ),
+                "self_play": sp,
+            }
+
+        if intent == "/brain_sync":
+            shard = payload.get("domain_shard") or payload.get("text") or "CODE_DEBUG_EXEC"
+            if shard not in {"MATH_PROOF_LOGIC", "CODE_DEBUG_EXEC", "SECURITY_AUDIT_REDTEAM", "DATA_MEMORY_SYNTHESIS"}:
+                shard = "CODE_DEBUG_EXEC"
+            delta = self.brain_matrix.sync_p2p_weight_delta(
+                domain_shard=shard,
+                delta_summary=f"Manual P2P Weight & Memory Fusion Sync for {shard}",
+            )
+            return {
+                "tele_response": (
+                    f"🌐 P2P MEMORY FUSION & SHARED WEIGHTS DELTA SYNCED:\n"
+                    f"• Delta ID: {delta['delta_id']}\n"
+                    f"• Domain Shard: {delta['domain_shard']}\n"
+                    f"• SHA-256 Anchor: {delta['sha256_anchor'][:24]}...\n"
+                    f"• Replicated Across ({delta['replication_factor']} Nodes): {', '.join(delta['holder_worker_ids'])}"
+                ),
+                "delta": delta,
+            }
+
+        if intent in {"/reward_top_miners", "/buyback_top3"}:
+            if role is not Role.OWNER:
+                return {"tele_response": "❌ Owner role required to settle Weekly Top 3 Miners Buyback."}
+            pkr_each = float(payload.get("reward_pkr_each", 500.0) or 500.0)
+            cr_each = int(payload.get("credits_bought_each", 100) or 100)
+            res = self.hub.execute_weekly_top3_buyback(reward_pkr_each=pkr_each, credits_bought_each=cr_each)
+            if not res.get("ok"):
+                return {"tele_response": f"❌ {res.get('error')}"}
+            lines = [
+                f"  #{w['rank']} {w['worker_id']}: Paid PKR {w['reward_pkr']:.0f} (${w['reward_usd_equivalent']:.2f}) "
+                f"| Bought {w['credits_bought_back']} cr (Remaining: {w['remaining_credits']} cr) | Acc: {w['payout_address']}"
+                for w in res.get("winners", [])
+            ]
+            return {
+                "tele_response": (
+                    f"🎉 WEEKLY TOP 3 MINERS OFFICIAL BUYBACK SETTLED!\n"
+                    f"Total Paid: PKR {res['total_pkr_paid']:.0f} | Total Credits Bought Back: {res['total_credits_bought_back']} cr\n"
+                    f"Winners:\n" + "\n".join(lines) + f"\nLedger Block: {res['ledger_block']}"
+                ),
+                "buyback": res,
+            }
+
+        if intent in {"/p2p_market", "/market"}:
+            orders = self.p2p.list_orders(status="OPEN")
+            stats = self.p2p.market_stats()
+            if not orders:
+                return {"tele_response": (
+                    f"🤝 P2P CREDITS MARKETPLACE:\n"
+                    f"No active sell offers right now.\n\n"
+                    f"💡 To SELL your earned credits for EasyPaisa/JazzCash:\n"
+                    f"  /p2p_sell <worker_id> <credits> <price_pkr> <payment_info>\n"
+                    f"  Example: /p2p_sell worker-1 50 250 EasyPaisa:03001234567"),
+                    "market_stats": stats, "orders": []}
+            lines = [
+                f"  🏷️ [{o['order_id']}] {o['amount_credits']} Credits for {o['currency']} {o['price_fiat']:.0f} "
+                f"({o['price_per_credit']:.1f}/credit) by {o['seller_id']} | Method: {o['payment_method']}"
+                for o in orders
+            ]
+            return {"tele_response": (
+                f"🤝 P2P CREDITS MARKETPLACE ({len(orders)} offers open):\n" + "\n".join(lines) + "\n\n"
+                f"💡 To BUY credits: /p2p_buy <order_id> <your_worker_id>\n"
+                f"💡 To SELL credits: /p2p_sell <worker_id> <amount> <price_pkr> <payment_info>"),
+                "orders": orders, "market_stats": stats}
+
+        if intent == "/p2p_sell":
+            wid = payload.get("worker_id", "")
+            amt = int(payload.get("amount", 0) or 0)
+            price = float(payload.get("price", 0.0) or 0.0)
+            method = payload.get("payment_method") or payload.get("text", "")
+            curr = payload.get("currency", "PKR")
+            if not wid or amt <= 0 or price <= 0:
+                return {"tele_response": "❌ Usage: /p2p_sell <worker_id> <credits_amount> <price_pkr> <payment_info>\n"
+                                         "Example: /p2p_sell worker-1 100 500 EasyPaisa:03001234567"}
+            try:
+                res = self.p2p.create_sell_order(wid, amt, price, method or "EasyPaisa / JazzCash", currency=curr)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {"tele_response": (
+                    f"✅ SELL OFFER LISTED & ESCROW LOCKED!\n"
+                    f"Order ID: {res['order_id']}\n"
+                    f"Offering: {amt} Credits for {curr} {price:.2f}\n"
+                    f"Escrow: {amt} credits locked from {wid} (Remaining: {res['seller_balance']})\n"
+                    f"Buyer can now buy this order via Web Studio or Telegram.")}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/p2p_buy_order":
+            bid = payload.get("buyer_id") or payload.get("worker_id", "")
+            amt = int(payload.get("amount", 0) or 0)
+            price = float(payload.get("price", 0.0) or 0.0)
+            method = payload.get("payment_method") or payload.get("text", "EasyPaisa / JazzCash")
+            curr = payload.get("currency", "PKR")
+            if not bid or amt <= 0 or price <= 0:
+                return {"tele_response": "❌ Usage: /p2p_buy_order <buyer_id> <credits_amount> <offered_price_pkr> [payment_method]\n"
+                                         "Example: /p2p_buy_order buyer-1 250 150 EasyPaisa"}
+            try:
+                res = self.p2p.create_buy_order(bid, amt, price, method, currency=curr)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {"tele_response": (
+                    f"📢 BUY ORDER PUBLISHED ON P2P MARKET!\n"
+                    f"Order ID: {res['order_id']}\n"
+                    f"Want to Buy: {amt} Credits for {curr} {price:.2f}\n"
+                    f"Buyer: {res['buyer_id']} | Preferred Method: {res['payment_method']}\n"
+                    f"Any Miner/Seller can now accept your Buy Order via Web Studio or /p2p_sell_to_buyer!")}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/p2p_sell_to_buyer":
+            oid = payload.get("order_id", "")
+            sid = payload.get("seller_id", "")
+            method = payload.get("payment_method") or payload.get("text", "")
+            if not oid or not sid:
+                return {"tele_response": "❌ Usage: /p2p_sell_to_buyer <order_id> <seller_id> <your_easypaisa_or_jazzcash>"}
+            try:
+                res = self.p2p.accept_buy_order(oid, sid, seller_payment_method=method)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {"tele_response": (
+                    f"🔒 BUY ORDER ACCEPTED & CREDITS LOCKED IN ESCROW!\n"
+                    f"Order ID: {res['order_id']}\n"
+                    f"Seller: {res['seller_id']} ➡️ Buyer: {res['buyer_id']}\n"
+                    f"Escrow Locked: {res['amount_credits']} Credits (Remaining Balance: {res['seller_balance']})\n"
+                    f"Buyer will now send {res['currency']} {res['price_fiat']:.2f} to {res['payment_method']}.")}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/p2p_buy":
+            oid = payload.get("order_id", "")
+            bid = payload.get("buyer_id") or payload.get("buyer_worker_id", "")
+            if not oid or not bid:
+                return {"tele_response": "❌ Usage: /p2p_buy <order_id> <buyer_worker_id>"}
+            try:
+                res = self.p2p.initiate_buy(oid, bid)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {"tele_response": (
+                    f"🔒 ORDER RESERVED IN ESCROW!\n"
+                    f"Order: {res['order_id']} ({res['amount_credits']} Credits)\n"
+                    f"Total Amount to Pay: {res['currency']} {res['price_fiat']:.2f}\n"
+                    f"Payment Details: {res['payment_method']}\n\n"
+                    f"👉 Once you send money via EasyPaisa/JazzCash, notify the seller with:\n"
+                    f"  /p2p_pay {res['order_id']} {bid} <Transaction_ID>")}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/p2p_pay":
+            oid = payload.get("order_id", "")
+            bid = payload.get("buyer_id") or payload.get("buyer_worker_id", "")
+            ref = payload.get("ref") or payload.get("tid") or payload.get("text", "")
+            if not oid or not bid or not ref:
+                return {"tele_response": "❌ Usage: /p2p_pay <order_id> <buyer_worker_id> <TID_or_receipt>"}
+            try:
+                res = self.p2p.submit_payment(oid, bid, ref)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {"tele_response": f"📨 {res['message']}\nTID: {ref}"}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent in {"/dispute", "/p2p_dispute"}:
+            oid = payload.get("order_id", "")
+            cid = payload.get("caller_id") or payload.get("worker_id") or str(sender_id)
+            reason = payload.get("reason") or payload.get("text", "Payment / Screenshot Dispute")
+            is_owner = (role is Role.OWNER)
+            if not oid:
+                return {"tele_response": "❌ Usage: /dispute <order_id> <your_worker_id> [reason]"}
+            try:
+                res = self.p2p.raise_dispute(oid, cid, reason=reason, is_owner=is_owner)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {
+                    "tele_response": (
+                        f"🚨 P2P DISPUTE RAISED & ACCOUNTS FROZEN!\n"
+                        f"Order: {res['order_id']} (Status: {res['status']})\n"
+                        f"Frozen Accounts: {', '.join(res.get('frozen_accounts', []))}\n"
+                        f"Reason: {res['reason']}\n"
+                        f"📲 Sovereign Owner has been notified on Telegram for arbitration.\n"
+                        f"Ledger Block: {res['ledger_block']}"
+                    ),
+                    "dispute": res,
+                }
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/p2p_release":
+            oid = payload.get("order_id", "")
+            sid = payload.get("seller_id", "")
+            is_owner = (role is Role.OWNER)
+            if not oid:
+                return {"tele_response": "❌ Usage: /p2p_release <order_id> [seller_id]"}
+            try:
+                res = self.p2p.confirm_and_release(oid, sid or str(sender_id), is_owner=is_owner)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {"tele_response": (
+                    f"🎉 ESCROW RELEASED & TRADE SETTLED!\n"
+                    f"Order: {res['order_id']}\n"
+                    f"{res['credits_released']} Credits delivered to Buyer '{res['buyer_id']}'!\n"
+                    f"Buyer New Balance: {res['buyer_new_balance']} credits.\n"
+                    f"Ledger Block: {res['ledger_block']}")}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/p2p_cancel":
+            oid = payload.get("order_id", "")
+            sid = payload.get("seller_id", "")
+            is_owner = (role is Role.OWNER)
+            if not oid:
+                return {"tele_response": "❌ Usage: /p2p_cancel <order_id> [seller_id]"}
+            try:
+                res = self.p2p.cancel_order(oid, sid or str(sender_id), is_owner=is_owner)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {"tele_response": f"↩️ Order {res['order_id']} cancelled. {res['refunded_credits']} credits refunded to {res['seller_id']}."}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent in {"/rent_server", "/rent_cluster"}:
+            wid = payload.get("worker_id") or payload.get("account_key", "")
+            cores = int(payload.get("cores", 8) or 8)
+            ram = int(payload.get("ram_gb") or payload.get("ram", 32) or 32)
+            duration = int(payload.get("duration", 1) or 1)
+            tier = payload.get("tier_name") or f"Cluster-{cores}C-{ram}GB"
+            if not wid:
+                return {"tele_response": "❌ Usage: /rent_server <account_key> <cores> <ram_gb> [duration_hours]"}
+            try:
+                res = self.supercomputer.provision_server(wid, tier, cores, ram, duration)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                inst = res["instance"]
+                return {"tele_response": (
+                    f"🚀 SUPERCOMPUTER CLUSTER PROVISIONED!\n"
+                    f"Instance ID: {inst['instance_id']}\n"
+                    f"Tier: {inst['tier_name']}\n"
+                    f"Cores: {inst['allocated_cores']} vCPUs | RAM: {inst['allocated_ram_gb']} GB\n"
+                    f"Pooled Edge Workers: {inst['nodes_count']} nodes\n"
+                    f"Virtual Endpoint: {inst['endpoint']}\n"
+                    f"Duration: {inst['duration_hours']} hour(s) (Cost: {res['credits_spent']} credits)\n"
+                    f"Remaining Balance: {res['remaining_credits']} credits\n"
+                    f"Ledger Hash: {res['ledger_block']}"),
+                    "instance": inst}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent in {"/my_servers", "/supercomputers"}:
+            wid = payload.get("worker_id") or payload.get("account_key", "")
+            servers = self.supercomputer.list_instances(wid or None)
+            if not servers:
+                return {"tele_response": "ℹ️ No supercomputer clusters active. Rent one with /rent_server!"}
+            lines = [
+                f"  🖥️ [{s['instance_id']}] {s['tier_name']} ({s['allocated_cores']} cores, {s['allocated_ram_gb']}GB) - "
+                f"{s['status']} ({s['nodes_count']} workers pooled, {s['remaining_seconds']}s left)"
+                for s in servers
+            ]
+            return {"tele_response": f"🚀 CLUSTERED SUPERCOMPUTERS ({len(servers)}):\n" + "\n".join(lines),
+                    "servers": servers}
+
+        if intent == "/run_server_job":
+            iid = payload.get("instance_id", "")
+            wid = payload.get("worker_id") or payload.get("account_key", "")
+            name = payload.get("job_name", "Telegram Parallel Task")
+            if not iid:
+                return {"tele_response": "❌ Usage: /run_server_job <instance_id> <account_key> [job_name]"}
+            try:
+                res = self.supercomputer.dispatch_job(iid, wid, name, "")
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                job = res["job"]
+                return {"tele_response": (
+                    f"⚡ CLUSTER JOB EXECUTED!\n"
+                    f"Job ID: {job['job_id']}\n"
+                    f"Instance: {iid}\n"
+                    f"Distributed Across: {job['nodes_utilized']} edge nodes ({job['cores_active']} cores)\n"
+                    f"Execution Time: {job['elapsed_ms']} ms\n"
+                    f"Telemetry: {job['summary']}"),
+                    "job": job}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
+        if intent == "/pause_server":
+            iid = payload.get("instance_id", "")
+            wid = payload.get("worker_id") or payload.get("account_key", "")
+            if not iid:
+                return {"tele_response": "❌ Usage: /pause_server <instance_id>"}
+            res = self.supercomputer.pause_server(iid, wid)
+            if not res.get("ok"):
+                return {"tele_response": f"❌ {res.get('error')}"}
+            return {"tele_response": f"⏸️ {res['message']}", "instance": res.get("instance")}
+
+        if intent == "/resume_server":
+            iid = payload.get("instance_id", "")
+            wid = payload.get("worker_id") or payload.get("account_key", "")
+            if not iid:
+                return {"tele_response": "❌ Usage: /resume_server <instance_id>"}
+            res = self.supercomputer.resume_server(iid, wid)
+            if not res.get("ok"):
+                return {"tele_response": f"❌ {res.get('error')}"}
+            return {"tele_response": f"▶️ {res['message']}", "instance": res.get("instance")}
+
+        if intent in {"/stop_server", "/terminate_server"}:
+            iid = payload.get("instance_id", "")
+            wid = payload.get("worker_id") or payload.get("account_key", "")
+            if not iid:
+                return {"tele_response": "❌ Usage: /stop_server <instance_id>"}
+            try:
+                res = self.supercomputer.terminate_server(iid, wid)
+                if not res.get("ok"):
+                    return {"tele_response": f"❌ {res.get('error')}"}
+                return {"tele_response": f"🛑 {res['message']}"}
+            except Exception as exc:
+                return {"tele_response": f"❌ {exc}"}
+
         if intent == "/kill_switch":
             res = self.run_feature(sender_id, "kill_switch_protocol", {"text": payload.get("text", "telegram")},
                                    via="telegram")
@@ -788,3 +1429,8 @@ class UltimateAgiSovereignGrid:
         return {"tele_response": f"✅ CONSENSUS ACHIEVED{sim}\nTask: {title} (id {task.id})\n{tally}\n"
                                  f"Ledger block: {block['hash'][:16]}\nDispatch: {dispatch}",
                 "task_id": task.id, "vote": vote}
+
+
+# Alias for clean programmatic and architectural naming
+SovereignGrid = UltimateAgiSovereignGrid
+

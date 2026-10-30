@@ -14,7 +14,8 @@ def _orchestrate(grid, p):
 
 
 def _debate(grid, p):
-    return {"status": "OK", **grid.router.debate(require_text(p), clamp(p.get("rounds"), 1, 4, 2))}
+    return {"status": "OK", **grid.router.debate(require_text(p), clamp(p.get("rounds"), 1, 4, 2),
+                                                 simulate_offline=grid.config.simulate_offline_consensus)}
 
 
 def _consensus(grid, p):
