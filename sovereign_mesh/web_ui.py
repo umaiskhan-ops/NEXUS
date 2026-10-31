@@ -2615,7 +2615,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
     /* ========================================================= */
     function renderChatHistory() {{
       const cont = document.getElementById('chat-history-container');
-      cont.innerHTML = '';
+      cont.safeHtml = '';
       const sessionIds = Object.keys(chatSessions);
       if (sessionIds.length === 0) {{
         chatSessions['default'] = {{ title: 'New Session', messages: [] }};
@@ -2624,7 +2624,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
         const s = chatSessions[sid];
         const item = document.createElement('div');
         item.className = 'chat-history-item' + (sid === currentChatSessionId ? ' active' : '');
-        item.innerHTML = `
+        item.safeHtml = `
           <span style="overflow:hidden; text-overflow:ellipsis;">${{escapeHtml(s.title || 'Session')}}</span>
           <button class="del-btn" onclick="event.stopPropagation(); deleteChatSession('${{sid}}')">✕</button>
         `;
@@ -2711,10 +2711,10 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
 
       const body = document.createElement('div');
       body.className = 'msg-body';
-      body.innerHTML = formatMarkdown(content);
+      body.safeHtml = formatMarkdown(content);
 
       if (meta) {{
-        body.innerHTML += `<div style="font-size:0.72rem; font-family:var(--font-mono); color:var(--text-muted); margin-top:0.45rem;">${{meta}}</div>`;
+        appendSafeHtml(body, `<div style="font-size:0.72rem; font-family:var(--font-mono); color:var(--text-muted); margin-top:0.45rem;">${{meta}}</div>`);
       }}
 
       row.appendChild(avatar);
@@ -2746,7 +2746,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
       const thinkRow = document.createElement('div');
       thinkRow.className = 'msg-row';
       thinkRow.id = 'think-row';
-      thinkRow.innerHTML = `
+      thinkRow.safeHtml = `
         <div class="msg-avatar avatar-ai">NX</div>
         <div class="msg-body" style="color:var(--text-muted); font-family:var(--font-mono); font-size:0.8rem;">Dispatching query across SUP Agentic Mesh...</div>
       `;
@@ -2851,8 +2851,35 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
     }}
 
     function escapeHtml(str) {{
-      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+      return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }}
+
+    function setSafeHtml(el, htmlStr) {{
+      if (!el) return;
+      if (!htmlStr) {{ el.textContent = ''; return; }}
+      const tag = (el.tagName || 'DIV').toUpperCase();
+      const wrapMap = {{ TBODY: ['<table><tbody>', '</tbody></table>', 2], TR: ['<table><tbody><tr>', '</tr></tbody></table>', 3] }};
+      const wrap = wrapMap[tag];
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(wrap ? (wrap[0] + htmlStr + wrap[1]) : ('<div>' + htmlStr + '</div>'), 'text/html');
+      doc.querySelectorAll('script,iframe,object,embed').forEach(n => n.remove());
+      let root = doc.body.firstElementChild;
+      if (wrap) {{ for (let i = 1; i < wrap[2]; i++) {{ if (root) root = root.firstElementChild; }} }}
+      if (root) {{ el.replaceChildren(...Array.from(root.childNodes)); }} else {{ el.textContent = ''; }}
+    }}
+
+    function appendSafeHtml(el, htmlStr) {{
+      if (!el || !htmlStr) return;
+      const parser = new DOMParser();
+      const doc = parser.parseFromString('<div>' + htmlStr + '</div>', 'text/html');
+      doc.querySelectorAll('script,iframe,object,embed').forEach(n => n.remove());
+      const root = doc.body.firstElementChild;
+      if (root) {{ Array.from(root.childNodes).forEach(n => el.appendChild(n)); }}
+    }}
+    Object.defineProperty(Element.prototype, 'safeHtml', {{
+      set(v) {{ setSafeHtml(this, v); }},
+      get() {{ return this.textContent || ''; }}
+    }});
 
     /* ========================================================= */
     /* REAL VS CODE & MONACO ENGINE + CUSTOM PROJECT MANAGEMENT  */
@@ -2884,7 +2911,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
         const data = await res.json();
         if (data.ok && data.projects) {{
           recentProjectsList = data.projects;
-          listDiv.innerHTML = data.projects.map(p => `
+          listDiv.safeHtml = data.projects.map(p => `
             <div style="display:flex; justify-content:space-between; align-items:center; background:#090a0f; border:1px solid var(--border); border-radius:6px; padding:0.4rem 0.65rem; cursor:pointer;" onclick="selectRecentProject('${{escapeHtml(String(p).replace(/\\\\/g, '/'))}}')">
               <span style="font-family:var(--font-mono); font-size:0.78rem; color:${{p === currentProjectRoot ? 'var(--accent)' : 'var(--text)'}};">
                 ${{p === currentProjectRoot ? '● [MOUNTED] ' : ''}}${{escapeHtml(p)}}
@@ -3017,13 +3044,13 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
       if (projectPath) currentProjectRoot = projectPath;
       const tree = document.getElementById('ide-file-tree');
       if (!tree) return;
-      tree.innerHTML = `<div style="padding:0.75rem; color:var(--text-muted); font-size:0.76rem;">Indexing ${{currentProjectRoot}}...</div>`;
+      tree.safeHtml = `<div style="padding:0.75rem; color:var(--text-muted); font-size:0.76rem;">Indexing ${{currentProjectRoot}}...</div>`;
 
       try {{
         const res = await fetch('/api/ide/files?project=' + encodeURIComponent(currentProjectRoot));
         const data = await res.json();
         if (!data.ok || !data.files) {{
-          tree.innerHTML = '<div style="padding:0.75rem; color:var(--danger); font-size:0.76rem;">Failed to index directory</div>';
+          tree.safeHtml = '<div style="padding:0.75rem; color:var(--danger); font-size:0.76rem;">Failed to index directory</div>';
           return;
         }}
         cachedFilesList = data.files;
@@ -3034,11 +3061,11 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
         }}
 
         if (data.files.length === 0) {{
-          tree.innerHTML = '<div style="padding:1rem; color:var(--text-muted); font-size:0.78rem; text-align:center;">Empty directory.<br><button class="account-btn" style="margin-top:0.5rem;" onclick="createNewProjectFile()">+ New File</button></div>';
+          tree.safeHtml = '<div style="padding:1rem; color:var(--text-muted); font-size:0.78rem; text-align:center;">Empty directory.<br><button class="account-btn" style="margin-top:0.5rem;" onclick="createNewProjectFile()">+ New File</button></div>';
           return;
         }}
 
-        tree.innerHTML = data.files.map(f => {{
+        tree.safeHtml = data.files.map(f => {{
           if (f.is_dir) {{
             return `<div style="padding:0.25rem 0.6rem; font-weight:600; font-family:var(--font-mono); color:var(--text-muted); font-size:0.74rem;">/${{f.path}}</div>`;
           }}
@@ -3058,7 +3085,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
           if (firstFile) switchIdeFile(firstFile.path);
         }}
       }} catch(err) {{
-        tree.innerHTML = `<div style="padding:0.75rem; color:var(--danger); font-size:0.76rem;">Error: ${{err.toString()}}</div>`;
+        tree.safeHtml = `<div style="padding:0.75rem; color:var(--danger); font-size:0.76rem;">Error: ${{err.toString()}}</div>`;
       }}
     }}
 
@@ -3157,7 +3184,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
 
       const startCard = document.createElement('div');
       startCard.className = 'agent-step-card';
-      startCard.innerHTML = `
+      startCard.safeHtml = `
         <div style="display:flex; justify-content:space-between; margin-bottom:0.25rem;">
           <strong style="color:var(--accent); font-size:0.75rem;">DISPATCHED</strong>
           <span style="font-size:0.7rem; font-family:var(--font-mono); color:var(--text-muted);">${{timeStr}}</span>
@@ -3196,7 +3223,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
 
           const resCard = document.createElement('div');
           resCard.className = 'agent-step-card';
-          resCard.innerHTML = `
+          resCard.safeHtml = `
             <div style="display:flex; justify-content:space-between; margin-bottom:0.25rem;">
               <strong style="color:var(--success); font-size:0.75rem;">VERIFIED &amp; COMMITTED</strong>
               <span class="credits-pill" style="font-size:0.68rem;">${{data.elapsed_ms}}ms</span>
@@ -3290,13 +3317,13 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
       const scr = document.getElementById('ide-terminal-screen');
       if (!scr) return;
       const time = new Date().toLocaleTimeString();
-      scr.innerHTML += `\\n<span style="color:${{color}}">[${{time}}] ${{escapeHtml(text)}}</span>`;
+      appendSafeHtml(scr, `\\n<span style="color:${{color}}">[${{time}}] ${{escapeHtml(text)}}</span>`);
       scr.scrollTop = scr.scrollHeight;
     }}
 
     function clearIdeTerminal() {{
       const scr = document.getElementById('ide-terminal-screen');
-      if (scr) scr.innerHTML = '<span style="color:var(--text-muted);">[Console Buffer Cleared]</span>';
+      if (scr) scr.safeHtml = '<span style="color:var(--text-muted);">[Console Buffer Cleared]</span>';
     }}
 
     function switchTerminalTab(tab) {{
@@ -3411,10 +3438,10 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
         updateHalvingBadge(data);
         const tbody = document.getElementById('p2p-leaderboard-tbody');
         if (!tbody) return;
-        tbody.innerHTML = '';
+        tbody.safeHtml = '';
         const list = data.leaderboard || [];
         if (list.length === 0) {{
-          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1.75rem;">No active edge worker nodes registered in current epoch.</td></tr>';
+          tbody.safeHtml = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1.75rem;">No active edge worker nodes registered in current epoch.</td></tr>';
           return;
         }}
         list.forEach(m => {{
@@ -3426,7 +3453,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
           const eligBadge = m.eligible_for_sunday_buyback
             ? `<span class="tech-pill" style="color:var(--success); border-color:rgba(16,185,129,0.35);">QUALIFIED (PKR 500 FLOOR)</span>`
             : `<span style="color:var(--text-muted); font-size:0.74rem; font-family:var(--font-mono);">ACTIVE</span>`;
-          tr.innerHTML = `
+          tr.safeHtml = `
             <td style="font-family:var(--font-mono); font-weight:700;">${{rankLabel}}</td>
             <td><code style="font-family:var(--font-mono);">${{escapeHtml(m.worker_id)}}</code></td>
             <td>
@@ -3487,9 +3514,9 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
           const shardsMap = surv.shards || {{}};
           const shardKeys = Object.keys(shardsMap);
           if (shardKeys.length === 0) {{
-            shardsTbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:1rem;">No neural shards initialized.</td></tr>';
+            shardsTbody.safeHtml = '<tr><td colspan="6" style="text-align:center; color:var(--text-muted); padding:1rem;">No neural shards initialized.</td></tr>';
           }} else {{
-            shardsTbody.innerHTML = shardKeys.map(sid => {{
+            shardsTbody.safeHtml = shardKeys.map(sid => {{
               const s = shardsMap[sid];
               const pHolders = (s.primary_holders || []).join(', ') || 'Auto-Routing';
               const rHolders = (s.replica_holders || []).join(', ') || 'sovereign-hub-vault';
@@ -3521,7 +3548,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
         const erasTbody = document.getElementById('bm-eras-tbody');
         if (erasTbody) {{
           const timeline = data.era_timeline || [];
-          erasTbody.innerHTML = timeline.map(e => {{
+          erasTbody.safeHtml = timeline.map(e => {{
             const isCurr = (data.era && data.era.startsWith(e.era.split(' ')[0] + ' ' + e.era.split(' ')[1]));
             const statusPill = isCurr
               ? `<span class="tech-pill" style="color:var(--accent); border-color:rgba(59,130,246,0.45);">● ACTIVE PHASE</span>`
@@ -3643,15 +3670,15 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
 
         // 1. Render Sell Offers (Sellers offering credits)
         const tbody = document.getElementById('p2p-offers-tbody');
-        tbody.innerHTML = '';
+        tbody.safeHtml = '';
         const sellOrders = data.sell_orders || (data.orders || []).filter(o => (o.order_type || 'SELL') === 'SELL');
 
         if (sellOrders.length === 0) {{
-          tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No open ask offers on the orderbook. Select "Post Bid (Buy)" to publish a liquidity request or "Post Ask (Sell)" to list UMAIS credits.</td></tr>';
+          tbody.safeHtml = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No open ask offers on the orderbook. Select "Post Bid (Buy)" to publish a liquidity request or "Post Ask (Sell)" to list UMAIS credits.</td></tr>';
         }} else {{
           sellOrders.forEach(o => {{
             const tr = document.createElement('tr');
-            tr.innerHTML = `
+            tr.safeHtml = `
               <td><code style="font-family:var(--font-mono);">${{escapeHtml(o.order_id)}}</code></td>
               <td><strong style="font-family:var(--font-mono);">${{escapeHtml(o.seller_id)}}</strong></td>
               <td style="font-family:var(--font-mono);"><strong style="color:var(--success);">${{o.amount_credits}} UMAIS</strong></td>
@@ -3672,14 +3699,14 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
         // 2. Render Buy Orders (Buyers looking for credits)
         const buyTbody = document.getElementById('p2p-buy-orders-tbody');
         if (buyTbody) {{
-          buyTbody.innerHTML = '';
+          buyTbody.safeHtml = '';
           const buyOrders = data.buy_orders || (data.orders || []).filter(o => o.order_type === 'BUY');
           if (buyOrders.length === 0) {{
-            buyTbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No open bid orders. Click "+ New Bid Order" above to publish a bid.</td></tr>';
+            buyTbody.safeHtml = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted); padding:1.5rem;">No open bid orders. Click "+ New Bid Order" above to publish a bid.</td></tr>';
           }} else {{
             buyOrders.forEach(o => {{
               const tr = document.createElement('tr');
-              tr.innerHTML = `
+              tr.safeHtml = `
                 <td><code style="font-family:var(--font-mono);">${{escapeHtml(o.order_id)}}</code></td>
                 <td><strong style="font-family:var(--font-mono);">${{escapeHtml(o.buyer_id)}}</strong></td>
                 <td style="font-family:var(--font-mono);"><strong style="color:var(--accent);">${{o.amount_credits}} UMAIS</strong></td>
@@ -3857,9 +3884,9 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
 
         // Render Sales
         const salesT = document.getElementById('my-sales-tbody');
-        salesT.innerHTML = '';
+        salesT.safeHtml = '';
         if (!trades.selling || trades.selling.length === 0) {{
-          salesT.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted)">No outbound ask contracts found.</td></tr>';
+          salesT.safeHtml = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted)">No outbound ask contracts found.</td></tr>';
         }} else {{
           trades.selling.forEach(o => {{
             const tr = document.createElement('tr');
@@ -3876,7 +3903,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
             }} else {{
               action = `<span style="font-family:var(--font-mono); font-size:0.75rem;">${{escapeHtml(o.status)}}</span>`;
             }}
-            tr.innerHTML = `
+            tr.safeHtml = `
               <td><code style="font-family:var(--font-mono);">${{escapeHtml(o.order_id)}}</code></td>
               <td style="font-family:var(--font-mono);"><strong>${{o.amount_credits}} CR</strong></td>
               <td style="font-family:var(--font-mono);">${{escapeHtml(o.currency)}} ${{o.price_fiat}}</td>
@@ -3891,9 +3918,9 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
 
         // Render Buys
         const buysT = document.getElementById('my-buys-tbody');
-        buysT.innerHTML = '';
+        buysT.safeHtml = '';
         if (!trades.buying || trades.buying.length === 0) {{
-          buysT.innerHTML = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted)">No inbound bid contracts found.</td></tr>';
+          buysT.safeHtml = '<tr><td colspan="7" style="text-align:center; color:var(--text-muted)">No inbound bid contracts found.</td></tr>';
         }} else {{
           trades.buying.forEach(o => {{
             const tr = document.createElement('tr');
@@ -3917,7 +3944,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
             }} else {{
               buyAction = `<span style="font-family:var(--font-mono); font-size:0.75rem;">${{escapeHtml(o.status)}}</span>`;
             }}
-            tr.innerHTML = `
+            tr.safeHtml = `
               <td><code style="font-family:var(--font-mono);">${{escapeHtml(o.order_id)}}</code></td>
               <td style="font-family:var(--font-mono);"><strong>${{escapeHtml(o.seller_id || 'AWAITING FILL')}}</strong></td>
               <td style="font-family:var(--font-mono);"><strong>${{o.amount_credits}} CR</strong></td>
@@ -4138,20 +4165,20 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
       if (!tbody) return;
       const queryKey = overrideKey || activeAccountKey || activeRemoteServerSecret || '';
       if (!queryKey) {{
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1.75rem;">Authenticate your Account Key or attach via IAM Instance Credentials to manage provisioned clusters.</td></tr>';
+        tbody.safeHtml = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1.75rem;">Authenticate your Account Key or attach via IAM Instance Credentials to manage provisioned clusters.</td></tr>';
         return;
       }}
-      tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1rem;">Querying provisioned instances...</td></tr>';
+      tbody.safeHtml = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1rem;">Querying provisioned instances...</td></tr>';
 
       try {{
         const res = await fetch('/api/supercomputer/instances', {{ headers: {{ 'X-Account-Key': queryKey }} }});
         const data = await res.json();
         if (!data.ok || !data.instances || data.instances.length === 0) {{
-          tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1.75rem;">No active or paused instances found for this key.</td></tr>';
+          tbody.safeHtml = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1.75rem;">No active or paused instances found for this key.</td></tr>';
           return;
         }}
 
-        tbody.innerHTML = data.instances.map(s => {{
+        tbody.safeHtml = data.instances.map(s => {{
           const isOnline = (s.status === 'ONLINE');
           const isPaused = (s.status === 'PAUSED' || s.status === 'PAUSED_LOW_CREDITS');
           const remMins = Math.floor((s.remaining_seconds || 0) / 60);
@@ -4212,7 +4239,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
           `;
         }}).join('');
       }} catch(err) {{
-        tbody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:var(--danger); padding:1rem;">Error loading instances: ${{err.toString()}}</td></tr>`;
+        tbody.safeHtml = `<tr><td colspan="8" style="text-align:center; color:var(--danger); padding:1rem;">Error loading instances: ${{err.toString()}}</td></tr>`;
       }}
     }}
 
@@ -4295,7 +4322,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
       outArea.style.display = 'block';
       stLine.textContent = `Dispatching workload across pooled worker nodes in ${{currentConsoleInstanceId}}...`;
       stdPre.textContent = 'Running...';
-      slicesDiv.innerHTML = '';
+      slicesDiv.safeHtml = '';
 
       try {{
         const res = await fetch('/api/supercomputer/job', {{
@@ -4314,9 +4341,9 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
           const j = data.job;
           const burstCores = j.elastic_cores_burst || j.cores_active;
           const sharedMesh = j.shared_to_network_cores !== undefined ? j.shared_to_network_cores : 0;
-          stLine.innerHTML = `<span style="color:var(--success);">[OK] Completed in ${{j.elapsed_ms}}ms across ${{j.nodes_utilized}} nodes (Active Burst: ${{burstCores}}/${{j.cores_active}} vCPUs • Mesh Shared: ${{sharedMesh}} vCPUs)</span>`;
+          stLine.safeHtml = `<span style="color:var(--success);">[OK] Completed in ${{j.elapsed_ms}}ms across ${{j.nodes_utilized}} nodes (Active Burst: ${{burstCores}}/${{j.cores_active}} vCPUs • Mesh Shared: ${{sharedMesh}} vCPUs)</span>`;
           stdPre.textContent = j.output || '(Process exited with code 0)';
-          slicesDiv.innerHTML = (j.node_results || []).map(nr => `
+          slicesDiv.safeHtml = (j.node_results || []).map(nr => `
             <div style="background:#101218; border:1px solid var(--border); border-radius:4px; padding:0.22rem 0.5rem; font-size:0.7rem;">
               <span style="color:var(--success);">●</span> <strong>${{escapeHtml(nr.node_id)}}</strong> [#${{nr.slice_index}}]: ${{nr.tflops_utilized}} TF | ${{nr.memory_slice_mb}} MB
             </div>
@@ -4489,7 +4516,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
           const winnersCont = document.getElementById('lottery-recent-winners');
           if (winnersCont) {{
             if (lotData.recent_winners && lotData.recent_winners.length > 0) {{
-              winnersCont.innerHTML = lotData.recent_winners.slice().reverse().map(w => `
+              winnersCont.safeHtml = lotData.recent_winners.slice().reverse().map(w => `
                 <div style="background:#090a0f; border:1px solid var(--border); border-radius:6px; padding:0.45rem 0.65rem; display:flex; justify-content:space-between; align-items:center;">
                   <div>
                     <span style="font-weight:700; color:var(--warning);">ROUND #${{w.round_number}}</span>
@@ -4499,7 +4526,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp
                 </div>
               `).join('');
             }} else {{
-              winnersCont.innerHTML = `<div style="color:var(--text-muted);">No settled rounds recorded. Commit entries to initialize Round #1.</div>`;
+              winnersCont.safeHtml = `<div style="color:var(--text-muted);">No settled rounds recorded. Commit entries to initialize Round #1.</div>`;
             }}
           }}
         }}

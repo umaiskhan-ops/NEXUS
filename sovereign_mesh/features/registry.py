@@ -161,6 +161,18 @@ class FeatureRegistry:
     def kind_counts(self) -> Dict[str, int]:
         return {k.value: sum(f.kind == k for f in self._features.values()) for k in Kind}
 
+    def availability_summary(self, adapters: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+        """Returns transparent count of ready built-in features vs unconfigured external adapter hooks (N13/R4)."""
+        reg_adapters = adapters or {}
+        ready = 0
+        unconfigured = 0
+        for f in self._features.values():
+            if f.kind in (Kind.INTEGRATION, Kind.HARDWARE) and f.key not in reg_adapters:
+                unconfigured += 1
+            else:
+                ready += 1
+        return {"total_registered": len(self._features), "ready_builtin": ready, "unconfigured_adapters": unconfigured}
+
     def dependency_graph(self) -> Dict[str, List[str]]:
         return {f.key: list(f.depends_on) for f in self._features.values()}
 
@@ -206,12 +218,14 @@ def integration(key: str, name: str, block: Block, requirement: str, **kw) -> Fe
         adapter = grid.adapters.get(key)
         if adapter is None:
             return {
-                "status": "OK",
-                "mode": "LOCAL_BUILTIN_ADAPTER",
+                "status": "NOT_CONFIGURED",
+                "available": False,
                 "feature": key,
                 "requirement": requirement,
-                "payload_processed": bool(payload),
-                "output": f"Executed {name} via built-in local adapter (optional external driver: {requirement}).",
+                "error": (
+                    f"{name} is unavailable until a real external adapter ({requirement}) "
+                    f"is registered via grid.register_adapter({key!r}, fn)."
+                ),
             }
         return adapter(grid, payload)
     return Feature(key, name, block, Kind.INTEGRATION, handler, f"Requires: {requirement}", **kw)

@@ -90,7 +90,8 @@ class TokenSinkManager:
     def _load(self) -> None:
         if self._path and self._path.exists():
             try:
-                data = json.loads(self._path.read_text(encoding="utf-8"))
+                with interprocess_file_lock(self._path):
+                    data = json.loads(self._path.read_text(encoding="utf-8"))
                 self.current_round = int(data.get("current_round", 1))
                 self.total_lottery_rounds_completed = int(data.get("total_lottery_rounds_completed", 0))
                 self.total_deflationary_burned_credits = int(data.get("total_deflationary_burned_credits", 0))

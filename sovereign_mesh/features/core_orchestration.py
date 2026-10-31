@@ -26,16 +26,17 @@ def _consensus(grid, p):
 
 def _memory(grid, p):
     op = p.get("op", "list")
+    sess = str(p.get("session") or "default")
     if op == "set":
-        grid.memory.set(require_text(p, "key"), p.get("value", p.get("text", "")), p.get("session", "default"))
-        return {"status": "OK", "stored": p["key"]}
+        grid.memory.set(require_text(p, "key"), p.get("value", p.get("text", "")), session=sess)
+        return {"status": "OK", "stored": p["key"], "session": sess}
     if op == "get":
-        return {"status": "OK", "value": grid.memory.get(require_text(p, "key"))}
+        return {"status": "OK", "value": grid.memory.get(require_text(p, "key"), session=sess), "session": sess}
     if op == "delete":
-        return {"status": "OK", "deleted": grid.memory.delete(require_text(p, "key"))}
+        return {"status": "OK", "deleted": grid.memory.delete(require_text(p, "key"), session=sess), "session": sess}
     if op == "search":
-        return {"status": "OK", "results": grid.memory.search(require_text(p), clamp(p.get("k"), 1, 50, 5))}
-    return {"status": "OK", "keys": grid.memory.keys(), "sessions": grid.memory.sessions()}
+        return {"status": "OK", "results": grid.memory.search(require_text(p), clamp(p.get("k"), 1, 50, 5), session=sess), "session": sess}
+    return {"status": "OK", "keys": grid.memory.keys(session=sess), "sessions": grid.memory.sessions(), "session": sess}
 
 
 def _explain(grid, p):

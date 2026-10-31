@@ -33,78 +33,124 @@ def cosine(a: Counter, b: Counter) -> float:
 
 
 # ---------------------------------------------------------------- memory
-class MemoryStore:
-    """Persistent key/value memory with lexical similarity search, session isolation & bounded retention (N9 Fix)."""
+from .ledger import interprocess_file_lock
 
-    def __init__(self, path: Optional[Path] = None, max_entries: int = 5000, ttl_seconds: float = 0.0):
+
+class MemoryStore:
+    """Persistent key/value memory with lexical similarity search, per-user session isolation & bounded retention (N9/M7 Fix)."""
+
+    def __init__(self, path: Optional[Path] = None, max_entries: int = 5000, ttl_seconds: float = 0.0,
+                 max_per_session: int = 500):
         self._path = path
         self._max_entries = max(100, int(max_entries))
+        self._max_per_session = max(20, int(max_per_session))
         self._ttl_seconds = float(ttl_seconds)
         self._lock = threading.RLock()
         self._data: Dict[str, dict] = {}
         if path and path.exists():
-            self._data = json.loads(path.read_text(encoding="utf-8"))
+            with interprocess_file_lock(path):
+                self._data = json.loads(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _storage_key(key: str, session: str) -> str:
+        sess = str(session or "default")
+        return key if sess == "default" else f"{sess}::{key}"
+
+    @staticmethod
+    def _logical_key(storage_key: str, entry: dict) -> str:
+        if "key" in entry:
+            return str(entry["key"])
+        sess = str(entry.get("session") or "default")
+        prefix = f"{sess}::"
+        return storage_key[len(prefix):] if storage_key.startswith(prefix) else storage_key
 
     def _flush(self) -> None:
         if self._path:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(".tmp")
-            with tmp.open("w", encoding="utf-8") as fh:
-                fh.write(json.dumps(self._data, default=str))
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
-            tmp.replace(self._path)
+            with interprocess_file_lock(self._path):
+                tmp = self._path.with_suffix(".tmp")
+                with tmp.open("w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(self._data, default=str))
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                tmp.replace(self._path)
 
-    def _prune_locked(self) -> None:
+    def _prune_locked(self, active_session: Optional[str] = None) -> None:
         now = time.time()
         if self._ttl_seconds > 0:
             expired = [k for k, e in self._data.items() if (now - float(e.get("updated", now))) > self._ttl_seconds]
             for k in expired:
                 self._data.pop(k, None)
+        if active_session:
+            sess_items = [(k, e) for k, e in self._data.items() if e.get("session") == active_session]
+            if len(sess_items) > self._max_per_session:
+                sess_items.sort(key=lambda kv: float(kv[1].get("updated", 0.0)))
+                for k, _ in sess_items[: len(sess_items) - self._max_per_session]:
+                    self._data.pop(k, None)
         if len(self._data) > self._max_entries:
             by_age = sorted(self._data.items(), key=lambda kv: float(kv[1].get("updated", 0.0)))
             for k, _ in by_age[: len(self._data) - self._max_entries]:
                 self._data.pop(k, None)
 
     def set(self, key: str, value: Any, session: str = "default") -> None:
+        sess = str(session or "default")
+        skey = self._storage_key(key, sess)
         with self._lock:
-            self._data[key] = {"value": value, "session": session, "updated": time.time()}
-            self._prune_locked()
+            self._data[skey] = {"key": key, "value": value, "session": sess, "updated": time.time()}
+            self._prune_locked(active_session=sess)
             self._flush()
 
     def get(self, key: str, session: Optional[str] = None) -> Any:
         with self._lock:
             self._prune_locked()
+            if session is not None:
+                skey = self._storage_key(key, session)
+                entry = self._data.get(skey)
+                if entry and entry.get("session") == session:
+                    return entry["value"]
+                entry_legacy = self._data.get(key)
+                if entry_legacy and entry_legacy.get("session") == session:
+                    return entry_legacy["value"]
+                return None
             entry = self._data.get(key)
-            if not entry:
-                return None
-            if session is not None and entry.get("session") != session:
-                return None
-            return entry["value"]
+            if entry:
+                return entry["value"]
+            return None
 
-    def delete(self, key: str) -> bool:
+    def delete(self, key: str, session: Optional[str] = None) -> bool:
         with self._lock:
-            existed = self._data.pop(key, None) is not None
-            self._flush()
+            existed = False
+            if session is not None:
+                skey = self._storage_key(key, session)
+                if skey in self._data:
+                    self._data.pop(skey, None)
+                    existed = True
+                elif key in self._data and self._data[key].get("session") == session:
+                    self._data.pop(key, None)
+                    existed = True
+            else:
+                existed = self._data.pop(key, None) is not None
+            if existed:
+                self._flush()
             return existed
 
     def keys(self, session: Optional[str] = None) -> List[str]:
         with self._lock:
             self._prune_locked()
             if session is not None:
-                return sorted(k for k, e in self._data.items() if e.get("session") == session)
-            return sorted(self._data)
+                return sorted(self._logical_key(k, e) for k, e in self._data.items() if e.get("session") == session)
+            return sorted(self._logical_key(k, e) for k, e in self._data.items())
 
     def search(self, query: str, k: int = 5, session: Optional[str] = None) -> List[Tuple[str, float, Any]]:
         q = tokenize(query)
         with self._lock:
             self._prune_locked()
             scored = [
-                (key, cosine(q, tokenize(f"{key} {e['value']}")), e["value"])
-                for key, e in self._data.items()
+                (self._logical_key(skey, e), cosine(q, tokenize(f"{self._logical_key(skey, e)} {e['value']}")), e["value"])
+                for skey, e in self._data.items()
                 if session is None or e.get("session") == session
             ]
         scored.sort(key=lambda x: x[1], reverse=True)

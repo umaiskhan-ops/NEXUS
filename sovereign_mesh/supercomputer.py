@@ -32,6 +32,66 @@ from typing import Any, Dict, List, Optional
 from .ledger import HashChainLedger, interprocess_file_lock
 
 MIN_CREDITS_FOR_SERVER_RENTAL = 250
+_CACHED_HW_TELEMETRY: Optional[dict] = None
+
+
+def measure_host_hardware_telemetry() -> dict:
+    """Measures actual physical host RAM (GB) from the OS and benchmarks real FP64 GFLOPS/TFLOPS (N1 Fix)."""
+    global _CACHED_HW_TELEMETRY
+    if _CACHED_HW_TELEMETRY is not None:
+        return dict(_CACHED_HW_TELEMETRY)
+    measured_ram_gb = 0.0
+    try:
+        if os.name == "nt":
+            import ctypes
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                measured_ram_gb = round(stat.ullTotalPhys / (1024 ** 3), 2)
+        elif Path("/proc/meminfo").exists():
+            for line in Path("/proc/meminfo").read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("MemTotal:"):
+                    kb = int(line.split()[1])
+                    measured_ram_gb = round(kb / (1024 ** 2), 2)
+                    break
+        elif hasattr(os, "sysconf") and "SC_PAGE_SIZE" in os.sysconf_names and "SC_PHYS_PAGES" in os.sysconf_names:
+            total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            measured_ram_gb = round(total_bytes / (1024 ** 3), 2)
+    except Exception:
+        measured_ram_gb = 0.0
+
+    # Micro-benchmark real floating-point multiply-add throughput on this CPU
+    n_ops = 20_000
+    acc = 1.000001
+    t0 = time.perf_counter()
+    for i in range(1, n_ops + 1):
+        acc = acc * 1.0000001 + (i * 0.0000001)
+    dt = max(1e-6, time.perf_counter() - t0)
+    flops = (n_ops * 2.0) / dt  # 1 mul + 1 add per iteration
+    host_cores = os.cpu_count() or 1
+    measured_gflops = round((flops * host_cores) / 1e9, 4)
+    measured_tflops = round(max(0.001, measured_gflops / 1000.0), 4)
+    _CACHED_HW_TELEMETRY = {
+        "measured_host_cores": host_cores,
+        "measured_host_ram_gb": measured_ram_gb,
+        "measured_host_gflops": measured_gflops,
+        "measured_host_tflops": measured_tflops,
+        "telemetry_source": "os_physical_memory_and_fp_microbenchmark",
+        "_acc_sink": round(acc, 2),
+    }
+    return dict(_CACHED_HW_TELEMETRY)
 
 
 @dataclass
@@ -147,7 +207,8 @@ class SupercomputerEngine:
     def _load(self) -> None:
         if self._path and self._path.exists():
             try:
-                data = json.loads(self._path.read_text(encoding="utf-8"))
+                with interprocess_file_lock(self._path):
+                    data = json.loads(self._path.read_text(encoding="utf-8"))
                 valid_fields = {f.name for f in dataclasses.fields(VirtualServerInstance)}
                 for d in data:
                     inst = VirtualServerInstance(**{k: v for k, v in d.items() if k in valid_fields})
@@ -380,7 +441,9 @@ class SupercomputerEngine:
             ssh_uri = f"ssh://root@cluster-{iid}.nexus.mesh:2222"
             now = time.time()
             expires = now + (duration_hours * 3600.0)
-            tflops = round((cores * 2.8) / 10.0, 1)
+            hw_Measured = measure_host_hardware_telemetry()
+            real_nodes_count = max(1, len(available_workers[:needed_nodes]))
+            tflops = round(hw_Measured["measured_host_tflops"] * real_nodes_count, 4)
 
             # Start in Warm Standby (2 cores / 8GB active), sharing idle capacity with network until workload scales up!
             standby_cores = min(2, cores)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hmac
 import html
 import json
+import os
 import subprocess
 import threading
 import time
@@ -135,12 +136,12 @@ def make_handler(grid, client):
         return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
     def _sign_ota_ed25519(version: str, sha256_hex: str) -> tuple[str, str]:
-        """Asymmetric Ed25519 code signing for OTA updates (fixes C4)."""
+        """Asymmetric Ed25519 code signing for OTA updates matching worker's pinned public key (fixes C4)."""
         import hashlib
         try:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
             from cryptography.hazmat.primitives import serialization
-            seed_material = (cfg.peer_shared_secret or cfg.dashboard_token or cfg.master_passphrase_hash or "nexus-ota-ed25519-root").encode("utf-8")
+            seed_material = (os.environ.get("NEXUS_OTA_PRIVATE_SEED", "") or "nexus-ota-ed25519-root").encode("utf-8")
             seed32 = hashlib.sha256(b"NEXUS_OTA_ED25519:" + seed_material).digest()
             priv = Ed25519PrivateKey.from_private_bytes(seed32)
             pub_hex = priv.public_key().public_bytes(

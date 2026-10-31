@@ -98,15 +98,15 @@ def _spot_checkable(feature: str, payload: dict) -> bool:
 
 WELCOME_CREDITS = 20
 REFERRAL_BONUS_RATE = 0.05  # +5% extra bonus credits minted to referrer when referred worker mines/completes tasks
-POW_DIFFICULTY = 3  # SHA-256 hex digest must start with "000" (~4,096 hashes, proves real CPU cycles; scales dynamically)
+POW_DIFFICULTY = int(os.environ.get("NEXUS_POW_DIFFICULTY", "4"))  # SHA-256 hex prefix difficulty (~65,536 hashes default, scales up to 6)
 
 
 def dynamic_pow_difficulty(active_workers: int = 1) -> int:
     """Dynamically scales Micro-PoW difficulty based on network size (N4 Anti-Sybil Fix)."""
     if active_workers > 500:
-        return 5
+        return max(POW_DIFFICULTY, 6)
     if active_workers > 50:
-        return 4
+        return max(POW_DIFFICULTY, 5)
     return POW_DIFFICULTY
 
 
@@ -157,8 +157,10 @@ class WorkerNodeRecord:
     # Anti-Fake-Uptime Micro-PoW
     pow_challenge: str = field(default_factory=lambda: secrets.token_hex(8))
     pow_verified_count: int = 0
-    # P2P Dispute Freeze
+    # P2P Dispute Freeze (H6: order-scoped freeze by default; account lock only for accused scammer)
     dispute_frozen: bool = False
+    dispute_account_locked: bool = False
+    dispute_escrow_locked_credits: int = 0
     dispute_reason: str = ""
     # Viral Referral Multiplier (+5% Network Effect)
     referral_code: str = ""
@@ -228,15 +230,18 @@ class MasterHubCoordinator:
         self._lock = threading.RLock()
         self._load()
 
-    # -- persistence
+    # -- persistence & WAL crash-recovery (H4 / M7 Fix)
     def _load(self) -> None:
+        last_settled_hash = ""
         if self._path and self._path.exists():
             try:
-                data = json.loads(self._path.read_text(encoding="utf-8"))
+                with interprocess_file_lock(self._path):
+                    data = json.loads(self._path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     self.commercial_revenue_pool = float(data.get("commercial_revenue_pool", 0.0))
                     self.treasury_balance = float(data.get("treasury_balance", 0.0))
                     self.current_epoch = int(data.get("current_epoch", 1))
+                    last_settled_hash = str(data.get("last_settled_ledger_hash", ""))
                     workers_data = data.get("workers", [])
                 else:
                     workers_data = data
@@ -246,6 +251,55 @@ class MasterHubCoordinator:
                     self._workers[d["worker_id"]] = WorkerNodeRecord(**filtered)
             except Exception:
                 pass
+        self._reconcile_wal_from_ledger(last_settled_hash)
+
+    def _reconcile_wal_from_ledger(self, last_settled_hash: str) -> None:
+        """Replays any uncommitted WAL credit transitions from HashChainLedger after a process crash (H4 Fix)."""
+        if not self.ledger or not self._workers:
+            return
+        try:
+            blocks = self.ledger.range(0, len(self.ledger))
+            if not blocks:
+                return
+            start_idx = 0
+            if last_settled_hash:
+                found = False
+                for idx, b in enumerate(blocks):
+                    if b.get("hash") == last_settled_hash:
+                        start_idx = idx + 1
+                        found = True
+                        break
+                if not found:
+                    return
+            else:
+                return
+            reconciled = False
+            for b in blocks[start_idx:]:
+                task = b.get("data", {}).get("task", "")
+                p = b.get("data", {}).get("payload", {})
+                if task == "credits_spent":
+                    w = self._workers.get(p.get("worker_id", ""))
+                    if w and "remaining" in p and w.credits != int(p["remaining"]):
+                        w.credits = int(p["remaining"])
+                        reconciled = True
+                elif task == "owner_credits_granted":
+                    w = self._workers.get(p.get("worker_id", ""))
+                    if w and "new_balance" in p and w.credits != int(p["new_balance"]):
+                        w.credits = int(p["new_balance"])
+                        reconciled = True
+                elif task == "credits_transferred":
+                    wf = self._workers.get(p.get("from_worker", ""))
+                    wt = self._workers.get(p.get("to_worker", ""))
+                    if wf and "from_balance" in p:
+                        wf.credits = int(p["from_balance"])
+                        reconciled = True
+                    if wt and "to_balance" in p:
+                        wt.credits = int(p["to_balance"])
+                        reconciled = True
+            if reconciled:
+                self._flush()
+        except Exception:
+            pass
 
     def _flush(self) -> None:
         if not self._path:
@@ -257,6 +311,7 @@ class MasterHubCoordinator:
                 "commercial_revenue_pool": self.commercial_revenue_pool,
                 "treasury_balance": self.treasury_balance,
                 "current_epoch": self.current_epoch,
+                "last_settled_ledger_hash": getattr(self.ledger, "head_hash", "") if self.ledger else "",
                 "workers": [w.to_dict(include_key=True) for w in self._workers.values()],
             }
             with tmp.open("w", encoding="utf-8") as fh:
@@ -920,7 +975,7 @@ class MasterHubCoordinator:
                 raise KeyError(f"Unknown worker node {worker_id!r}")
             if worker.status == "SLASHED":
                 raise PermissionError(f"Worker {worker.worker_id!r} is SLASHED and cannot spend credits")
-            if worker.dispute_frozen:
+            if getattr(worker, "dispute_account_locked", False):
                 raise PermissionError(
                     f"Worker {worker.worker_id!r} account is FROZEN due to an active P2P Dispute ({worker.dispute_reason}). "
                     f"Awaiting Sovereign Owner arbitration."

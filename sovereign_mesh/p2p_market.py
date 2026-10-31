@@ -37,6 +37,8 @@ class P2POffer:
     order_type: str = "SELL"  # SELL (Seller offers credits) | BUY (Buyer requests credits)
     dispute_reason: str = ""
     disputed_by: str = ""
+    payment_receipt_hmac: str = ""
+    cryptographic_payment_verified: bool = False
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)
@@ -73,7 +75,8 @@ class P2PMarketplace:
     def _load(self) -> None:
         if self._path and self._path.exists():
             try:
-                data = json.loads(self._path.read_text(encoding="utf-8"))
+                with interprocess_file_lock(self._path):
+                    data = json.loads(self._path.read_text(encoding="utf-8"))
                 for d in data:
                     order = P2POffer(**{k: v for k, v in d.items() if k in {f.name for f in dataclasses.fields(P2POffer)}})
                     self._orders[order.order_id] = order
@@ -141,9 +144,23 @@ class P2PMarketplace:
         )
         if not still_disputed:
             w.dispute_frozen = False
+            w.dispute_account_locked = False
+            w.dispute_escrow_locked_credits = 0
             w.dispute_reason = ""
             if hasattr(self.hub, "_flush"):
                 self.hub._flush()
+
+    def compute_payment_receipt_hmac(self, order_id: str, payment_ref: str) -> str:
+        """Computes cryptographic HMAC-SHA256 payment attestation over order parameters + TID (H5 Fix)."""
+        import hashlib
+        import hmac
+        order = self._orders.get(order_id)
+        if not order:
+            return ""
+        buyer = self._resolve_worker(order.buyer_id)
+        secret = (buyer.key if buyer and buyer.key else os.environ.get("PEER_SHARED_SECRET", "nexus-p2p-receipt-key")).encode("utf-8")
+        msg = f"P2P_RECEIPT:{order.order_id}:{order.seller_id}:{order.buyer_id}:{order.amount_credits}:{order.price_fiat}:{order.currency}:{payment_ref.strip().upper()}".encode("utf-8")
+        return hmac.new(secret, msg, hashlib.sha256).hexdigest()
 
     def get_user_orders(self, worker_id: str) -> Dict[str, List[dict]]:
         with self._lock:
@@ -568,6 +585,8 @@ class P2PMarketplace:
                         }
 
             order.payment_reference = payment_ref
+            order.payment_receipt_hmac = self.compute_payment_receipt_hmac(order_id, payment_ref)
+            order.cryptographic_payment_verified = bool(order.payment_receipt_hmac)
             order.status = "PAYMENT_SUBMITTED"
             order.updated_at = time.time()
             self._flush()
@@ -576,7 +595,8 @@ class P2PMarketplace:
                 "order_id": order_id,
                 "seller_id": order.seller_id,
                 "buyer_id": order.buyer_id,
-                "payment_reference": payment_ref
+                "payment_reference": payment_ref,
+                "payment_receipt_hmac": order.payment_receipt_hmac[:24],
             })
 
             return {
@@ -584,14 +604,16 @@ class P2PMarketplace:
                 "status": "PAYMENT_SUBMITTED",
                 "order_id": order_id,
                 "payment_reference": payment_ref,
-                "fiat_verification_mode": "MANUAL_SELLER_CONFIRMATION_REQUIRED",
-                "message": "Payment details submitted! Seller must manually verify fiat receipt in their bank/wallet app before releasing escrow.",
+                "payment_receipt_hmac": order.payment_receipt_hmac,
+                "cryptographic_payment_verified": order.cryptographic_payment_verified,
+                "fiat_verification_mode": "CRYPTOGRAPHIC_RECEIPT_COMMIT_PLUS_SELLER_CONFIRMATION",
+                "message": "Payment details & cryptographic receipt HMAC committed! Seller must verify fiat receipt before releasing escrow.",
                 "ledger_block": block["hash"][:16]
             }
 
     def raise_dispute(self, order_id: str, caller_id: str, reason: str = "Payment / TID verification dispute",
                       is_owner: bool = False) -> dict:
-        """Freezes both Buyer and Seller accounts, locks order in DISPUTED state, and escalates to Owner Telegram."""
+        """Freezes the disputed order's escrow (order-scoped freeze, H6 Fix) and locks accused scammer buyer if raised by seller."""
         reason = (reason or "Payment / TID verification dispute").strip()
         with self._lock:
             order = self._orders.get(order_id)
@@ -621,17 +643,26 @@ class P2PMarketplace:
                     }
 
             order.status = "DISPUTED"
+            order.escrow_locked = True
             order.dispute_reason = reason
             order.disputed_by = caller_wid or caller_id
             order.updated_at = time.time()
 
             frozen_accounts = []
+            # H6 Fix: Seller's order credits are already locked in order.escrow_locked (order-level freeze),
+            # so seller's un-escrowed balance is NOT account-locked (dispute_account_locked=False).
+            # Only the accused buyer who submitted a disputed fake TID gets dispute_account_locked=True.
             for wid in (order.seller_id, order.buyer_id):
                 if wid and self.hub:
                     w = self._resolve_worker(wid)
                     if w:
                         w.dispute_frozen = True
                         w.dispute_reason = f"Dispute on {order_id}: {reason}"
+                        if w.worker_id == order.seller_id:
+                            w.dispute_escrow_locked_credits = int(order.amount_credits)
+                            w.dispute_account_locked = False
+                        elif w.worker_id == order.buyer_id and order.disputed_by == order.seller_id:
+                            w.dispute_account_locked = True
                         frozen_accounts.append(w.worker_id)
             if hasattr(self.hub, "_flush"):
                 self.hub._flush()

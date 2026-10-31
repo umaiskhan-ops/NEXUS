@@ -301,9 +301,30 @@ Requirements:
 """
 
 
-def get_worker_launcher_code(default_hub_url: str, default_bootstrap_url: str = "") -> str:
+def get_pinned_ota_public_key_hex(seed_override: str = "") -> str:
+    """Returns the offline-pinned Ed25519 OTA public key hex (C4 Fix: never trusted from HTTP headers)."""
+    env_pub = os.environ.get("NEXUS_OTA_PUBLIC_KEY_HEX", "").strip()
+    if len(env_pub) == 64:
+        return env_pub
+    import hashlib
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        raw_seed = (seed_override or os.environ.get("NEXUS_OTA_PRIVATE_SEED", "") or "nexus-ota-ed25519-root").encode("utf-8")
+        seed32 = hashlib.sha256(b"NEXUS_OTA_ED25519:" + raw_seed).digest()
+        priv = Ed25519PrivateKey.from_private_bytes(seed32)
+        return priv.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        ).hex()
+    except Exception:
+        return hashlib.sha256(b"NEXUS_OTA_ED25519_FALLBACK_PIN").hexdigest()
+
+
+def get_worker_launcher_code(default_hub_url: str, default_bootstrap_url: str = "", pinned_ota_pub_hex: str = "") -> str:
     if default_hub_url.startswith("https://") and ("8443" in default_hub_url or "localhost" in default_hub_url or "127.0.0.1" in default_hub_url):
         default_hub_url = default_hub_url.replace("https://", "http://")
+    pinned_pub = (pinned_ota_pub_hex or get_pinned_ota_public_key_hex()).strip()
     return f'''"""SUP Agentic Mesh Worker Node (Powered by NEXUS) - 1-Click Standalone Launcher.
 Runs with zero external pip dependencies (Pure Python stdlib).
 Supports Zero-Touch Over-The-Air (OTA) Hot-Updates & Decentralized Neural Shard Sync.
@@ -335,6 +356,7 @@ SHARDS_DIR = BASE_DIR / "brain_shards"
 SANDBOX_DIR = BASE_DIR / "sandbox_workspace"
 DEFAULT_HUB_URL = "{default_hub_url}"
 DEFAULT_BOOTSTRAP_URL = "{default_bootstrap_url}"
+PINNED_OTA_PUBLIC_KEY_HEX = "{pinned_pub}"
 
 class SandboxSecurityViolation(PermissionError):
     """Raised when an operation attempts to breach native process sandbox boundaries."""
@@ -790,7 +812,8 @@ class WorkerState:
                 expected_hash = target_sha256 or resp.headers.get("X-Script-Sha256", "")
                 received_sig = ota_signature or resp.headers.get("X-OTA-Signature", "")
                 ota_ed25519_sig = resp.headers.get("X-OTA-Ed25519-Signature", "")
-                ota_ed25519_pub = os.environ.get("NEXUS_OTA_PUBLIC_KEY_HEX", "") or resp.headers.get("X-OTA-Ed25519-Pub", "")
+                # C4 Fix: Public key MUST come strictly from pinned constant or local env, NEVER from server response header/body
+                ota_ed25519_pub = (os.environ.get("NEXUS_OTA_PUBLIC_KEY_HEX", "").strip() or PINNED_OTA_PUBLIC_KEY_HEX).strip()
                 try:
                     j = json.loads(raw_data.decode("utf-8"))
                     if j.get("ok") and j.get("code"):
@@ -798,7 +821,6 @@ class WorkerState:
                         expected_hash = j.get("sha256") or expected_hash
                         received_sig = j.get("ota_signature") or received_sig
                         ota_ed25519_sig = j.get("ota_ed25519_sig") or ota_ed25519_sig
-                        ota_ed25519_pub = os.environ.get("NEXUS_OTA_PUBLIC_KEY_HEX", "") or j.get("ota_ed25519_pub") or ota_ed25519_pub
                 except Exception:
                     code_to_write = raw_data.decode("utf-8")
 
@@ -817,7 +839,7 @@ class WorkerState:
                     self.ota_status = "INTEGRITY_MISMATCH"
                     return
 
-                # Mandatory Fail-Closed Cryptographic Signature check (C4 Fix: NEVER allow unsigned OTA even if worker_key is empty)
+                # Mandatory Fail-Closed Asymmetric Ed25519 Signature check against Pinned Key (C4 Fix)
                 ota_msg = f"OTA:{{target_version}}:{{calc_sha256}}".encode("utf-8")
                 sig_verified = False
                 if ota_ed25519_sig and ota_ed25519_pub:
@@ -829,15 +851,13 @@ class WorkerState:
                     except Exception:
                         sig_verified = False
 
-                if self.worker_key and received_sig:
+                if self.worker_key and received_sig and sig_verified:
                     expected_sig = hmac.new(
                         self.worker_key.encode("utf-8"),
                         ota_msg,
                         hashlib.sha256,
                     ).hexdigest()
-                    if hmac.compare_digest(received_sig, expected_sig):
-                        sig_verified = True
-                    else:
+                    if not hmac.compare_digest(received_sig, expected_sig):
                         sig_verified = False
 
                 if not sig_verified:

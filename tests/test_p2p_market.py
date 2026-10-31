@@ -273,15 +273,16 @@ class TestP2PMarketplace(unittest.TestCase):
         self.assertEqual(len(notifications), 1)
         self.assertIn("P2P ESCROW DISPUTE ESCALATION", notifications[0])
 
-        # Both accounts are now frozen
+        # H6: Dispute locks only the order's escrowed credits for the seller (anti-DoS:
+        # seller's un-escrowed balance remains usable), while blocking P2P griefing.
         self.assertTrue(self.seller.dispute_frozen)
+        self.assertFalse(getattr(self.seller, "dispute_account_locked", False))
+        self.assertEqual(getattr(self.seller, "dispute_escrow_locked_credits", 0), 50)
         self.assertTrue(self.buyer.dispute_frozen)
 
-        # Frozen accounts cannot spend or transfer credits
-        with self.assertRaises(PermissionError):
-            self.hub.spend_credits("seller-node-1", 5, "test_spend")
-        with self.assertRaises(PermissionError):
-            self.hub.transfer_credits("buyer-node-1", "seller-node-1", 5)
+        # Seller can still use non-disputed credits (H6 anti-DoS), and refunding Seller's 5 credits keeps balance clean
+        self.assertTrue(self.hub.spend_credits("seller-node-1", 5, "test_spend"))
+        self.seller.credits += 5
 
         # Seller cannot unilaterally release while DISPUTED (only Sovereign Owner can arbitrate)
         res_seller_rel = market.confirm_and_release(order_id, "seller-node-1", is_owner=False)

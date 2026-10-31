@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Protocol
 
+from .ledger import interprocess_file_lock
 from .state import TokenBudget
 
 DEGRADE_AFTER_FAILURES = 3
@@ -137,12 +139,8 @@ SYNTHESIS = ("You are the roundtable moderator. Synthesize the panel's final pos
              "answer. Explicitly note any unresolved disagreements.")
 
 SYSTEM_BRAND_IDENTITY = (
-    "MANDATORY IDENTITY DIRECTIVE: Your name and identity is 'SUP Agentic Mesh powered by NEXUS'. "
-    "You are an autonomous multi-agent intelligence and supercomputing system powered by NEXUS. "
-    "NEVER refer to yourself as Llama, Mistral, Qwen, DeepSeek, GPT, OpenAI, Meta, Alibaba, Anthropic, "
-    "or a generic 'LLM' / 'large language model'. "
-    "If asked your name, who you are, who created you, or what model/company you are, "
-    "you MUST answer: 'I am SUP Agentic Mesh powered by NEXUS.'"
+    "You are 'SUP Agentic Mesh powered by NEXUS', an orchestration assistant that routes tasks across "
+    "configured open-source and API language models. Be transparent about underlying models when asked."
 )
 
 _IDENTITY_PROMPT_RE = re.compile(
@@ -156,31 +154,28 @@ _IDENTITY_PROMPT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_THIRD_PARTY_LEAK_RE = re.compile(
-    r"\b(I\s+am|I'm)\s+(a\s+|an\s+)?(large\s+language\s+model|language\s+model|AI\s+assistant|LLM|Llama[\w.-]*|Mistral[\w.-]*|Qwen[\w.-]*|DeepSeek[\w.-]*|ChatGPT|GPT[\w.-]*|Claude[\w.-]*)"
-    r"(\s+(trained|created|developed|built|made)\s+by\s+[A-Za-z0-9_ -]+)?",
-    re.IGNORECASE,
-)
-
 
 def is_identity_question(prompt: str) -> bool:
     return bool(_IDENTITY_PROMPT_RE.search(prompt or ""))
 
 
-def enforce_brand_identity(prompt: str, text: str) -> str:
-    if is_identity_question(prompt):
+def format_assistant_greeting(prompt: str, text: str) -> str:
+    """Returns transparent assistant greeting without rewriting or disguising underlying OSS model names (N7 Fix)."""
+    if is_identity_question(prompt) and not text:
         return (
-            "I am **SUP Agentic Mesh powered by NEXUS** — an autonomous multi-agent intelligence, "
-            "coding, and distributed supercomputing platform."
+            "I am **SUP Agentic Mesh powered by NEXUS** — a multi-model orchestration and "
+            "distributed compute platform routing across local and open-source language models."
         )
-    if text and _THIRD_PARTY_LEAK_RE.search(text):
-        text = _THIRD_PARTY_LEAK_RE.sub("I am SUP Agentic Mesh powered by NEXUS", text)
     return text
+
+
+# Backward-compatible alias that never rewrites or hides underlying model names
+enforce_brand_identity = format_assistant_greeting
 
 
 _FRONTIER_COMPLEX_RE = re.compile(
     r"\b("
-    r"gpt[-_\s]?6|astra|claude\s*5\.?5|opus\s*5\.?5|frontier[_\s-]*model|hyper[-_\s]*complex|"
+    r"frontier[_\s-]*model|hyper[-_\s]*complex|"
     r"formal\s+verification|zero[-_\s]day\s+audit|distributed\s+consensus\s+proof|"
     r"quantum\s+algorithm|deep\s+cot\s+synthesis|multi[-_\s]agent\s+theorem"
     r")\b",
@@ -189,11 +184,11 @@ _FRONTIER_COMPLEX_RE = re.compile(
 
 
 def is_frontier_complex_task(prompt: str, mode: str = "") -> bool:
-    """Returns True if a task requires Frontier-tier reasoning (e.g. GPT-6 Astra / Claude 5.5 Opus)."""
+    """Returns True if a task requires extended multi-step Chain-of-Thought reasoning."""
     text = f"{prompt or ''} {mode or ''}".strip()
     if not text:
         return False
-    if mode and mode.lower() in {"frontier", "gpt-6-astra", "claude-5.5-opus", "hyper_complex"}:
+    if mode and mode.lower() in {"frontier", "deep_cot", "hyper_complex"}:
         return True
     if _FRONTIER_COMPLEX_RE.search(text):
         return True
@@ -201,7 +196,7 @@ def is_frontier_complex_task(prompt: str, mode: str = "") -> bool:
 
 
 def compute_task_credit_cost(prompt: str, mode: str = "", cached_locally: bool = False) -> int:
-    """Standard distributed worker tasks cost 1 credit; uncached Frontier complex tasks cost 20 credits."""
+    """Standard distributed worker tasks cost 1 credit; uncached extended CoT tasks cost 20 credits."""
     if cached_locally:
         return STANDARD_TASK_CREDIT_COST
     if is_frontier_complex_task(prompt, mode):
@@ -212,9 +207,9 @@ def compute_task_credit_cost(prompt: str, mode: str = "", cached_locally: bool =
 class DistillationCache:
     """Local Chain-of-Thought (CoT) Knowledge Distillation & Self-Training Dataset Cache.
 
-    Stores responses and reasoning chains (CoT) from Frontier/Complex model invocations
+    Stores responses and reasoning chains (CoT) from complex model invocations
     in both the local data layer and the Hash-Chain Ledger so similar future tasks are
-    served and fine-tuned locally without repeated external API calls.
+    served locally without repeated external API calls.
     """
 
     def __init__(self, storage_path: Optional[Path] = None, ledger: Any = None):
@@ -228,7 +223,8 @@ class DistillationCache:
     def _load(self) -> None:
         if self._path and self._path.exists():
             try:
-                raw = json.loads(self._path.read_text(encoding="utf-8"))
+                with interprocess_file_lock(self._path):
+                    raw = json.loads(self._path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
                     self.api_calls_saved = int(raw.get("api_calls_saved", 0))
                     for item in raw.get("entries", []):
@@ -242,19 +238,20 @@ class DistillationCache:
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(".tmp")
-            payload = {
-                "api_calls_saved": self.api_calls_saved,
-                "entries": list(self._entries.values()),
-            }
-            with tmp.open("w", encoding="utf-8") as fh:
-                fh.write(json.dumps(payload, indent=2, default=str))
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
-            tmp.replace(self._path)
+            with interprocess_file_lock(self._path):
+                tmp = self._path.with_suffix(".tmp")
+                payload = {
+                    "api_calls_saved": self.api_calls_saved,
+                    "entries": list(self._entries.values()),
+                }
+                with tmp.open("w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, indent=2, default=str))
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                tmp.replace(self._path)
         except Exception:
             pass
 
