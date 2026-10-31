@@ -41,7 +41,12 @@ class TestHyperSovereignQuantumCrypto(unittest.TestCase):
         self.hub = MasterHubCoordinator(self.ledger, state_path=self.tmp_hub_state)
 
     def tearDown(self):
-        for p in (self.tmp_ledger_path, self.tmp_hub_state):
+        for p in (
+            self.tmp_ledger_path,
+            self.tmp_hub_state,
+            Path(f".{self.tmp_ledger_path.name}.lock"),
+            Path(f".{self.tmp_hub_state.name}.lock"),
+        ):
             if p.exists():
                 try:
                     p.unlink()

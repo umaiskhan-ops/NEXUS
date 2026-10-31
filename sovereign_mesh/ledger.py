@@ -1,17 +1,62 @@
 """Append-only, HMAC-authenticated hash-chained ledger persisted as JSON Lines."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 GENESIS_HASH = "0" * 64
+
+
+@contextlib.contextmanager
+def interprocess_file_lock(target_path: Optional[Path]) -> Iterator[None]:
+    """Cross-platform OS-level advisory file lock (fcntl.flock on POSIX, msvcrt.locking on Windows) for M7."""
+    if not target_path:
+        yield
+        return
+    lock_file = target_path.parent / f".{target_path.name}.lock"
+    fh = None
+    try:
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_file, "a+b")
+        if sys.platform == "win32":
+            import msvcrt
+            fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except OSError:
+                pass
+        yield
+    finally:
+        if fh is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                fh.close()
+            except OSError:
+                pass
 
 
 def _canonical(obj: Any) -> bytes:
@@ -37,29 +82,16 @@ class HashChainLedger:
 
     @staticmethod
     def _resolve_hmac_key(path: Optional[Path], explicit_key: Optional[str]) -> bytes:
-        if explicit_key:
-            return explicit_key.encode("utf-8")
-        env_key = os.environ.get("LEDGER_HMAC_KEY", "").strip()
-        if env_key:
-            return env_key.encode("utf-8")
-        if path:
-            key_file = path.parent / ".ledger_hmac.key"
-            try:
-                if key_file.exists():
-                    raw = key_file.read_text(encoding="utf-8").strip()
-                    if raw:
-                        return raw.encode("utf-8")
-                key_file.parent.mkdir(parents=True, exist_ok=True)
-                generated = secrets.token_hex(32)
-                key_file.write_text(generated, encoding="utf-8")
-                try:
-                    os.chmod(key_file, 0o600)
-                except OSError:
-                    pass
-                return generated.encode("utf-8")
-            except OSError:
-                pass
-        return secrets.token_hex(32).encode("utf-8")
+        # M9 Fix: Derive Ledger HMAC key from environment / master passphrase secret in memory,
+        # NEVER storing a plaintext '.ledger_hmac.key' file alongside ledger.jsonl in the data folder.
+        raw_secret = (
+            explicit_key
+            or os.environ.get("LEDGER_HMAC_KEY", "").strip()
+            or os.environ.get("MASTER_PASSPHRASE_HASH", "").strip()
+            or os.environ.get("PEER_SHARED_SECRET", "").strip()
+            or "sovereign-mesh-default-memory-hmac-key"
+        )
+        return hashlib.sha256(b"NEXUS_LEDGER_HMAC_V2:" + raw_secret.encode("utf-8")).digest()
 
     def _compute_sig(self, block_hash: str, index: int, prev_hash: str) -> str:
         msg = f"{index}:{prev_hash}:{block_hash}".encode("utf-8")
@@ -67,29 +99,30 @@ class HashChainLedger:
 
     def append(self, task: str, payload: Any) -> dict:
         with self._lock:
-            prev = self._blocks[-1]["hash"] if self._blocks else GENESIS_HASH
-            idx = len(self._blocks)
-            data = {
-                "index": idx,
-                "task": task,
-                "payload": _jsonable(payload),
-                "timestamp": time.time(),
-                "prev_hash": prev,
-            }
-            block_hash = hashlib.sha256(_canonical(data)).hexdigest()
-            sig = self._compute_sig(block_hash, idx, prev)
-            block = {"hash": block_hash, "signature": sig, "data": data}
-            self._blocks.append(block)
-            if self._path:
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-                with self._path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(block, default=str) + "\n")
-                    fh.flush()
-                    try:
-                        os.fsync(fh.fileno())
-                    except OSError:
-                        pass
-            return block
+            with interprocess_file_lock(self._path):
+                prev = self._blocks[-1]["hash"] if self._blocks else GENESIS_HASH
+                idx = len(self._blocks)
+                data = {
+                    "index": idx,
+                    "task": task,
+                    "payload": _jsonable(payload),
+                    "timestamp": time.time(),
+                    "prev_hash": prev,
+                }
+                block_hash = hashlib.sha256(_canonical(data)).hexdigest()
+                sig = self._compute_sig(block_hash, idx, prev)
+                block = {"hash": block_hash, "signature": sig, "data": data}
+                self._blocks.append(block)
+                if self._path:
+                    self._path.parent.mkdir(parents=True, exist_ok=True)
+                    with self._path.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(block, default=str) + "\n")
+                        fh.flush()
+                        try:
+                            os.fsync(fh.fileno())
+                        except OSError:
+                            pass
+                return block
 
     def verify(self) -> Tuple[bool, Optional[int]]:
         """Returns (valid, index_of_first_bad_block)."""

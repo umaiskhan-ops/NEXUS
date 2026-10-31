@@ -59,7 +59,13 @@ class UltimateAgiSovereignGrid:
                                                  config.dashboard_token, config.peer_shared_secret])
         self.encryption = EncryptionLayer(self.data_dir / "fernet.key")
 
-        self.ledger = HashChainLedger(self.data_dir / "ledger.jsonl")
+        ledger_hmac_key = (
+            os.environ.get("LEDGER_HMAC_KEY")
+            or config.master_passphrase_hash
+            or config.peer_shared_secret
+            or config.dashboard_token
+        )
+        self.ledger = HashChainLedger(self.data_dir / "ledger.jsonl", hmac_key=ledger_hmac_key)
         self.memory = MemoryStore(self.data_dir / "memory.json")
         self.snapshots = SnapshotManager()
         self.budget = TokenBudget(config.token_budget)
@@ -352,7 +358,13 @@ class UltimateAgiSovereignGrid:
         for fname in ("ledger.jsonl", "memory.json"):
             if (src / fname).exists():
                 shutil.copy2(src / fname, self.data_dir / fname)
-        self.ledger = HashChainLedger(self.data_dir / "ledger.jsonl")
+        ledger_hmac_key = (
+            os.environ.get("LEDGER_HMAC_KEY")
+            or config.master_passphrase_hash
+            or config.peer_shared_secret
+            or config.dashboard_token
+        )
+        self.ledger = HashChainLedger(self.data_dir / "ledger.jsonl", hmac_key=ledger_hmac_key)
         self.memory = MemoryStore(self.data_dir / "memory.json")
         for sub in (
             getattr(self, "hub", None),
@@ -407,6 +419,8 @@ class UltimateAgiSovereignGrid:
                     approved: bool = False, passphrase: Optional[str] = None, log: bool = True) -> dict:
         payload = dict(payload or {})
         payload.pop("passphrase", None)  # never let secrets reach handlers, logs or the ledger
+        if "session" not in payload and sender_id:
+            payload["session"] = f"user_{sender_id}"
         entry = {"ts": time.time(), "sender": sender_id, "feature": key, "via": via}
 
         def finish(result: dict) -> dict:

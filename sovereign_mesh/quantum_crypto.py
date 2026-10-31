@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------- Constants & Parameters
-VAULT_ENTROPY_BYTES = 512       # 4096 bits of raw cryptographic entropy (16x Bitcoin keys)
+VAULT_ENTROPY_BYTES = 512       # 4096 bits of raw master seed entropy across 4 chambers
 LATTICE_N = 32                  # Polynomial ring degree N (X^N + 1)
 LATTICE_Q = 8380417             # ML-DSA prime: 2^23 - 2^13 + 1 (q = 1 mod 2N)
 LATTICE_ETA = 2                 # Secret vector bound [-eta, eta]
@@ -358,14 +358,14 @@ def ed448_verify(ed448_pub_bytes: bytes, message: bytes, signature: bytes) -> bo
 # ---------------------------------------------------------------- Master 4096-Bit Hyper-Sovereign Key Vault
 @dataclass
 class HyperSovereignKeyVault:
-    """The 4096-Bit Multi-Chamber Hyper-Sovereign Cryptographic Key Vault.
+    """The 4096-Bit Multi-Chamber Hybrid Cryptographic Key Vault.
     
     Contains:
-    - 512 bytes (4096 bits) of pure entropy (16x Bitcoin keys)
-    - Chamber 1: Lattice ML-DSA Post-Quantum Keypair
+    - 512 bytes (4096 bits) of master seed entropy
+    - Chamber 1: Cyclotomic Ring Module-LWE Keypair
     - Chamber 2: Ed448-Goldilocks High-Degree Keypair
     - Chamber 3: Cascaded Triple Hash Tree Root (SHAKE-256 + SHA3-512 + BLAKE2b)
-    - Chamber 4: Hardware Silicon PUF Seal
+    - Chamber 4: Host Hardware Fingerprint Attestation Seal
     - Ephemeral Forward-Secure Ratchet State
     - Bech32m Quantum Address ('nxq1...')
     """
@@ -420,7 +420,7 @@ class HyperSovereignKeyVault:
         sha3_out = hashlib.sha3_512(shake_out).digest()
         cascade_root = hashlib.blake2b(sha3_out, digest_size=64).digest()
 
-        # 4. Chamber 4: Hardware Silicon PUF Seal
+        # 4. Chamber 4: Host Hardware Fingerprint Attestation Seal
         puf_data = compute_hardware_puf_seal(override_uuid=hardware_uuid)
 
         # 5. Bech32m Post-Quantum Address Commitment
@@ -507,7 +507,7 @@ class HyperSovereignKeyVault:
         """Returns the public credentials to be registered on the Master Hub."""
         return {
             "quantum_address": self.quantum_address,
-            "crypto_security_level": "4096-Bit Hyper-Sovereign Quantum-Resistant (16x Multiplied Bitcoin Key Space)",
+            "crypto_security_level": "4096-Bit Hybrid Lattice + Ed448 + SHA3-512 Key Vault",
             "entropy_bits": 4096,
             "hardware_uuid": self.hardware_uuid,
             "puf_seal": self.puf_seal,

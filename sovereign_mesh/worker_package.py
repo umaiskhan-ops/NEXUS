@@ -450,7 +450,7 @@ def detect_hardware_spec() -> str:
     cores = os.cpu_count() or 4
     return f"{{cpu}} ({{cores}} Cores)"
 
-def solve_pow_challenge(worker_id: str, challenge: str, difficulty_prefix: str = "00") -> str:
+def solve_pow_challenge(worker_id: str, challenge: str, difficulty_prefix: str = "000") -> str:
     if not challenge:
         return ""
     prefix = f"{{worker_id}}:{{challenge}}:"
@@ -580,7 +580,7 @@ class WorkerState:
         self.models_dir = SHARDS_DIR
         # Hyper-Sovereign 4096-Bit Quantum Identity
         self.quantum_address = ""
-        self.crypto_security_level = "4096-Bit Hyper-Sovereign Quantum Vault (16x Multiplied Bitcoin Key Space)"
+        self.crypto_security_level = "4096-Bit Hybrid Lattice + Ed448 + SHA3-512 Key Vault"
         self.puf_seal = ""
         self.quantum_vault_pub = {{}}
         self.ratchet_step = 0
@@ -789,12 +789,16 @@ class WorkerState:
                 code_to_write = ""
                 expected_hash = target_sha256 or resp.headers.get("X-Script-Sha256", "")
                 received_sig = ota_signature or resp.headers.get("X-OTA-Signature", "")
+                ota_ed25519_sig = resp.headers.get("X-OTA-Ed25519-Signature", "")
+                ota_ed25519_pub = os.environ.get("NEXUS_OTA_PUBLIC_KEY_HEX", "") or resp.headers.get("X-OTA-Ed25519-Pub", "")
                 try:
                     j = json.loads(raw_data.decode("utf-8"))
                     if j.get("ok") and j.get("code"):
                         code_to_write = j["code"]
                         expected_hash = j.get("sha256") or expected_hash
                         received_sig = j.get("ota_signature") or received_sig
+                        ota_ed25519_sig = j.get("ota_ed25519_sig") or ota_ed25519_sig
+                        ota_ed25519_pub = os.environ.get("NEXUS_OTA_PUBLIC_KEY_HEX", "") or j.get("ota_ed25519_pub") or ota_ed25519_pub
                 except Exception:
                     code_to_write = raw_data.decode("utf-8")
 
@@ -813,18 +817,34 @@ class WorkerState:
                     self.ota_status = "INTEGRITY_MISMATCH"
                     return
 
-                # Mandatory Cryptographic Signature check when worker_key is provisioned (C4 Fix)
-                if self.worker_key:
+                # Mandatory Fail-Closed Cryptographic Signature check (C4 Fix: NEVER allow unsigned OTA even if worker_key is empty)
+                ota_msg = f"OTA:{{target_version}}:{{calc_sha256}}".encode("utf-8")
+                sig_verified = False
+                if ota_ed25519_sig and ota_ed25519_pub:
+                    try:
+                        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+                        pub_obj = Ed25519PublicKey.from_public_bytes(bytes.fromhex(ota_ed25519_pub))
+                        pub_obj.verify(bytes.fromhex(ota_ed25519_sig), ota_msg)
+                        sig_verified = True
+                    except Exception:
+                        sig_verified = False
+
+                if self.worker_key and received_sig:
                     expected_sig = hmac.new(
                         self.worker_key.encode("utf-8"),
-                        f"OTA:{{target_version}}:{{calc_sha256}}".encode("utf-8"),
+                        ota_msg,
                         hashlib.sha256,
                     ).hexdigest()
-                    if not received_sig or not hmac.compare_digest(received_sig, expected_sig):
-                        print("[!] [OTA] Cryptographic OTA signature verification failed! Rejecting unsigned/untrusted update.")
-                        self.updating = False
-                        self.ota_status = "SIGNATURE_INVALID"
-                        return
+                    if hmac.compare_digest(received_sig, expected_sig):
+                        sig_verified = True
+                    else:
+                        sig_verified = False
+
+                if not sig_verified:
+                    print("[!] [OTA] Cryptographic OTA signature verification failed! Rejecting unsigned/untrusted update.")
+                    self.updating = False
+                    self.ota_status = "SIGNATURE_INVALID"
+                    return
 
                 # Validate syntax via AST before writing to disk
                 import ast
@@ -1294,14 +1314,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
       </p>
     </div>
 
-    <!-- 4096-Bit Hyper-Sovereign Quantum Vault Card (Surpasses Bitcoin by 16x Key Space Multiplication) -->
+    <!-- 4096-Bit Hybrid Cryptographic Vault Card -->
     <div class="card" style="border-color: rgba(59, 130, 246, 0.45); background: linear-gradient(180deg, #101422 0%, #0d0f17 100%);">
       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
         <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
-          <span style="font-size:0.7rem; font-family:var(--font-mono); font-weight:700; color:#60a5fa; text-transform:uppercase; letter-spacing:0.06em;">⚡ 4096-BIT HYPER-SOVEREIGN QUANTUM VAULT (HSQK-4096)</span>
-          <span style="font-size:0.65rem; background:rgba(16,185,129,0.15); color:#10b981; border:1px solid rgba(16,185,129,0.3); padding:0.15rem 0.45rem; border-radius:4px; font-weight:700;">16x BITCOIN MULTIPLIER (2^4096)</span>
+          <span style="font-size:0.7rem; font-family:var(--font-mono); font-weight:700; color:#60a5fa; text-transform:uppercase; letter-spacing:0.06em;">⚡ 4096-BIT HYBRID CRYPTOGRAPHIC VAULT (HSQK-4096)</span>
+          <span style="font-size:0.65rem; background:rgba(16,185,129,0.15); color:#10b981; border:1px solid rgba(16,185,129,0.3); padding:0.15rem 0.45rem; border-radius:4px; font-weight:700;">4-CHAMBER HYBRID VAULT (4096-BIT)</span>
         </div>
-        <span style="font-size:0.72rem; font-family:var(--font-mono); color:#10b981; font-weight:600;">● SILICON PUF SEAL ACTIVE [LOCKED]</span>
+        <span style="font-size:0.72rem; font-family:var(--font-mono); color:#10b981; font-weight:600;">● HARDWARE FINGERPRINT SEAL ACTIVE [LOCKED]</span>
       </div>
       <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.65rem; flex-wrap:wrap; gap:0.75rem;">
         <div style="font-family:var(--font-mono); font-size:0.84rem; font-weight:600; color:#93c5fd; background:#090a0f; padding:0.5rem 0.8rem; border-radius:6px; border:1px solid #1e293b; word-break:break-all; flex:1; min-width:240px;" id="quantum-address-box">__QUANTUM_ADDR__</div>
@@ -1328,7 +1348,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         </div>
       </div>
       <p style="font-size:0.74rem; color:var(--text-muted); margin-top:0.55rem; line-height:1.4;">
-        Cryptographic Proof: Combines 4096-bit physical entropy with post-quantum lattice polynomial ring signatures and hardware silicon drift. Immune to quantum Shor attacks and VM clone theft.
+        Cryptographic Proof: Combines 4096-bit OS entropy with hybrid lattice polynomial ring signatures, Ed448-Goldilocks, and host hardware fingerprint attestation.
       </p>
     </div>
 
@@ -1700,10 +1720,9 @@ def main():
     print("=" * 60)
     print(f"[*] Public Worker ID:   {{state.worker_id}}")
     print(f"[*] Secret Account Key: {{state.worker_key}}")
-    print(f"[*] Crypto Security:    4096-Bit Hyper-Sovereign Quantum Vault")
-    print(f"[*] Bitcoin Multiplier: 16x Multiplied Key Space (2^4096)")
+    print(f"[*] Crypto Security:    4096-Bit Hybrid Lattice + Ed448 + SHA3-512 Key Vault")
     print(f"[*] Quantum Address:    {{state.quantum_address}}")
-    print(f"[*] Silicon PUF Seal:   ACTIVE [Hardware-Locked]")
+    print(f"[*] Hardware Seal:      ACTIVE [Host Fingerprint Attested]")
     print(f"[*] Native Sandbox:     ACTIVE [Directory-Jailed & Host-Protected]")
     print(f"[*] Sandbox Workspace:  {{state.sandbox_dir}}")
     print(f"[*] Host CPU Shield:    {{state.sandbox.throttling_mode}}")

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .ledger import HashChainLedger
+from .ledger import HashChainLedger, interprocess_file_lock
 
 TICKET_PRICE_CREDITS = 5
 DEFAULT_TARGET_POOL_TICKETS = 10  # 10 tickets = 50 credits
@@ -114,26 +114,27 @@ class TokenSinkManager:
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(".tmp")
-            payload = {
-                "current_round": self.current_round,
-                "round_seed_commit": self.round_seed_commit,
-                "round_seed_secret": self._round_seed_secret,
-                "total_lottery_rounds_completed": self.total_lottery_rounds_completed,
-                "total_deflationary_burned_credits": self.total_deflationary_burned_credits,
-                "total_jackpot_credits_awarded": self.total_jackpot_credits_awarded,
-                "past_winners": self.past_winners[-50:],
-                "current_tickets": [t.to_dict() for t in self.current_tickets],
-                "stakers": {wid: s.to_dict() for wid, s in self._stakers.items()},
-            }
-            with tmp.open("w", encoding="utf-8") as fh:
-                fh.write(json.dumps(payload, indent=2, default=str))
-                fh.flush()
-                try:
-                    os.fsync(fh.fileno())
-                except OSError:
-                    pass
-            tmp.replace(self._path)
+            with interprocess_file_lock(self._path):
+                tmp = self._path.with_suffix(".tmp")
+                payload = {
+                    "current_round": self.current_round,
+                    "round_seed_commit": self.round_seed_commit,
+                    "round_seed_secret": self._round_seed_secret,
+                    "total_lottery_rounds_completed": self.total_lottery_rounds_completed,
+                    "total_deflationary_burned_credits": self.total_deflationary_burned_credits,
+                    "total_jackpot_credits_awarded": self.total_jackpot_credits_awarded,
+                    "past_winners": self.past_winners[-50:],
+                    "current_tickets": [t.to_dict() for t in self.current_tickets],
+                    "stakers": {wid: s.to_dict() for wid, s in self._stakers.items()},
+                }
+                with tmp.open("w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, indent=2, default=str))
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                tmp.replace(self._path)
         except Exception:
             pass
 

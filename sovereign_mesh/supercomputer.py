@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .ledger import HashChainLedger
+from .ledger import HashChainLedger, interprocess_file_lock
 
 MIN_CREDITS_FOR_SERVER_RENTAL = 250
 
@@ -167,22 +167,32 @@ class SupercomputerEngine:
         if not self._path:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        data = [i.to_dict(include_secret=True) for i in self._instances.values()]
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2, default=str))
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except OSError:
-                pass
-        tmp.replace(self._path)
+        with interprocess_file_lock(self._path):
+            tmp = self._path.with_suffix(".tmp")
+            data = [i.to_dict(include_secret=True) for i in self._instances.values()]
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, indent=2, default=str))
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            tmp.replace(self._path)
+
+    def _resolve_worker(self, id_or_key: str):
+        val = (id_or_key or "").strip()
+        if not val or not self.hub:
+            return None
+        w = self.hub.get_worker(val) if hasattr(self.hub, "get_worker") else None
+        if not w and hasattr(self.hub, "get_worker_by_key"):
+            w = self.hub.get_worker_by_key(val)
+        return w
 
     def _resolve_wid(self, id_or_key: str) -> str:
         val = (id_or_key or "").strip()
-        if not val or not hasattr(self.hub, "get_worker"):
+        if not val:
             return val
-        w = self.hub.get_worker(val)
+        w = self._resolve_worker(val)
         return w.worker_id if w else val
 
     def _find_instance(self, instance_id_or_access_key: str) -> Optional[VirtualServerInstance]:
@@ -233,7 +243,7 @@ class SupercomputerEngine:
             self._flush()
             return
 
-        worker = self.hub.get_worker(inst.user_account_key) if hasattr(self.hub, "get_worker") else None
+        worker = self._resolve_worker(inst.user_account_key)
         rate = max(5, inst.hourly_rate)
         can_renew = bool(
             worker
@@ -298,7 +308,7 @@ class SupercomputerEngine:
         total_credits = hourly_rate * duration_hours
 
         with self._lock:
-            worker = self.hub.get_worker(user_account_key) if hasattr(self.hub, "get_worker") else None
+            worker = self._resolve_worker(user_account_key)
             if not worker:
                 return {
                     "ok": False,
@@ -537,7 +547,7 @@ class SupercomputerEngine:
                 inst.paused_remaining_seconds = 0.0
             else:
                 # Need a fresh 1-hour billing block to resume
-                worker = self.hub.get_worker(inst.user_account_key) if hasattr(self.hub, "get_worker") else None
+                worker = self._resolve_worker(inst.user_account_key)
                 rate = max(5, inst.hourly_rate)
                 if worker and worker.status == "SLASHED":
                     return {"ok": False, "error": f"Account '{inst.user_account_key}' is SLASHED and cannot resume clusters."}
@@ -699,14 +709,14 @@ class SupercomputerEngine:
                 node_results.append({
                     "node_id": nid,
                     "slice_index": i + 1,
-                    "status": "COMPLETED",
+                    "status": "QUEUED_FOR_WORKER_PULL" if dispatched_task_id else "SIMULATED_FALLBACK",
+                    "execution_mode": "ASYNC_NAT_PULL_QUEUE" if dispatched_task_id else "LOCAL_HUB_SANDBOX",
                     "task_id": dispatched_task_id,
-                    "tflops_utilized": round((inst.allocated_tflops * elastic_ratio) / max(1, len(active_nodes_slice)), 2),
                     "memory_slice_mb": int((elastic_ram * 1024) / max(1, len(active_nodes_slice))),
                     "worker_credits_awarded": 0,
                 })
 
-            elapsed = round((time.perf_counter() - t0) * 1000 + 42.5, 2)
+            elapsed = round((time.perf_counter() - t0) * 1000, 2)
             inst.status = "ONLINE"
             shared_cores_remaining = max(0, inst.allocated_cores - elastic_cores)
 

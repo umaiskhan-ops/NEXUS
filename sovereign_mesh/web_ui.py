@@ -9,7 +9,7 @@ Features:
 from __future__ import annotations
 
 
-def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> str:
+def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict, csp_nonce: str = "") -> str:
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -19,8 +19,8 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
-  <style>
+  <script nonce="{csp_nonce}" src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
+  <style nonce="{csp_nonce}">
     :root {{
       --bg: #090a0f;
       --card-bg: #101218;
@@ -2405,8 +2405,9 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
       </div>
     </div>
   </div>
-  <script>
-    let activeAccountKey = localStorage.getItem('sup_account_key') || '';
+  <script nonce="{csp_nonce}">
+    let activeAccountKey = '';
+    let activeRemoteServerSecret = '';
     let currentChatSessionId = localStorage.getItem('sup_chat_session_id') || 'default';
     let chatSessions = (() => {{
       try {{
@@ -2419,13 +2420,12 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
 
     /* --- INITIALIZATION --- */
     window.onload = () => {{
-      // Auto-detect account key from URL if passed from worker launcher, then scrub URL bar (N6 / H11)
+      // Auto-detect account key from URL if passed from worker launcher, store in HttpOnly cookie, then scrub URL bar (N6 / H11 / R1)
       const params = new URLSearchParams(window.location.search);
       const urlKey = params.get('account_key');
       const urlToken = params.get('token');
       if (urlKey) {{
         activeAccountKey = urlKey;
-        localStorage.setItem('sup_account_key', activeAccountKey);
         fetch('/api/auth/session', {{
           method: 'POST',
           headers: {{ 'Content-Type': 'application/json' }},
@@ -2442,9 +2442,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
         window.history.replaceState({{}}, document.title, window.location.pathname + window.location.hash);
       }}
 
-      if (activeAccountKey) {{
-        verifyAndDisplayAccount(activeAccountKey);
-      }}
+      verifyAndDisplayAccount(activeAccountKey);
       renderChatHistory();
       loadActiveChat();
       initMonaco();
@@ -2521,11 +2519,18 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
 
     async function verifyAndDisplayAccount(key) {{
       try {{
-        const res = await fetch('/api/account/status?key=' + encodeURIComponent(key));
+        const reqHeaders = key ? {{ 'X-Account-Key': key }} : {{}};
+        const res = await fetch('/api/account/status', {{ headers: reqHeaders }});
         const data = await res.json();
         if (data.ok) {{
           activeAccountKey = data.account_key || key;
-          localStorage.setItem('sup_account_key', activeAccountKey);
+          if (key) {{
+            fetch('/api/auth/session', {{
+              method: 'POST',
+              headers: {{ 'Content-Type': 'application/json' }},
+              body: JSON.stringify({{ account_key: activeAccountKey }})
+            }}).catch(() => {{}});
+          }}
           document.getElementById('account-logged-out').style.display = 'none';
           document.getElementById('account-logged-in').style.display = 'flex';
           document.getElementById('account-key-label').textContent = data.worker_id + (data.dispute_frozen ? ' (FROZEN)' : '');
@@ -2551,7 +2556,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
           if (document.getElementById('sell-worker-id')) document.getElementById('sell-worker-id').value = activeAccountKey;
           if (document.getElementById('tr-from')) document.getElementById('tr-from').value = activeAccountKey;
           if (document.getElementById('p2p-check-id')) document.getElementById('p2p-check-id').value = activeAccountKey;
-        }} else {{
+        }} else if (key) {{
           alert('Could not verify key: ' + (data.error || 'Unknown'));
         }}
       }} catch(err) {{
@@ -2564,7 +2569,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
       const addr = el ? el.getAttribute('data-full-addr') : '';
       if (addr) {{
         navigator.clipboard.writeText(addr);
-        alert('4096-Bit Hyper-Sovereign Post-Quantum Address copied:\\n' + addr);
+        alert('4096-Bit Hybrid Quantum Vault Address copied:\\n' + addr);
       }}
     }}
 
@@ -2580,7 +2585,6 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
 
     function disconnectAccountKey() {{
       activeAccountKey = '';
-      localStorage.removeItem('sup_account_key');
       document.getElementById('account-logged-in').style.display = 'none';
       document.getElementById('account-logged-out').style.display = 'flex';
       document.getElementById('top-account-key').value = '';
@@ -4118,7 +4122,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
         const data = await res.json();
         if (data.ok && data.instance) {{
           const s = data.instance;
-          localStorage.setItem('sup_remote_server_secret', secret);
+          activeRemoteServerSecret = secret;
           openServerConsole(s.instance_id, s.tier_name, s.allocated_cores, s.allocated_ram_gb, s.endpoint, s.access_key_id || '', s.server_secret_key || secret);
           loadMyClusters(secret);
         }} else {{
@@ -4132,7 +4136,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
     async function loadMyClusters(overrideKey) {{
       const tbody = document.getElementById('my-clusters-tbody');
       if (!tbody) return;
-      const queryKey = overrideKey || activeAccountKey || localStorage.getItem('sup_remote_server_secret') || '';
+      const queryKey = overrideKey || activeAccountKey || activeRemoteServerSecret || '';
       if (!queryKey) {{
         tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1.75rem;">Authenticate your Account Key or attach via IAM Instance Credentials to manage provisioned clusters.</td></tr>';
         return;
@@ -4140,7 +4144,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
       tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1rem;">Querying provisioned instances...</td></tr>';
 
       try {{
-        const res = await fetch('/api/supercomputer/instances?account_key=' + encodeURIComponent(queryKey));
+        const res = await fetch('/api/supercomputer/instances', {{ headers: {{ 'X-Account-Key': queryKey }} }});
         const data = await res.json();
         if (!data.ok || !data.instances || data.instances.length === 0) {{
           tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; color:var(--text-muted); padding:1.75rem;">No active or paused instances found for this key.</td></tr>';
@@ -4225,7 +4229,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
     function openServerConsole(instanceId, tierName, cores, ramGb, endpoint, accessKeyId, serverSecretKey) {{
       currentConsoleInstanceId = instanceId;
       currentConsoleAccessKeyId = accessKeyId || 'NXIA-SERVER';
-      currentConsoleServerSecretKey = serverSecretKey || localStorage.getItem('sup_remote_server_secret') || '';
+      currentConsoleServerSecretKey = serverSecretKey || activeRemoteServerSecret || '';
       const m = document.getElementById('modal-server-console');
       if (m) m.style.display = 'flex';
 
@@ -4329,14 +4333,14 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
     }}
 
     async function ideRunOnSupercomputer() {{
-      const queryKey = activeAccountKey || localStorage.getItem('sup_remote_server_secret') || '';
+      const queryKey = activeAccountKey || activeRemoteServerSecret || '';
       if (!queryKey) {{
         alert('Please authenticate your Account Key or attach to an instance in Tab 5 first.');
         return;
       }}
       logToIdeTerminal('Querying provisioned Supercomputer instances...', '#60a5fa');
       try {{
-        const res = await fetch('/api/supercomputer/instances?account_key=' + encodeURIComponent(queryKey));
+        const res = await fetch('/api/supercomputer/instances', {{ headers: {{ 'X-Account-Key': queryKey }} }});
         const data = await res.json();
         const activeInst = (data.instances || []).find(i => i.status === 'ONLINE' || i.status === 'PAUSED' || i.status === 'PAUSED_LOW_CREDITS');
         if (!activeInst) {{
@@ -4501,7 +4505,8 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
         }}
 
         const queryAcc = activeAccountKey || '';
-        const stakeRes = await fetch('/api/staking/status?account_key=' + encodeURIComponent(queryAcc));
+        const stakeHeaders = queryAcc ? {{ 'X-Account-Key': queryAcc }} : {{}};
+        const stakeRes = await fetch('/api/staking/status', {{ headers: stakeHeaders }});
         const stakeData = await stakeRes.json();
         if (stakeData && stakeData.ok) {{
           const myStk = document.getElementById('my-staked-credits');

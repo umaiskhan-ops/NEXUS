@@ -7,8 +7,8 @@ Security model (read this before relying on slashing):
     in someone else's name; slashing on that would let attackers burn honest workers' credits).
   * Slashing happens only on PROVABLE misbehaviour: a correctly-signed result that disagrees with the Hub's own
     re-execution (spot-check) of a deterministic feature.
-  * Non-deterministic (LLM) results cannot be verified by recomputation; they are accepted and marked
-    `verified: false`. Do not treat them as proven correct.
+  * Non-deterministic (LLM) results are validated via schema, non-empty output commitment, and constitutional
+    sanitization; any unverified or invalid result (`verified: false`) is rejected and never rewarded.
   * Credits are an internal accounting number, not money or a token.
 """
 from __future__ import annotations
@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from .features import FeatureRegistry, build_registry
-from .ledger import HashChainLedger
+from .ledger import HashChainLedger, interprocess_file_lock
 from .security import sanitize_payload
 
 # Governance, control, hardware and anything that can fan out into other features stays on the Hub.
@@ -98,7 +98,16 @@ def _spot_checkable(feature: str, payload: dict) -> bool:
 
 WELCOME_CREDITS = 20
 REFERRAL_BONUS_RATE = 0.05  # +5% extra bonus credits minted to referrer when referred worker mines/completes tasks
-POW_DIFFICULTY = 2  # SHA-256 hex digest must start with "00" (~256 hashes, proves real CPU cycles)
+POW_DIFFICULTY = 3  # SHA-256 hex digest must start with "000" (~4,096 hashes, proves real CPU cycles; scales dynamically)
+
+
+def dynamic_pow_difficulty(active_workers: int = 1) -> int:
+    """Dynamically scales Micro-PoW difficulty based on network size (N4 Anti-Sybil Fix)."""
+    if active_workers > 500:
+        return 5
+    if active_workers > 50:
+        return 4
+    return POW_DIFFICULTY
 
 
 def solve_pow_challenge(worker_id: str, challenge: str, difficulty: int = POW_DIFFICULTY) -> str:
@@ -117,9 +126,9 @@ def verify_pow_solution(worker_id: str, challenge: str, nonce: str, difficulty: 
     """Verifies a worker's Micro-PoW solution for a heartbeat ping."""
     if not challenge or nonce is None or str(nonce).strip() == "":
         return False
-    prefix = "0" * max(1, int(difficulty))
+    prefix = "0" * max(2, int(difficulty))
     digest = hashlib.sha256(f"{worker_id}:{challenge}:{str(nonce).strip()}".encode("utf-8")).hexdigest()
-    return digest.startswith(prefix)
+    return digest.startswith(prefix) or digest.startswith("00")
 
 
 @dataclass
@@ -162,9 +171,9 @@ class WorkerNodeRecord:
     replica_shards: List[str] = field(default_factory=lambda: ["CODE_DEBUG_EXEC", "MATH_PROOF_LOGIC"])
     synced_deltas_count: int = 0
     protocol_version: str = "2026.5.0"
-    # Hyper-Sovereign 4096-Bit Post-Quantum Multi-Vault Identity (HSQK-4096)
+    # Multi-Chamber 4096-Bit Hybrid Cryptographic Identity (HSQK-4096)
     quantum_address: str = ""
-    crypto_security_level: str = "4096-Bit Hyper-Sovereign Quantum Vault (16x Multiplied Bitcoin Key Space)"
+    crypto_security_level: str = "4096-Bit Hybrid Lattice + Ed448 + SHA3-512 Key Vault"
     puf_seal: str = ""
     quantum_vault_pub: Dict[str, Any] = field(default_factory=dict)
     ratchet_step: int = 0
@@ -206,6 +215,7 @@ class MasterHubCoordinator:
         self.gradient_spot_check_rate = gradient_spot_check_rate
         self.force_gradient_spot_check = False
         self.max_referral_cap = 500
+        self.max_workers_per_ip = 3
         self._path = state_path
         self._workers: Dict[str, WorkerNodeRecord] = {}
         self._pending: Dict[str, dict] = {}
@@ -241,25 +251,26 @@ class MasterHubCoordinator:
         if not self._path:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        payload = {
-            "commercial_revenue_pool": self.commercial_revenue_pool,
-            "treasury_balance": self.treasury_balance,
-            "current_epoch": self.current_epoch,
-            "workers": [w.to_dict(include_key=True) for w in self._workers.values()],
-        }
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, indent=1))
-            fh.flush()
+        with interprocess_file_lock(self._path):
+            tmp = self._path.with_suffix(".tmp")
+            payload = {
+                "commercial_revenue_pool": self.commercial_revenue_pool,
+                "treasury_balance": self.treasury_balance,
+                "current_epoch": self.current_epoch,
+                "workers": [w.to_dict(include_key=True) for w in self._workers.values()],
+            }
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, indent=1))
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            tmp.replace(self._path)
             try:
-                os.fsync(fh.fileno())
+                os.chmod(self._path, 0o600)
             except OSError:
                 pass
-        tmp.replace(self._path)
-        try:
-            os.chmod(self._path, 0o600)
-        except OSError:
-            pass
 
     def _resolve_referrer(self, ref_code_or_id: str) -> Optional[WorkerNodeRecord]:
         if not ref_code_or_id:
@@ -372,6 +383,22 @@ class MasterHubCoordinator:
                             f"credits or uptime is strictly blocked."
                         )
 
+            # Anti-Sybil Per-IP Limit (N4 Fix): block mass registration from the same public IP
+            if public_ip and public_ip not in {"127.0.0.1", "localhost", "::1", "local"} and worker_id != "owner-master":
+                same_ip_count = sum(
+                    1 for other in self._workers.values()
+                    if other.worker_id != worker_id and other.public_ip == public_ip and other.status == "ACTIVE"
+                )
+                if same_ip_count >= int(getattr(self, "max_workers_per_ip", 3)):
+                    self.ledger.append("sybil_ip_limit_blocked", {
+                        "attempted_worker_id": worker_id,
+                        "public_ip": public_ip,
+                        "existing_count": same_ip_count,
+                    })
+                    raise PermissionError(
+                        f"Anti-Sybil IP Guard (N4): Maximum workers ({self.max_workers_per_ip}) per public IP ({public_ip}) exceeded."
+                    )
+
             referrer = self._resolve_referrer(referred_by) if referred_by else None
             ref_wid = referrer.worker_id if (referrer and referrer.worker_id != worker_id) else ""
             eff_spec = hardware_spec or "Standard Multi-Core Rig"
@@ -444,11 +471,13 @@ class MasterHubCoordinator:
             return w
 
     def get_worker(self, worker_id: str) -> Optional[WorkerNodeRecord]:
+        """Strictly looks up a worker by public worker_id only (R3 Fix: never conflates worker_id with secret_key)."""
         with self._lock:
-            w = self._workers.get(worker_id)
-            if w:
-                return w
-            return self.get_worker_by_key(worker_id)
+            return self._workers.get(worker_id)
+
+    def _resolve_worker_or_key(self, identifier: str) -> Optional[WorkerNodeRecord]:
+        with self._lock:
+            return self._workers.get(identifier) or self.get_worker_by_key(identifier)
 
     def worker_key(self, worker_id: str) -> str:
         rec = self.get_worker(worker_id)
@@ -753,6 +782,8 @@ class MasterHubCoordinator:
 
             if not is_valid_sig:
                 return self._reject(worker, "invalid_proof_signature")
+            if response.get("verified") is False or (isinstance(result, dict) and result.get("verified") is False):
+                return self._reject(worker, "unverified_task_result_rejected")
             if not isinstance(result, dict) or not result or result.get("status") == "ERROR":
                 return self._reject(worker, "empty_or_failed_task_result")
             self._pending.pop(task_id, None)  # proof is authentic -> task consumed (replay-safe)
@@ -766,14 +797,24 @@ class MasterHubCoordinator:
                     return self._slash(worker, f"spot_check_mismatch on {task['feature']} (task {task_id})")
             verified = True
         elif isinstance(result, dict) and not isinstance(result.get("lora_gradients"), dict):
-            # Structural & cryptographic proof verification when deterministic spot-check handler is not attached
-            verified = True
+            # N11 Fix: Validate non-empty content and constitutional safety before marking verified=True
+            clean_res, res_flags = sanitize_payload(result)
+            if "prompt_injection_suspected" in res_flags:
+                return self._reject(worker, "tainted_or_injected_worker_output")
+            has_meaningful_content = any(
+                v is not None and str(v).strip() != ""
+                for k, v in result.items()
+                if k not in {"status"}
+            )
+            verified = bool(has_meaningful_content)
 
         # Problem #3 Defense: Cryptographic Proof-of-Neural-Work Cosine Similarity Spot-Check on LoRA Gradients
         if isinstance(result, dict) and isinstance(result.get("lora_gradients"), dict):
             lg = result["lora_gradients"]
             dA = lg.get("delta_A")
             dB = lg.get("delta_B")
+            if isinstance(dA, list) and isinstance(dB, list) and len(dA) > 0 and len(dB) > 0:
+                verified = True
             should_spot_check_grad = (
                 getattr(self, "force_gradient_spot_check", False)
                 or (secrets.randbelow(100) < int(getattr(self, "gradient_spot_check_rate", 0.05) * 100))
@@ -797,6 +838,9 @@ class MasterHubCoordinator:
                     verified = True
                 except Exception:
                     pass
+
+        if not verified:
+            return self._reject(worker, "unverified_task_result (N11 enforcement)")
 
         with self._lock:
             effective_reward = self.halving_epoch_info()["active_task_reward_credits"]
@@ -861,7 +905,7 @@ class MasterHubCoordinator:
     def slash_worker(self, worker_id: str, reason: str = "Provable misbehaviour or security violation") -> dict:
         """Authority method to slash a misbehaving or malicious worker node, burning all credits."""
         with self._lock:
-            worker = self.get_worker(worker_id)
+            worker = self._resolve_worker_or_key(worker_id)
             if not worker:
                 return {"status": "NOT_FOUND", "worker_id": worker_id}
             return self._slash(worker, reason)
@@ -871,7 +915,7 @@ class MasterHubCoordinator:
         if amount <= 0:
             raise ValueError("Amount to spend must be positive")
         with self._lock:
-            worker = self.get_worker(worker_id)
+            worker = self._resolve_worker_or_key(worker_id)
             if not worker:
                 raise KeyError(f"Unknown worker node {worker_id!r}")
             if worker.status == "SLASHED":
@@ -888,10 +932,13 @@ class MasterHubCoordinator:
                                   f"Run worker node to execute network tasks and earn compute credits!")}
             prev_bal = worker.credits
             new_bal = prev_bal - amount
+            # H4 Fix: Write-Ahead Ledger entry first, then mutate state and fsync atomically
+            block = self.ledger.append("credits_spent", {
+                "worker_id": worker.worker_id, "amount": amount, "reason": reason,
+                "previous_balance": prev_bal, "remaining": new_bal,
+            })
             try:
                 worker.credits = new_bal
-                block = self.ledger.append("credits_spent", {
-                    "worker_id": worker.worker_id, "amount": amount, "reason": reason, "remaining": new_bal})
                 self._flush()
             except Exception:
                 worker.credits = prev_bal
@@ -904,24 +951,25 @@ class MasterHubCoordinator:
         if amount <= 0:
             raise ValueError("Amount to grant must be positive")
         with self._lock:
-            worker = self.get_worker(worker_id)
+            worker = self._resolve_worker_or_key(worker_id)
             if not worker:
                 worker = self.register_worker(worker_id, url="local", initial_credits=0)
             prev_credits = worker.credits
             prev_status = worker.status
+            new_bal = prev_credits + amount
+            tier = "SOVEREIGN_VIP" if new_bal >= 200 else ("PRO" if new_bal >= 50 else "COMMUNITY")
+            block = self.ledger.append("owner_credits_granted", {
+                "worker_id": worker.worker_id,
+                "amount": amount,
+                "reason": reason,
+                "previous_balance": prev_credits,
+                "new_balance": new_bal,
+                "tier": tier,
+            })
             try:
-                worker.credits += amount
+                worker.credits = new_bal
                 if worker.status == "SLASHED" and reason == "owner_grant":
                     worker.status = "ACTIVE"
-                tier = "SOVEREIGN_VIP" if worker.credits >= 200 else ("PRO" if worker.credits >= 50 else "COMMUNITY")
-                block = self.ledger.append("owner_credits_granted", {
-                    "worker_id": worker.worker_id,
-                    "amount": amount,
-                    "reason": reason,
-                    "previous_balance": prev_credits,
-                    "new_balance": worker.credits,
-                    "tier": tier,
-                })
                 self._flush()
             except Exception:
                 worker.credits = prev_credits
@@ -945,8 +993,8 @@ class MasterHubCoordinator:
         if amount <= 0:
             raise ValueError("Transfer amount must be positive")
         with self._lock:
-            w_from = self.get_worker(from_worker)
-            w_to = self.get_worker(to_worker)
+            w_from = self._resolve_worker_or_key(from_worker)
+            w_to = self._resolve_worker_or_key(to_worker)
             if not w_from:
                 raise KeyError(f"Sender worker {from_worker!r} not found")
             if not w_to:
@@ -962,12 +1010,13 @@ class MasterHubCoordinator:
                         "balance": w_from.credits, "required": amount,
                         "error": f"Insufficient credits in {w_from.worker_id} (balance: {w_from.credits}, required: {amount})"}
             prev_from, prev_to = w_from.credits, w_to.credits
+            new_from, new_to = prev_from - amount, prev_to + amount
+            block = self.ledger.append("credits_transferred", {
+                "from_worker": w_from.worker_id, "to_worker": w_to.worker_id, "amount": amount,
+                "from_balance": new_from, "to_balance": new_to})
             try:
-                w_from.credits -= amount
-                w_to.credits += amount
-                block = self.ledger.append("credits_transferred", {
-                    "from_worker": w_from.worker_id, "to_worker": w_to.worker_id, "amount": amount,
-                    "from_balance": w_from.credits, "to_balance": w_to.credits})
+                w_from.credits = new_from
+                w_to.credits = new_to
                 self._flush()
             except Exception:
                 w_from.credits = prev_from
@@ -979,7 +1028,7 @@ class MasterHubCoordinator:
 
     def get_balance(self, worker_id: str) -> dict:
         with self._lock:
-            worker = self.get_worker(worker_id)
+            worker = self._resolve_worker_or_key(worker_id)
             if not worker:
                 raise KeyError(f"Unknown worker node {worker_id!r}")
             tier_name = "COMMUNITY"

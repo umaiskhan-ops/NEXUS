@@ -35,9 +35,14 @@ DANGEROUS_PATTERNS = [
 ]
 
 _BLOCKED_IMPORTS = {
-    "subprocess", "socket", "pty", "ctypes", "shutil", "urllib", "http",
+    "subprocess", "socket", "pty", "ctypes", "cffi", "shutil", "urllib", "http",
     "ftplib", "telnetlib", "smtplib", "smtpd", "xmlrpc", "winreg",
-    "webbrowser", "importlib", "builtins", "multiprocessing", "signal",
+    "webbrowser", "importlib", "builtins", "multiprocessing", "concurrent",
+    "signal", "asyncio", "selectors", "ssl", "pathlib", "tempfile", "glob",
+    "fnmatch", "linecache", "tokenize", "codecs", "io", "zipfile", "tarfile",
+    "gzip", "bz2", "lzma", "sqlite3", "dbm", "shelve", "pickle", "marshal",
+    "mmap", "gc", "inspect", "traceback", "pkgutil", "runpy", "code", "codeop",
+    "compileall", "py_compile", "tty", "termios", "fcntl", "resource", "syslog",
 }
 
 _BLOCKED_OS_ATTRS = {
@@ -159,11 +164,107 @@ def compile_check(source: str, filename: str = "<grid>") -> dict:
     return {"ok": True, "bytecode_instructions": listing.count("\n"), "disassembly_preview": listing[:1500]}
 
 
+_AUDIT_RUNNER_TEMPLATE = '''import builtins
+import os
+import sys
+
+_SANDBOX_ROOT = os.path.realpath(os.getcwd())
+_STDLIB_ROOT = os.path.realpath(os.path.dirname(os.__file__))
+_PYTHON_LIB_ROOTS = tuple(sorted({
+    _STDLIB_ROOT,
+    os.path.realpath(sys.prefix),
+    os.path.realpath(sys.base_prefix),
+    *(os.path.realpath(p) for p in sys.path if p and ("site-packages" in p or "dist-packages" in p or "lib" in p.lower())),
+}))
+sys.path[:] = [_SANDBOX_ROOT] + [
+    p for p in sys.path
+    if p and any(os.path.realpath(p).startswith(r) for r in _PYTHON_LIB_ROOTS)
+]
+_PAYLOAD_FILE = os.path.join(_SANDBOX_ROOT, "_payload.py")
+
+with builtins.open(_PAYLOAD_FILE, "r", encoding="utf-8") as _f:
+    _USER_SOURCE = _f.read()
+try:
+    os.remove(_PAYLOAD_FILE)
+except OSError:
+    pass
+
+_CODE_OBJ = compile(_USER_SOURCE, "<sandbox>", "exec")
+del _USER_SOURCE
+
+def _is_within(child_path, parent_root):
+    try:
+        real_c = os.path.realpath(str(child_path))
+        return os.path.commonpath([parent_root, real_c]) == parent_root
+    except Exception:
+        return False
+
+def _is_python_lib(child_path):
+    return any(_is_within(child_path, r) for r in _PYTHON_LIB_ROOTS)
+
+_BLOCKED_EVENT_PREFIXES = (
+    "socket.", "urllib.", "http.", "ftplib.", "smtplib.", "telnetlib.",
+    "subprocess.", "os.system", "os.exec", "os.spawn", "os.posix_spawn",
+    "os.fork", "os.kill", "os.chmod", "os.chown", "os.chroot", "os.startfile",
+    "os.link", "os.symlink", "os.chdir",
+    "winreg.", "pty.", "syslog.", "webbrowser.", "shutil.",
+)
+
+_FS_MUTATE_EVENTS = {
+    "os.remove", "os.unlink", "os.rmdir", "os.mkdir",
+    "os.rename", "os.replace", "os.truncate", "os.utime",
+}
+
+_FS_READ_EVENTS = {"os.listdir", "os.scandir"}
+
+def _sandbox_audit_hook(event, args):
+    if event == "open":
+        path_arg = args[0] if len(args) > 0 else None
+        mode_arg = args[1] if len(args) > 1 else "r"
+        flags_arg = args[2] if len(args) > 2 else 0
+        if isinstance(path_arg, int):
+            raise PermissionError("Security Sandbox Exception: Raw file descriptor open is prohibited")
+        if _is_within(path_arg, _SANDBOX_ROOT):
+            return
+        is_readonly = (
+            (mode_arg is None or (isinstance(mode_arg, str) and all(c in "rbU" for c in mode_arg)))
+            and (int(flags_arg or 0) & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)) == 0
+        )
+        if is_readonly and _is_python_lib(path_arg):
+            return
+        raise PermissionError(
+            f"Security Sandbox Exception: Host filesystem access outside isolated sandbox jail is strictly blocked ({path_arg})"
+        )
+    if event in _FS_MUTATE_EVENTS:
+        for a in args[:2]:
+            if a is not None and not _is_within(a, _SANDBOX_ROOT):
+                raise PermissionError(
+                    f"Security Sandbox Exception: Host file mutation '{event}' outside sandbox is blocked"
+                )
+        return
+    if event in _FS_READ_EVENTS:
+        a = args[0] if len(args) > 0 else None
+        if a is not None and not (_is_within(a, _SANDBOX_ROOT) or _is_python_lib(a)):
+            raise PermissionError(
+                f"Security Sandbox Exception: Host directory listing '{event}' outside sandbox is blocked"
+            )
+        return
+    if event.startswith(_BLOCKED_EVENT_PREFIXES):
+        raise PermissionError(
+            f"Security Sandbox Exception: Network and host system call '{event}' is strictly blocked in sandbox"
+        )
+
+sys.addaudithook(_sandbox_audit_hook)
+_SAFE_GLOBALS = {"__name__": "__main__", "__doc__": None, "__package__": None}
+exec(_CODE_OBJ, _SAFE_GLOBALS, _SAFE_GLOBALS)
+'''
+
+
 def run_python(source: str, enabled: bool, timeout: float = 10.0, cwd: str | None = None) -> dict:
     if not enabled:
         return {"ok": False, "disabled": True, "error": "code execution disabled (set ENABLE_CODE_EXECUTION=true)"}
 
-    # Pre-execution security heuristic check
+    # Pre-execution security heuristic + AST check
     scan = security_scan(source)
     if not scan["safe"]:
         return {
@@ -185,17 +286,37 @@ def run_python(source: str, enabled: bool, timeout: float = 10.0, cwd: str | Non
         tmp = tempfile.mkdtemp(prefix="grid_sbx_")
 
     try:
-        script = Path(tmp) / "main.py"
-        script.write_text(source, encoding="utf-8")
+        has_custom_cwd = bool(cwd and Path(cwd).is_dir())
+        exec_cwd = str(Path(cwd).resolve()) if has_custom_cwd else tmp
+        payload_file = Path(exec_cwd) / "_payload.py"
+        runner_file = Path(exec_cwd) / "_sandbox_runner.py"
+        payload_file.write_text(source, encoding="utf-8")
+        runner_file.write_text(_AUDIT_RUNNER_TEMPLATE, encoding="utf-8")
+
         try:
-            has_custom_cwd = bool(cwd and Path(cwd).is_dir())
-            exec_cwd = str(Path(cwd).resolve()) if has_custom_cwd else tmp
-            if has_custom_cwd:
+            # Optional disposable Docker container execution if SANDBOX_USE_DOCKER=true and docker binary exists
+            use_docker = os.environ.get("SANDBOX_USE_DOCKER", "").strip().lower() in ("1", "true", "yes")
+            docker_bin = shutil.which("docker") if use_docker else None
+            if docker_bin:
+                docker_image = os.environ.get("SANDBOX_DOCKER_IMAGE", "python:3.12-slim")
+                cmd = [
+                    docker_bin, "run", "--rm",
+                    "--network", "none",
+                    "--read-only",
+                    "--memory", "256m",
+                    "--cpus", "0.5",
+                    "--pids-limit", "32",
+                    "-v", f"{exec_cwd}:/sandbox:rw",
+                    "-w", "/sandbox",
+                    docker_image,
+                    "python", "-I", "-B", "/sandbox/_sandbox_runner.py",
+                ]
+            elif has_custom_cwd:
                 env["PYTHONPATH"] = exec_cwd
-                cmd = [sys.executable, "-B", str(script)]
+                cmd = [sys.executable, "-B", str(runner_file)]
             else:
                 # -I flag isolates Python from host user site-packages & current directory injection
-                cmd = [sys.executable, "-I", "-B", str(script)]
+                cmd = [sys.executable, "-I", "-B", str(runner_file)]
 
             run_kwargs: dict = {}
             if os.name == "nt":
@@ -227,8 +348,27 @@ def run_python(source: str, enabled: bool, timeout: float = 10.0, cwd: str | Non
                 "infinite_loop_caught": True,
                 "error": f"timeout after {timeout}s: infinite loop or execution deadline exceeded",
             }
+        finally:
+            for f_clean in (payload_file, runner_file):
+                try:
+                    f_clean.unlink(missing_ok=True)
+                except OSError:
+                    pass
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    stderr_txt = (proc.stderr or "")[-MAX_OUTPUT:]
+    stdout_txt = (proc.stdout or "")[-MAX_OUTPUT:]
+    if proc.returncode != 0 and "Security Sandbox Exception:" in stderr_txt:
+        return {
+            "ok": False,
+            "security_blocked": True,
+            "host_protected": True,
+            "returncode": proc.returncode,
+            "error": stderr_txt.strip().splitlines()[-1],
+            "stdout": stdout_txt,
+            "stderr": stderr_txt,
+        }
+
     return {"ok": proc.returncode == 0, "returncode": proc.returncode,
-            "stdout": (proc.stdout or "")[-MAX_OUTPUT:], "stderr": (proc.stderr or "")[-MAX_OUTPUT:]}
+            "stdout": stdout_txt, "stderr": stderr_txt}

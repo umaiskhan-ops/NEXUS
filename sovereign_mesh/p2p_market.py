@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .ledger import HashChainLedger
+from .ledger import HashChainLedger, interprocess_file_lock
 
 
 @dataclass
@@ -84,16 +84,17 @@ class P2PMarketplace:
         if not self._path:
             return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        data = [o.to_dict() for o in self._orders.values()]
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2, default=str))
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except OSError:
-                pass
-        tmp.replace(self._path)
+        with interprocess_file_lock(self._path):
+            tmp = self._path.with_suffix(".tmp")
+            data = [o.to_dict() for o in self._orders.values()]
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps(data, indent=2, default=str))
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            tmp.replace(self._path)
 
     # ------------------------------------------------------------------ Market Operations
     def list_orders(self, status: Optional[str] = "OPEN", currency: Optional[str] = None,
@@ -114,16 +115,24 @@ class P2PMarketplace:
         with self._lock:
             return self._orders.get(order_id)
 
+    def _resolve_worker(self, id_or_key: str):
+        if not id_or_key or not self.hub:
+            return None
+        w = self.hub.get_worker(id_or_key) if hasattr(self.hub, "get_worker") else None
+        if not w and hasattr(self.hub, "get_worker_by_key"):
+            w = self.hub.get_worker_by_key(id_or_key)
+        return w
+
     def _resolve_wid(self, id_or_key: str) -> str:
         if not id_or_key:
             return ""
-        w = self.hub.get_worker(id_or_key) if hasattr(self.hub, "get_worker") else None
+        w = self._resolve_worker(id_or_key)
         return w.worker_id if w else id_or_key
 
     def _unfreeze_if_no_active_disputes(self, worker_id: str) -> None:
-        if not worker_id or not hasattr(self.hub, "get_worker"):
+        if not worker_id or not self.hub:
             return
-        w = self.hub.get_worker(worker_id)
+        w = self._resolve_worker(worker_id)
         if not w:
             return
         still_disputed = any(
@@ -159,7 +168,7 @@ class P2PMarketplace:
 
         with self._lock:
             # Check seller balance
-            seller = self.hub.get_worker(seller_id) if hasattr(self.hub, "get_worker") else None
+            seller = self._resolve_worker(seller_id)
             if not seller:
                 raise KeyError(f"Worker account {seller_id!r} not found. Please register worker node first.")
             if seller.status == "SLASHED":
@@ -286,7 +295,7 @@ class P2PMarketplace:
         payment_method = payment_method.strip() or "EasyPaisa / JazzCash"
 
         with self._lock:
-            buyer_rec = self.hub.get_worker(buyer_id) if hasattr(self.hub, "get_worker") else None
+            buyer_rec = self._resolve_worker(buyer_id)
             if not buyer_rec and hasattr(self.hub, "register_worker"):
                 buyer_rec = self.hub.register_worker(buyer_id, url="local", initial_credits=0)
             buyer_wid = buyer_rec.worker_id if buyer_rec else buyer_id
@@ -362,7 +371,7 @@ class P2PMarketplace:
             if order.status != "OPEN":
                 return {"ok": False, "error": f"Buy Order is already {order.status}"}
 
-            seller = self.hub.get_worker(seller_id) if hasattr(self.hub, "get_worker") else None
+            seller = self._resolve_worker(seller_id)
             if not seller:
                 raise KeyError(f"Seller account {seller_id!r} not found. Please register worker node first.")
             if seller.status == "SLASHED":
@@ -484,7 +493,7 @@ class P2PMarketplace:
                 return {"ok": False, "error": f"Order is already {order.status}"}
 
             # Auto-register buyer if not in hub yet
-            buyer_rec = self.hub.get_worker(buyer_id) if hasattr(self.hub, "get_worker") else None
+            buyer_rec = self._resolve_worker(buyer_id)
             if not buyer_rec and hasattr(self.hub, "register_worker"):
                 buyer_rec = self.hub.register_worker(buyer_id, url="local", initial_credits=0)
             buyer_wid = buyer_rec.worker_id if buyer_rec else buyer_id
@@ -575,7 +584,8 @@ class P2PMarketplace:
                 "status": "PAYMENT_SUBMITTED",
                 "order_id": order_id,
                 "payment_reference": payment_ref,
-                "message": "Payment details submitted! Awaiting seller verification and escrow release.",
+                "fiat_verification_mode": "MANUAL_SELLER_CONFIRMATION_REQUIRED",
+                "message": "Payment details submitted! Seller must manually verify fiat receipt in their bank/wallet app before releasing escrow.",
                 "ledger_block": block["hash"][:16]
             }
 
@@ -617,8 +627,8 @@ class P2PMarketplace:
 
             frozen_accounts = []
             for wid in (order.seller_id, order.buyer_id):
-                if wid and hasattr(self.hub, "get_worker"):
-                    w = self.hub.get_worker(wid)
+                if wid and self.hub:
+                    w = self._resolve_worker(wid)
                     if w:
                         w.dispute_frozen = True
                         w.dispute_reason = f"Dispute on {order_id}: {reason}"
@@ -693,7 +703,7 @@ class P2PMarketplace:
                 return {"ok": False, "error": f"Order status is {order.status}, cannot release"}
 
             # Transfer escrowed credits to buyer
-            buyer = self.hub.get_worker(order.buyer_id) if hasattr(self.hub, "get_worker") else None
+            buyer = self._resolve_worker(order.buyer_id)
             if not buyer:
                 # If buyer not found, register them
                 buyer = self.hub.register_worker(order.buyer_id, url="local", initial_credits=0)

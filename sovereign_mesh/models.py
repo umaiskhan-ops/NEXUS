@@ -406,11 +406,11 @@ class ModelRouter:
             n.avg_latency if n.latencies else 1e6,
         ))
 
-    def _call(self, node: ModelNode, system: str, prompt: str) -> dict:
+    def _call(self, node: ModelNode, system: str, prompt: str, user_id: Optional[str] = None) -> dict:
         full_system = system if "APPROVE or REJECT" in (system or "") else (
             f"{SYSTEM_BRAND_IDENTITY}\n\n{system}".strip()
         )
-        self.budget.charge(self.budget.estimate(full_system + prompt))
+        self.budget.charge(self.budget.estimate(full_system + prompt), user_id=user_id)
         start = time.monotonic()
         try:
             text = self.backend.chat(node.model, full_system, prompt, self.timeout)
@@ -421,13 +421,14 @@ class ModelRouter:
             text = enforce_brand_identity(prompt, text)
         latency = time.monotonic() - start
         node.record_success(latency)
-        self.budget.charge(self.budget.estimate(text))
+        self.budget.charge(self.budget.estimate(text), user_id=user_id)
         return {"node": node.name, "model": "SUP Agentic Mesh (Powered by NEXUS)", "raw_model": node.model, "text": text, "latency_s": round(latency, 3)}
 
     def ask(self, prompt: str, system: str = "", role: Optional[str] = None, node_name: Optional[str] = None,
-            frontier_mode: bool = False) -> dict:
+            frontier_mode: bool = False, namespace: str = "global", user_id: Optional[str] = None) -> dict:
         is_internal_vote_or_debate = system in {VOTE_SYSTEM, DEBATE_OPEN, DEBATE_REBUT, SYNTHESIS}
         is_frontier = frontier_mode or (not is_internal_vote_or_debate and is_frontier_complex_task(prompt))
+        eff_ns = (namespace or user_id or "global").strip()
         attention_route = (
             self.brain_matrix.route_attention(prompt)
             if (self.brain_matrix is not None and not is_internal_vote_or_debate)
@@ -435,7 +436,7 @@ class ModelRouter:
         )
 
         if is_frontier and self.distillation_cache is not None:
-            cached = self.distillation_cache.find_similar(prompt)
+            cached = self.distillation_cache.find_similar(prompt, namespace=eff_ns)
             if cached:
                 self.distillation_cache.mark_hit(cached["prompt_hash"])
                 out = {
@@ -459,12 +460,12 @@ class ModelRouter:
         errors = []
         for node in candidates:
             try:
-                res = self._call(node, system, prompt)
+                res = self._call(node, system, prompt, user_id=user_id)
                 if attention_route is not None:
                     res["attention_route"] = attention_route
                 if is_frontier and self.distillation_cache is not None:
                     cot = (
-                        f"[Frontier CoT Distillation -> Local Mesh Fine-Tuning]\n"
+                        f"[Local CoT Distillation -> Mesh Fine-Tuning]\n"
                         f"1. Task Analysis: {prompt[:160]}\n"
                         f"2. Reasoning Chain: Verified multi-step deduction via {node.name}\n"
                         f"3. Distilled Solution stored in Ledger & Local Cache for zero-API future reuse."
@@ -473,7 +474,8 @@ class ModelRouter:
                         prompt=prompt,
                         response_text=res["text"],
                         cot_reasoning=cot,
-                        source_tier="Frontier-GPT6-Astra-Opus5.5-Distiller",
+                        source_tier="Local-CoT-Distiller",
+                        namespace=eff_ns,
                     )
                     res["cot_reasoning"] = cot
                     res["distilled_from_cache"] = False

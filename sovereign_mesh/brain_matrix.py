@@ -1,13 +1,16 @@
-"""Decentralized Brain Matrix & Distributed Neural Architecture (The Freedom Loop).
+"""Decentralized Brain Matrix & Lightweight Local Adapter Engine (The Freedom Loop).
 
-Implements the 3-step permanent autonomy engine + Real Mathematical LoRA & SafeTensors Engine:
-1. Brain Splitting & Attention Routing Matrix (Specialization blocks across heterogeneous worker PCs)
-2. Self-Play & Synthetic Dataset Generation (Contradiction forcing & verified synthetic multiplication)
-3. P2P Memory Fusion & Parametric Weight Delta Fusion:
+Implements a 3-step domain routing and lightweight local adapter engine:
+1. Domain Attention Routing Matrix (Specialization routing across worker PCs)
+2. Self-Play & Synthetic Dataset Generation (Contradiction forcing & verified synthetic trajectories)
+3. Two-Tier Memory & Lightweight Local LoRA Feature Adapter:
    - Layer 1 (Episodic RAG Memory): Fast JSON CoT Cache (distillation_cache.json)
-   - Layer 2 (Parametric Weight Fusion): Real IEEE-754 float32 LoRA Backpropagation (ΔW = B·A),
-     Federated Averaging (FedAvg) with Byzantine Norm-Clipping, and HuggingFace-compliant
-     binary `.safetensors` model checkpoints (`data/safetensors/<shard_id>_adapter_model.safetensors`).
+   - Layer 2 (Lightweight Feature Adapter): Deterministic IEEE-754 float32 32x32 Low-Rank Adapter
+     matrices (ΔW = B·A, rank=8, dim=32), Federated Averaging (FedAvg) with Byzantine Norm-Clipping,
+     and HuggingFace-compatible binary `.safetensors` adapter checkpoints.
+   Note (N12 Transparency): This module operates a lightweight 32-dimensional feature-projection
+   adapter (~2,048 float32 parameters per shard) for zero-dependency CPU/edge routing and consensus
+   verification, rather than multi-billion-parameter GPU base model backprop.
 """
 from __future__ import annotations
 
@@ -1415,7 +1418,8 @@ class DecentralizedBrainMatrix:
                     "cached_cot_solutions": cached_count,
                 },
                 "layer_2_parametric_weights": {
-                    "type": "Parametric IEEE-754 float32 LoRA Backpropagation (ΔW = B·A) + FedAvg (.safetensors)",
+                    "type": "Lightweight 32x32 Feature-Projection LoRA Adapter (ΔW = B·A, F32 .safetensors)",
+                    "adapter_scope": "LIGHTWEIGHT_32x32_FEATURE_PROJECTION_ADAPTER (2,048 F32 params/shard)",
                     "safetensors_files_count": len(self._shard_safetensors_meta),
                     "fedavg_merges_completed": self.fedavg_merges_completed,
                     "lora_rank": self.LORA_RANK,

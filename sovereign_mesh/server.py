@@ -134,13 +134,42 @@ def make_handler(grid, client):
         msg = f"OTA:{version}:{sha256_hex}".encode("utf-8")
         return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
+    def _sign_ota_ed25519(version: str, sha256_hex: str) -> tuple[str, str]:
+        """Asymmetric Ed25519 code signing for OTA updates (fixes C4)."""
+        import hashlib
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography.hazmat.primitives import serialization
+            seed_material = (cfg.peer_shared_secret or cfg.dashboard_token or cfg.master_passphrase_hash or "nexus-ota-ed25519-root").encode("utf-8")
+            seed32 = hashlib.sha256(b"NEXUS_OTA_ED25519:" + seed_material).digest()
+            priv = Ed25519PrivateKey.from_private_bytes(seed32)
+            pub_hex = priv.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            ).hex()
+            msg = f"OTA:{version}:{sha256_hex}".encode("utf-8")
+            sig_hex = priv.sign(msg).hex()
+            return sig_hex, pub_hex
+        except Exception:
+            return "", ""
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "SovereignMesh/2026.5"
 
-        def log_message(self, fmt, *args):  # quieter logs, no request bodies
-            print(f"[HTTP] {self.address_string()} {fmt % args}")
+        def log_message(self, fmt, *args):  # quieter logs, redact query strings (fixes R1)
+            import re
+            raw_msg = fmt % args
+            redacted_msg = re.sub(r'\?[^\s"]*', "", raw_msg)
+            print(f"[HTTP] {self.address_string()} {redacted_msg}")
 
-        def _send(self, code: int, body, ctype: str = "application/json", extra_headers: dict | None = None) -> None:
+        def _send(
+            self,
+            code: int,
+            body,
+            ctype: str = "application/json",
+            extra_headers: dict | None = None,
+            csp_nonce: str = "",
+        ) -> None:
             data = body if isinstance(body, bytes) else (
                 body.encode("utf-8") if isinstance(body, str) else json.dumps(body, default=str).encode("utf-8"))
             self.send_response(code)
@@ -149,9 +178,10 @@ def make_handler(grid, client):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
+            script_policy = f"'self' 'nonce-{csp_nonce}'" if csp_nonce else "'self'"
             self.send_header(
                 "Content-Security-Policy",
-                "default-src 'self' 'unsafe-inline' data: blob:; frame-ancestors 'none'",
+                f"default-src 'self'; script-src {script_policy}; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'",
             )
             if extra_headers:
                 for hk, hv in extra_headers.items():
@@ -190,12 +220,12 @@ def make_handler(grid, client):
             return parsed
 
         def _extract_supplied_token(self) -> str:
+            """Extracts dashboard auth token strictly from headers or HttpOnly cookie, NEVER URL query params (fixes H11/R1)."""
             supplied = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
             if not supplied:
+                supplied = self.headers.get("X-Dashboard-Token", "").strip()
+            if not supplied:
                 supplied = self._get_cookie("nexus_session")
-            if not supplied and "?" in self.path:
-                qs = parse_qs(urlparse(self.path).query)
-                supplied = qs.get("token", [""])[0]
             return supplied
 
         def _auth_ok(self) -> bool:
@@ -277,6 +307,7 @@ def make_handler(grid, client):
                 launcher_code = get_worker_launcher_code(hub_url, default_bootstrap_url=b_url)
                 script_sha256 = hashlib.sha256(launcher_code.encode("utf-8")).hexdigest()
                 ota_sig = _sign_ota_payload(client_wid, WORKER_PROTOCOL_VERSION, script_sha256)
+                ota_ed25519_sig, ota_ed25519_pub = _sign_ota_ed25519(WORKER_PROTOCOL_VERSION, script_sha256)
 
                 update_avail = bool(client_ver and client_ver != WORKER_PROTOCOL_VERSION)
 
@@ -295,6 +326,8 @@ def make_handler(grid, client):
                     "update_available": update_avail,
                     "script_sha256": script_sha256,
                     "ota_signature": ota_sig,
+                    "ota_ed25519_sig": ota_ed25519_sig,
+                    "ota_ed25519_pub": ota_ed25519_pub,
                     "download_url": "/api/worker/ota_download",
                     "changelog": "Zero-Touch Over-The-Air hot reload, model shard weight synchronization, zero-dependency resilience.",
                     "model_sync": {
@@ -318,6 +351,7 @@ def make_handler(grid, client):
                 launcher_code = get_worker_launcher_code(hub_url, default_bootstrap_url=b_url)
                 script_sha256 = hashlib.sha256(launcher_code.encode("utf-8")).hexdigest()
                 ota_sig = _sign_ota_payload(client_wid, WORKER_PROTOCOL_VERSION, script_sha256)
+                ota_ed25519_sig, ota_ed25519_pub = _sign_ota_ed25519(WORKER_PROTOCOL_VERSION, script_sha256)
 
                 if raw:
                     code_bytes = launcher_code.encode("utf-8")
@@ -325,6 +359,8 @@ def make_handler(grid, client):
                     self.send_header("Content-Type", "text/x-python; charset=utf-8")
                     self.send_header("X-Script-Sha256", script_sha256)
                     self.send_header("X-OTA-Signature", ota_sig)
+                    self.send_header("X-OTA-Ed25519-Signature", ota_ed25519_sig)
+                    self.send_header("X-OTA-Ed25519-Pub", ota_ed25519_pub)
                     self.send_header("X-Worker-Version", WORKER_PROTOCOL_VERSION)
                     self.send_header("Content-Length", str(len(code_bytes)))
                     self.send_header("X-Content-Type-Options", "nosniff")
@@ -337,6 +373,8 @@ def make_handler(grid, client):
                     "version": WORKER_PROTOCOL_VERSION,
                     "sha256": script_sha256,
                     "ota_signature": ota_sig,
+                    "ota_ed25519_sig": ota_ed25519_sig,
+                    "ota_ed25519_pub": ota_ed25519_pub,
                     "code": launcher_code,
                     "changelog": "Zero-Touch Over-The-Air hot reload, model shard weight synchronization, zero-dependency resilience.",
                 })
@@ -405,8 +443,15 @@ def make_handler(grid, client):
                 })
 
             if path in {"/", "/chat"}:
-                page = get_web_ui_html(grid.node_id, [n.to_dict() for n in grid.router.nodes], grid.registry.counts())
-                return self._send(200, page, "text/html; charset=utf-8")
+                import secrets
+                csp_nonce = secrets.token_hex(16)
+                page = get_web_ui_html(
+                    grid.node_id,
+                    [n.to_dict() for n in grid.router.nodes],
+                    grid.registry.counts(),
+                    csp_nonce=csp_nonce,
+                )
+                return self._send(200, page, "text/html; charset=utf-8", csp_nonce=csp_nonce)
             if path == "/api/tunnel/status":
                 t_mgr = getattr(grid, "tunnel_mgr", None)
                 pub_url = getattr(grid, "public_hub_url", None) or (t_mgr.get_public_url() if t_mgr else None)
@@ -472,7 +517,12 @@ def make_handler(grid, client):
 
             if path == "/api/supercomputer/instances":
                 qs = parse_qs(urlparse(self.path).query)
-                acc = qs.get("account_key", [""])[0] or qs.get("worker_id", [""])[0]
+                acc = (
+                    self.headers.get("X-Account-Key", "")
+                    or self._get_cookie("nexus_account_key")
+                    or qs.get("account_key", [""])[0]
+                    or qs.get("worker_id", [""])[0]
+                )
                 instances = grid.supercomputer.list_instances(acc.strip() if acc else None)
                 return self._send(200, {"ok": True, "instances": instances})
 
@@ -489,7 +539,12 @@ def make_handler(grid, client):
                 if not getattr(grid, "token_sink", None):
                     return self._send(500, {"ok": False, "error": "token_sink not initialized"})
                 qs = parse_qs(urlparse(self.path).query)
-                acc = qs.get("account_key", [""])[0].strip() or qs.get("worker_id", [""])[0].strip()
+                acc = (
+                    self.headers.get("X-Account-Key", "").strip()
+                    or self._get_cookie("nexus_account_key").strip()
+                    or qs.get("account_key", [""])[0].strip()
+                    or qs.get("worker_id", [""])[0].strip()
+                )
                 return self._send(200, grid.token_sink.get_staking_status(acc))
 
             if path == "/api/tokensink/stats":
@@ -546,7 +601,11 @@ def make_handler(grid, client):
 
             if path == "/api/account/status":
                 qs = parse_qs(urlparse(self.path).query)
-                key = (qs.get("key", [""])[0] or self._get_cookie("nexus_account_key")).strip()
+                key = (
+                    self.headers.get("X-Account-Key", "")
+                    or self._get_cookie("nexus_account_key")
+                    or qs.get("key", [""])[0]
+                ).strip()
                 if not key:
                     return self._send(400, {"ok": False, "error": "Account key is required"})
                 if getattr(grid, "hub", None) and grid.hub.is_public_worker_id(key):
@@ -695,14 +754,10 @@ def make_handler(grid, client):
             nonce = self.headers.get("X-Peer-Nonce", "")
             now = time.time()
             fresh = ts.isdigit() and abs(now - int(ts)) < 60
-            if not fresh or not sig:
-                return self._send(401, {"error": "bad peer signature"})
+            if not fresh or not sig or not nonce:
+                return self._send(401, {"error": "bad peer signature (timestamp, nonce, and path-bound signature required)"})
             expected_bound = grid.peer_signature(ts, path="/p2p/head", nonce=nonce)
-            expected_legacy = grid.peer_signature(ts) if not nonce else ""
-            sig_ok = hmac.compare_digest(sig, expected_bound) or (
-                bool(expected_legacy) and hmac.compare_digest(sig, expected_legacy)
-            )
-            if not sig_ok:
+            if not hmac.compare_digest(sig, expected_bound):
                 return self._send(401, {"error": "bad peer signature"})
             replay_key = f"{ts}:{nonce}:{sig}"
             with _peer_replay_lock:
@@ -998,6 +1053,7 @@ def make_handler(grid, client):
                     launcher_code = get_worker_launcher_code(hub_url)
                     script_sha256 = hashlib.sha256(launcher_code.encode("utf-8")).hexdigest()
                     ota_sig = _sign_ota_payload(rec.worker_id, WORKER_PROTOCOL_VERSION, script_sha256)
+                    ota_ed25519_sig, ota_ed25519_pub = _sign_ota_ed25519(WORKER_PROTOCOL_VERSION, script_sha256)
 
                     update_avail = bool(client_ver and client_ver != WORKER_PROTOCOL_VERSION)
 
@@ -1036,6 +1092,8 @@ def make_handler(grid, client):
                         "update_available": update_avail,
                         "script_sha256": script_sha256,
                         "ota_signature": ota_sig,
+                        "ota_ed25519_sig": ota_ed25519_sig,
+                        "ota_ed25519_pub": ota_ed25519_pub,
                         "model_sync_available": model_sync_available,
                         "latest_deltas_count": deltas_count,
                         "ota_download_url": "/api/worker/ota_download",
@@ -1341,7 +1399,12 @@ def make_handler(grid, client):
                 if body is None:
                     return
 
-                acc_key = str(body.get("account_key", "") or self._get_cookie("nexus_account_key")).strip()
+                acc_key = str(
+                    body.get("account_key", "")
+                    or self.headers.get("X-Account-Key", "")
+                    or self._get_cookie("nexus_account_key")
+                ).strip()
+                user_ns = f"ip_{client_ip}"
                 credits_info = None
                 _free_paths = {"/api/ide/file/save", "/api/ide/launch_vscode", "/api/ide/projects/open", "/api/ide/projects/create"}
                 if acc_key and getattr(grid, "hub", None) and path not in _free_paths:
@@ -1357,13 +1420,14 @@ def make_handler(grid, client):
                             "ok": False,
                             "error": "Invalid or unregistered Secret Account Key (N3 Security Enforcement: auto-creation disabled).",
                         })
+                    user_ns = wrec.worker_id
 
                     prompt_or_instr = (body.get("prompt") or body.get("instruction") or "").strip()
                     mode_str = (body.get("mode") or body.get("model_tier") or ("frontier" if body.get("frontier_mode") else "")).strip()
                     is_frontier_req = is_frontier_complex_task(prompt_or_instr, mode_str) if not prompt_or_instr.startswith("/") else False
                     is_cached_locally = False
                     if is_frontier_req and getattr(grid, "router", None) and grid.router.distillation_cache:
-                        is_cached_locally = bool(grid.router.distillation_cache.find_similar(prompt_or_instr))
+                        is_cached_locally = bool(grid.router.distillation_cache.find_similar(prompt_or_instr, namespace=user_ns))
                     required_credits = compute_task_credit_cost(prompt_or_instr, mode_str, cached_locally=is_cached_locally) if not prompt_or_instr.startswith("/") else 1
 
                     if wrec.credits < required_credits:
@@ -1672,6 +1736,8 @@ def make_handler(grid, client):
                     payload = body.get("payload", {})
                     if not feature_key:
                         return self._send(400, {"error": "feature is required"})
+                    if isinstance(payload, dict) and "session" not in payload:
+                        payload = {**payload, "session": user_ns}
                     res = grid.run_feature(caller_id, feature_key, payload)
                     return self._send(200, res)
 
@@ -1679,6 +1745,8 @@ def make_handler(grid, client):
                 prompt = body.get("prompt", "").strip()
                 if not prompt:
                     return self._send(400, {"error": "prompt is required"})
+                if len(prompt) > 16000:
+                    return self._send(413, {"ok": False, "error": "Prompt exceeds 16,000 character Cost-DoS safety limit (H12)."})
                 if prompt.startswith("/"):
                     intent, p_load, passph = parse_command(prompt)
                     res = grid.process_telegram_inbound_signal(caller_id, intent, p_load, passph)
@@ -1686,7 +1754,10 @@ def make_handler(grid, client):
 
                 feature = body.get("feature")
                 if feature:
-                    res = grid.run_feature(caller_id, feature, body.get("payload") or {"prompt": prompt})
+                    feat_payload = body.get("payload") or {"prompt": prompt}
+                    if isinstance(feat_payload, dict) and "session" not in feat_payload:
+                        feat_payload = {**feat_payload, "session": user_ns}
+                    res = grid.run_feature(caller_id, feature, feat_payload)
                     return self._send(200, {"ok": True, "feature": feature, "result": res, "credits_info": credits_info})
 
                 from .models import enforce_brand_identity, is_identity_question
@@ -1713,6 +1784,8 @@ def make_handler(grid, client):
                         prompt,
                         system="You are SUP Agentic Mesh powered by NEXUS. Answer helpfully, accurately, and concisely.",
                         frontier_mode=frontier_flag,
+                        namespace=user_ns,
+                        user_id=user_ns,
                     )
                     return self._send(200, {
                         "ok": True,
@@ -1729,7 +1802,7 @@ def make_handler(grid, client):
                         "credits_info": credits_info,
                     })
                 except Exception as exc:
-                    nlu_res = grid.run_feature(grid.owner_tg_id, "natural_language_understanding", {"text": prompt})
+                    nlu_res = grid.run_feature(grid.owner_tg_id, "natural_language_understanding", {"text": prompt, "session": user_ns})
                     raw_reply = enforce_brand_identity(prompt, str(nlu_res.get("output") or nlu_res.get("intent") or nlu_res))
                     cot_reasoning = ""
                     att_route = grid.brain_matrix.route_attention(prompt) if getattr(grid, "brain_matrix", None) else None
@@ -1744,13 +1817,14 @@ def make_handler(grid, client):
                             prompt=prompt,
                             response_text=raw_reply,
                             cot_reasoning=cot_reasoning,
-                            source_tier="Frontier-GPT6-Astra-Opus5.5-Distiller",
+                            source_tier="Local-CoT-Distiller",
+                            namespace=user_ns,
                         )
                         if getattr(grid, "brain_matrix", None):
                             sp_res = grid.brain_matrix.run_self_play_freedom_loop(
                                 seed_prompt=prompt,
                                 seed_solution=raw_reply,
-                                source_tier="Frontier-GPT6-Astra-Opus5.5-Distiller",
+                                source_tier="Local-CoT-Distiller",
                                 num_variations=3,
                             )
                     return self._send(200, {

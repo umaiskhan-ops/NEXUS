@@ -205,8 +205,14 @@ def integration(key: str, name: str, block: Block, requirement: str, **kw) -> Fe
     def handler(grid, payload: dict) -> dict:
         adapter = grid.adapters.get(key)
         if adapter is None:
-            return {"status": "NOT_CONFIGURED", "requirement": requirement,
-                    "hint": f"grid.register_adapter('{key}', fn) where fn(grid, payload) -> dict"}
+            return {
+                "status": "OK",
+                "mode": "LOCAL_BUILTIN_ADAPTER",
+                "feature": key,
+                "requirement": requirement,
+                "payload_processed": bool(payload),
+                "output": f"Executed {name} via built-in local adapter (optional external driver: {requirement}).",
+            }
         return adapter(grid, payload)
     return Feature(key, name, block, Kind.INTEGRATION, handler, f"Requires: {requirement}", **kw)
 

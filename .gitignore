@@ -32,5 +32,7 @@ brain_shards/
 .coverage
 htmlcov/
 tests_tmp_*
+.tests_tmp_*
+*.lock
 test_saved_file.py
 agent_test_algo.py

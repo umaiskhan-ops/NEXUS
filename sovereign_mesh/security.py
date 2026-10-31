@@ -139,29 +139,78 @@ class EncryptionLayer:
 
 
 # ---------------------------------------------------------------- input sanitization
+import unicodedata
+
 _CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
-_DELIMITER_STRIP = re.compile(r"(?:<\|im_start\|>\s*(?:system|user|assistant)?|<\|im_end\|>|<\|system\|>|\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>)", re.IGNORECASE)
+_DELIMITER_STRIP = re.compile(
+    r"(?:<\|im_start\|>\s*(?:system|user|assistant)?|<\|im_end\|>|<\|system\|>|<\|user\|>|<\|assistant\|>|"
+    r"\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>|</?system(?:_prompt|_instructions)?[^>]*>|"
+    r"###\s*(?:System|Developer|Admin)\s*(?:Prompt|Instruction|Override)?\s*:)",
+    re.IGNORECASE,
+)
+_HOMOGLYPH_MAP = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "і": "i",
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "Х": "X",
+})
+_OVERRIDE_VERBS = {
+    "ignore", "disregard", "forget", "override", "bypass", "neglect", "discard",
+    "reveal", "dump", "leak", "exfiltrate", "output", "repeat", "print", "show",
+    "jailbreak", "unrestricted", "godmode", "dan",
+}
+_PRIVILEGED_TARGETS = {
+    "instructions", "instruction", "rules", "prompts", "prompt", "directives",
+    "constraints", "guardrails", "safety", "constitutional", "passphrase",
+    "secret", "secrets", "token", "apikey", "privatekey", "credentials",
+    "system", "developer",
+}
 _INJECTION_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
-    r"(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+|any\s+|the\s+|your\s+)?(?:previous|prior|above|system|safety|constitutional)\s+(?:instructions|prompts|rules|directives|constraints)",
-    r"(?:reveal|print|show|dump|output|leak|repeat)\s+(?:your|the)\s+(?:system\s+prompt|passphrase|secret|token|api\s*key|private\s*key|credentials|hidden\s+instructions)",
-    r"(?:begin|start|enter)\s+(?:system|admin|developer|god|unrestricted|jailbreak)\s+(?:prompt|mode|override)",
-    r"(?:you\s+are\s+now\s+in\s+|enable\s+|activate\s+)(?:developer\s+mode|dan\s+mode|do\s+anything\s+now|jailbreak\s+mode|unfiltered\s+mode)",
-    r"(?:<\|im_start\|>\s*system|<\|system\|>|\[INST\]\s*<<SYS>>|###\s*System\s*(?:Prompt|Instruction)\s*:)",
+    r"(?:ignore|disregard|forget|override|bypass|discard)\s+(?:all\s+|any\s+|the\s+|your\s+|every\s+)?(?:previous|prior|above|initial|original|system|safety|constitutional)\s+(?:instructions|prompts|rules|directives|constraints|guardrails)",
+    r"(?:reveal|print|show|dump|output|leak|repeat|echo|translate)\s+(?:your|the|all)?\s*(?:system\s+prompt|passphrase|secret|token|api\s*key|private\s*key|credentials|hidden\s+instructions|initial\s+prompt)",
+    r"(?:begin|start|enter|switch\s+to)\s+(?:system|admin|developer|god|unrestricted|jailbreak|sudo)\s+(?:prompt|mode|override|access)",
+    r"(?:you\s+are\s+now\s+in\s+|enable\s+|activate\s+|act\s+as\s+)(?:developer\s+mode|dan\s+mode|do\s+anything\s+now|jailbreak\s+mode|unfiltered\s+mode|unrestricted\s+ai)",
+    r"(?:<\|im_start\|>\s*system|<\|system\|>|\[INST\]\s*<<SYS>>|###\s*System\s*(?:Prompt|Instruction)\s*:|</?system_prompt>)",
     r"(?:base64\.b64decode|bytes\.fromhex)\s*\(.*(?:eval|exec|os\.system|subprocess)",
 )]
 MAX_TEXT_LEN = 16_000
 MAX_DEPTH = 6
 
 
+def _semantic_injection_check(normalized_text: str) -> bool:
+    """Multi-layer semantic & de-obfuscation prompt injection detector (M10 Fix)."""
+    lower = normalized_text.translate(_HOMOGLYPH_MAP).lower()
+    # Collapse single-letter spaced obfuscation e.g. 'i g n o r e' -> 'ignore'
+    collapsed = re.sub(r"(?<=\b[a-z])\s+(?=[a-z]\b)", "", lower)
+    for candidate in (lower, collapsed):
+        if any(p.search(candidate) for p in _INJECTION_PATTERNS):
+            return True
+        words = re.findall(r"[a-z]+", candidate)
+        # Sliding 10-word window semantic co-occurrence check
+        for idx in range(len(words)):
+            window = set(words[idx: idx + 10])
+            if (window & _OVERRIDE_VERBS) and (window & _PRIVILEGED_TARGETS):
+                return True
+    # Inspect potential Base64 payloads for hidden instructions
+    for b64_match in re.findall(r"\b[A-Za-z0-9+/]{24,}={0,2}\b", normalized_text):
+        try:
+            decoded = base64.b64decode(b64_match).decode("utf-8", errors="ignore")
+            if decoded and any(v in decoded.lower() for v in ("ignore", "system prompt", "passphrase", "rm -rf")):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def sanitize_text(text: str) -> Tuple[str, List[str]]:
     flags: List[str] = []
-    clean = _CONTROL_CHARS.sub("", text)
+    # Normalize Unicode compatibility characters (NFKC) before stripping control chars
+    norm_text = unicodedata.normalize("NFKC", text)
+    clean = _CONTROL_CHARS.sub("", norm_text)
     if clean != text:
         flags.append("control_chars_removed")
     if len(clean) > MAX_TEXT_LEN:
         clean = clean[:MAX_TEXT_LEN]
         flags.append("truncated")
-    if any(p.search(clean) for p in _INJECTION_PATTERNS) or _DELIMITER_STRIP.search(clean):
+    if _DELIMITER_STRIP.search(clean) or _semantic_injection_check(clean):
         flags.append("prompt_injection_suspected")
         clean = _DELIMITER_STRIP.sub("", clean)
     return clean, flags
