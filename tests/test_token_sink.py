@@ -194,8 +194,9 @@ class TestTokenSink(unittest.TestCase):
             data_dir=self.data_dir / "http_grid_data",
         )
         grid = UltimateAgiSovereignGrid(cfg)
-        grid.hub.register_worker("http-miner-1", url="local", initial_credits=100)
-        grid.hub.register_worker("http-miner-2", url="local", initial_credits=100)
+        m1 = grid.hub.register_worker("http-miner-1", url="local", initial_credits=100)
+        m2 = grid.hub.register_worker("http-miner-2", url="local", initial_credits=100)
+        owner = grid.hub.register_worker("owner-master", url="local", initial_credits=1000)
 
         srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(grid, None))
         port = srv.server_address[1]
@@ -210,10 +211,22 @@ class TestTokenSink(unittest.TestCase):
                 self.assertIn("Credit Lottery &amp; Staking Sink", html)
                 self.assertIn("loadLotteryAndStaking", html)
 
-            # 2. Buy tickets via HTTP POST
+            # 1b. Security check (C3): Bare public worker_id is rejected on HTTP endpoints with 403
+            import urllib.error
+            req_bad = urllib.request.Request(
+                f"{base}/api/lottery/buy_ticket",
+                data=json.dumps({"account_key": "http-miner-1", "count": 1}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req_bad, timeout=5)
+            self.assertEqual(ctx.exception.code, 403)
+
+            # 2. Buy tickets via HTTP POST using private Secret Account Key
             req_buy = urllib.request.Request(
                 f"{base}/api/lottery/buy_ticket",
-                data=json.dumps({"account_key": "http-miner-1", "count": 3}).encode("utf-8"),
+                data=json.dumps({"account_key": m1.key, "count": 3}).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
@@ -223,10 +236,10 @@ class TestTokenSink(unittest.TestCase):
                 self.assertEqual(buy_data["tickets_bought"], 3)
                 self.assertEqual(buy_data["current_pool_credits"], 15)
 
-            # 3. Draw winner via HTTP POST
+            # 3. Draw winner via HTTP POST (forced draw authenticated with owner secret key)
             req_draw = urllib.request.Request(
                 f"{base}/api/lottery/draw",
-                data=json.dumps({"force": True}).encode("utf-8"),
+                data=json.dumps({"force": True, "account_key": owner.key}).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
@@ -237,10 +250,10 @@ class TestTokenSink(unittest.TestCase):
                 self.assertEqual(draw_data["jackpot_credits"], 14)
                 self.assertEqual(draw_data["burned_credits"], 1)
 
-            # 4. Stake & Unstake via HTTP POST
+            # 4. Stake via HTTP POST using private Secret Account Key
             req_stake = urllib.request.Request(
                 f"{base}/api/staking/stake",
-                data=json.dumps({"account_key": "http-miner-2", "amount": 50}).encode("utf-8"),
+                data=json.dumps({"account_key": m2.key, "amount": 50}).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
@@ -250,7 +263,7 @@ class TestTokenSink(unittest.TestCase):
                 self.assertEqual(stk_data["tier"], "SILVER")
                 self.assertEqual(stk_data["total_staked"], 50)
 
-            with urllib.request.urlopen(f"{base}/api/staking/status?account_key=http-miner-2", timeout=5) as resp:
+            with urllib.request.urlopen(f"{base}/api/staking/status?account_key={m2.key}", timeout=5) as resp:
                 st_status = json.loads(resp.read().decode("utf-8"))
                 self.assertTrue(st_status["ok"])
                 self.assertEqual(st_status["user_staked"], 50)

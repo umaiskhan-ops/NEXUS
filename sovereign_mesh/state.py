@@ -6,6 +6,7 @@ import heapq
 import itertools
 import json
 import math
+import os
 import re
 import secrets
 import threading
@@ -33,10 +34,12 @@ def cosine(a: Counter, b: Counter) -> float:
 
 # ---------------------------------------------------------------- memory
 class MemoryStore:
-    """Persistent key/value memory with lexical similarity search."""
+    """Persistent key/value memory with lexical similarity search, session isolation & bounded retention (N9 Fix)."""
 
-    def __init__(self, path: Optional[Path] = None):
+    def __init__(self, path: Optional[Path] = None, max_entries: int = 5000, ttl_seconds: float = 0.0):
         self._path = path
+        self._max_entries = max(100, int(max_entries))
+        self._ttl_seconds = float(ttl_seconds)
         self._lock = threading.RLock()
         self._data: Dict[str, dict] = {}
         if path and path.exists():
@@ -46,18 +49,41 @@ class MemoryStore:
         if self._path:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._data, default=str), encoding="utf-8")
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps(self._data, default=str))
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
             tmp.replace(self._path)
+
+    def _prune_locked(self) -> None:
+        now = time.time()
+        if self._ttl_seconds > 0:
+            expired = [k for k, e in self._data.items() if (now - float(e.get("updated", now))) > self._ttl_seconds]
+            for k in expired:
+                self._data.pop(k, None)
+        if len(self._data) > self._max_entries:
+            by_age = sorted(self._data.items(), key=lambda kv: float(kv[1].get("updated", 0.0)))
+            for k, _ in by_age[: len(self._data) - self._max_entries]:
+                self._data.pop(k, None)
 
     def set(self, key: str, value: Any, session: str = "default") -> None:
         with self._lock:
             self._data[key] = {"value": value, "session": session, "updated": time.time()}
+            self._prune_locked()
             self._flush()
 
-    def get(self, key: str) -> Any:
+    def get(self, key: str, session: Optional[str] = None) -> Any:
         with self._lock:
+            self._prune_locked()
             entry = self._data.get(key)
-            return entry["value"] if entry else None
+            if not entry:
+                return None
+            if session is not None and entry.get("session") != session:
+                return None
+            return entry["value"]
 
     def delete(self, key: str) -> bool:
         with self._lock:
@@ -65,14 +91,22 @@ class MemoryStore:
             self._flush()
             return existed
 
-    def keys(self) -> List[str]:
+    def keys(self, session: Optional[str] = None) -> List[str]:
         with self._lock:
+            self._prune_locked()
+            if session is not None:
+                return sorted(k for k, e in self._data.items() if e.get("session") == session)
             return sorted(self._data)
 
-    def search(self, query: str, k: int = 5) -> List[Tuple[str, float, Any]]:
+    def search(self, query: str, k: int = 5, session: Optional[str] = None) -> List[Tuple[str, float, Any]]:
         q = tokenize(query)
         with self._lock:
-            scored = [(key, cosine(q, tokenize(f"{key} {e['value']}")), e["value"]) for key, e in self._data.items()]
+            self._prune_locked()
+            scored = [
+                (key, cosine(q, tokenize(f"{key} {e['value']}")), e["value"])
+                for key, e in self._data.items()
+                if session is None or e.get("session") == session
+            ]
         scored.sort(key=lambda x: x[1], reverse=True)
         return [s for s in scored[:k] if s[1] > 0]
 
@@ -135,12 +169,15 @@ class BudgetExceeded(RuntimeError):
 
 
 class TokenBudget:
-    """Local compute guard. 'Futures' = advance reservations against the budget."""
+    """Local compute guard with per-user quota tracking (N9 Fix). 'Futures' = advance reservations against the budget."""
 
-    def __init__(self, total: int):
+    def __init__(self, total: int, default_user_quota: int = 0):
         self.total = total
         self.used = 0
         self.reservations: Dict[str, int] = {}
+        self.default_user_quota = int(default_user_quota)
+        self.user_quotas: Dict[str, int] = {}
+        self.user_used: Dict[str, int] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -151,8 +188,18 @@ class TokenBudget:
     def available(self) -> int:
         return self.total - self.used - sum(self.reservations.values())
 
-    def charge(self, tokens: int, reservation: Optional[str] = None) -> None:
+    def set_user_quota(self, user_id: str, quota: int) -> None:
         with self._lock:
+            self.user_quotas[str(user_id)] = max(0, int(quota))
+
+    def charge(self, tokens: int, reservation: Optional[str] = None, user_id: Optional[str] = None) -> None:
+        with self._lock:
+            if user_id:
+                uid = str(user_id)
+                u_used = self.user_used.get(uid, 0)
+                u_quota = self.user_quotas.get(uid, self.default_user_quota)
+                if u_quota > 0 and (u_used + tokens) > u_quota:
+                    raise BudgetExceeded(f"user token quota exhausted for {uid} ({u_used}/{u_quota})")
             if reservation and reservation in self.reservations:
                 take = min(tokens, self.reservations[reservation])
                 self.reservations[reservation] -= take
@@ -161,6 +208,9 @@ class TokenBudget:
             if tokens > self.available:
                 raise BudgetExceeded(f"token budget exhausted ({self.used}/{self.total})")
             self.used += tokens
+            if user_id:
+                uid = str(user_id)
+                self.user_used[uid] = self.user_used.get(uid, 0) + tokens
 
     def reserve(self, label: str, tokens: int) -> None:
         with self._lock:

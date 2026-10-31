@@ -161,8 +161,15 @@ class PublicTunnelManager:
                 return str(c.resolve())
         return None
 
-    def start(self, auto_download: bool = False) -> Optional[str]:
-        """Starts cloudflared quick-tunnel and returns public HTTPS URL."""
+    def start(self, auto_download: bool = False, require_auth: bool = True) -> Optional[str]:
+        """Starts cloudflared quick-tunnel and returns public HTTPS URL (N10 Security Guard)."""
+        if require_auth and not os.environ.get("DASHBOARD_TOKEN", "").strip():
+            # N10 Fix: Never expose an unauthenticated localhost dashboard to a public tunnel
+            import secrets
+            generated_token = secrets.token_urlsafe(32)
+            os.environ["DASHBOARD_TOKEN"] = generated_token
+            print("[!] [Public-Tunnel] Security Guard (N10): Auto-generated runtime DASHBOARD_TOKEN before starting public tunnel.")
+
         existing = self.get_public_url()
         if existing:
             self.status = "ACTIVE_ENV_OVERRIDE"

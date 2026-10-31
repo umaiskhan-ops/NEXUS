@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sovereign-mesh"
+version = "2026.5.0"
+description = "NEXUS Sovereign Agentic Mesh — Decentralized AI Compute & Escrow Grid"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Proprietary"}
+dependencies = [
+    "cryptography>=42.0.0,<45.0.0",
+    "psutil>=5.9.8,<7.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0,<9.0.0",
+]
+
+[project.scripts]
+sovereign-mesh = "sovereign_mesh.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sovereign_mesh*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

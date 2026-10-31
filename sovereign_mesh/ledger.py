@@ -1,8 +1,11 @@
-"""Append-only, hash-chained ledger persisted as JSON Lines."""
+"""Append-only, HMAC-authenticated hash-chained ledger persisted as JSON Lines."""
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import os
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -20,10 +23,11 @@ def _jsonable(obj: Any) -> Any:
 
 
 class HashChainLedger:
-    def __init__(self, path: Optional[Path] = None):
+    def __init__(self, path: Optional[Path] = None, hmac_key: Optional[str] = None):
         self._path = path
         self._blocks: List[dict] = []
         self._lock = threading.RLock()
+        self._hmac_key = self._resolve_hmac_key(path, hmac_key)
         if path and path.exists():
             with path.open("r", encoding="utf-8") as fh:
                 for line in fh:
@@ -31,22 +35,60 @@ class HashChainLedger:
                     if line:
                         self._blocks.append(json.loads(line))
 
+    @staticmethod
+    def _resolve_hmac_key(path: Optional[Path], explicit_key: Optional[str]) -> bytes:
+        if explicit_key:
+            return explicit_key.encode("utf-8")
+        env_key = os.environ.get("LEDGER_HMAC_KEY", "").strip()
+        if env_key:
+            return env_key.encode("utf-8")
+        if path:
+            key_file = path.parent / ".ledger_hmac.key"
+            try:
+                if key_file.exists():
+                    raw = key_file.read_text(encoding="utf-8").strip()
+                    if raw:
+                        return raw.encode("utf-8")
+                key_file.parent.mkdir(parents=True, exist_ok=True)
+                generated = secrets.token_hex(32)
+                key_file.write_text(generated, encoding="utf-8")
+                try:
+                    os.chmod(key_file, 0o600)
+                except OSError:
+                    pass
+                return generated.encode("utf-8")
+            except OSError:
+                pass
+        return secrets.token_hex(32).encode("utf-8")
+
+    def _compute_sig(self, block_hash: str, index: int, prev_hash: str) -> str:
+        msg = f"{index}:{prev_hash}:{block_hash}".encode("utf-8")
+        return hmac.new(self._hmac_key, msg, hashlib.sha256).hexdigest()
+
     def append(self, task: str, payload: Any) -> dict:
         with self._lock:
             prev = self._blocks[-1]["hash"] if self._blocks else GENESIS_HASH
+            idx = len(self._blocks)
             data = {
-                "index": len(self._blocks),
+                "index": idx,
                 "task": task,
                 "payload": _jsonable(payload),
                 "timestamp": time.time(),
                 "prev_hash": prev,
             }
-            block = {"hash": hashlib.sha256(_canonical(data)).hexdigest(), "data": data}
+            block_hash = hashlib.sha256(_canonical(data)).hexdigest()
+            sig = self._compute_sig(block_hash, idx, prev)
+            block = {"hash": block_hash, "signature": sig, "data": data}
             self._blocks.append(block)
             if self._path:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 with self._path.open("a", encoding="utf-8") as fh:
                     fh.write(json.dumps(block, default=str) + "\n")
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
             return block
 
     def verify(self) -> Tuple[bool, Optional[int]]:
@@ -61,8 +103,14 @@ class HashChainLedger:
                     return False, i
                 if data.get("prev_hash") != prev or data.get("index") != i:
                     return False, i
-                if hashlib.sha256(_canonical(data)).hexdigest() != block.get("hash"):
+                expected_hash = hashlib.sha256(_canonical(data)).hexdigest()
+                if expected_hash != block.get("hash"):
                     return False, i
+                block_sig = block.get("signature")
+                if block_sig is not None:
+                    expected_sig = self._compute_sig(expected_hash, i, prev)
+                    if not hmac.compare_digest(str(block_sig), expected_sig):
+                        return False, i
                 prev = block["hash"]
             return True, None
 

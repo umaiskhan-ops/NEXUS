@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets, runtime state, and cryptographic keys (NEVER commit)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+data/
+worker_config.json
+owner_account.json
+public_tunnel_active.json
+sandbox_workspace/
+brain_shards/
+
+# Test and temporary artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+tests_tmp_*
+test_saved_file.py
+agent_test_algo.py

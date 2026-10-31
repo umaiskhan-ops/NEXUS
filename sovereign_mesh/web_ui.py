@@ -2419,12 +2419,27 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
 
     /* --- INITIALIZATION --- */
     window.onload = () => {{
-      // Auto-detect account key from URL if passed from worker launcher
+      // Auto-detect account key from URL if passed from worker launcher, then scrub URL bar (N6 / H11)
       const params = new URLSearchParams(window.location.search);
       const urlKey = params.get('account_key');
+      const urlToken = params.get('token');
       if (urlKey) {{
         activeAccountKey = urlKey;
         localStorage.setItem('sup_account_key', activeAccountKey);
+        fetch('/api/auth/session', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ account_key: urlKey, token: urlToken || '' }})
+        }}).catch(() => {{}});
+      }} else if (urlToken) {{
+        fetch('/api/auth/session', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ token: urlToken }})
+        }}).catch(() => {{}});
+      }}
+      if ((urlKey || urlToken) && window.history && window.history.replaceState) {{
+        window.history.replaceState({{}}, document.title, window.location.pathname + window.location.hash);
       }}
 
       if (activeAccountKey) {{
@@ -4158,8 +4173,8 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
 
           return `
             <tr>
-              <td><span style="font-family:var(--font-mono); font-weight:600; color:var(--accent);">${{s.instance_id}}</span></td>
-              <td><strong>${{s.tier_name}}</strong></td>
+              <td><span style="font-family:var(--font-mono); font-weight:600; color:var(--accent);">${{escapeHtml(s.instance_id)}}</span></td>
+              <td><strong>${{escapeHtml(s.tier_name)}}</strong></td>
               <td>
                 <div style="font-size:0.78rem;">Ceiling: <strong style="font-family:var(--font-mono);">${{s.allocated_cores}} vCPU / ${{s.allocated_ram_gb}} GB</strong></div>
                 ${{elasticInfo}}
@@ -4170,8 +4185,8 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
                   <div><span style="color:var(--text-muted);">KEY:</span> <span style="color:var(--warning);">${{escapeHtml(skey)}}</span></div>
                 </div>
               </td>
-              <td><span style="font-family:var(--font-mono); font-size:0.75rem; color:var(--text-muted);">${{s.endpoint}}</span></td>
-              <td style="font-family:var(--font-mono); font-size:0.74rem;"><span class="status-dot" style="background:${{statusColor}}"></span> ${{statusLabel}}</td>
+              <td><span style="font-family:var(--font-mono); font-size:0.75rem; color:var(--text-muted);">${{escapeHtml(s.endpoint)}}</span></td>
+              <td style="font-family:var(--font-mono); font-size:0.74rem;"><span class="status-dot" style="background:${{statusColor}}"></span> ${{escapeHtml(statusLabel)}}</td>
               <td>
                 <div style="font-weight:700; font-family:var(--font-mono); color:var(--text);">${{hRate}} UMAIS/hr</div>
                 <div style="font-size:0.7rem; font-family:var(--font-mono); color:var(--text-muted);">${{isPaused ? `FROZEN: ${{remMins}}m` : `EPOCH: ${{remMins}}m`}}</div>
@@ -4179,13 +4194,13 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
               <td>
                 <div style="display:flex; gap:4px; flex-wrap:wrap;">
                   ${{isOnline ? `
-                    <button class="account-btn" style="background:#2563eb; border-color:#3b82f6; color:white;" onclick="openServerConsole('${{s.instance_id}}', '${{escapeHtml(s.tier_name)}}', ${{s.allocated_cores}}, ${{s.allocated_ram_gb}}, '${{escapeHtml(s.endpoint)}}', '${{escapeHtml(akid)}}', '${{escapeHtml(skey)}}')">Console</button>
-                    <button class="account-btn" style="color:var(--warning); border-color:rgba(245,158,11,0.35);" onclick="pauseCluster('${{s.instance_id}}', '${{escapeHtml(skey)}}')">Pause</button>
-                    <button class="account-btn" style="color:var(--danger); border-color:rgba(239,68,68,0.35);" onclick="terminateCluster('${{s.instance_id}}', '${{escapeHtml(skey)}}')">Terminate</button>
+                    <button class="account-btn" style="background:#2563eb; border-color:#3b82f6; color:white;" onclick="openServerConsole('${{escapeHtml(s.instance_id)}}', '${{escapeHtml(s.tier_name)}}', ${{s.allocated_cores}}, ${{s.allocated_ram_gb}}, '${{escapeHtml(s.endpoint)}}', '${{escapeHtml(akid)}}', '${{escapeHtml(skey)}}')">Console</button>
+                    <button class="account-btn" style="color:var(--warning); border-color:rgba(245,158,11,0.35);" onclick="pauseCluster('${{escapeHtml(s.instance_id)}}', '${{escapeHtml(skey)}}')">Pause</button>
+                    <button class="account-btn" style="color:var(--danger); border-color:rgba(239,68,68,0.35);" onclick="terminateCluster('${{escapeHtml(s.instance_id)}}', '${{escapeHtml(skey)}}')">Terminate</button>
                   ` : isPaused ? `
-                    <button class="account-btn" style="background:#10b981; border-color:#10b981; color:#000; font-weight:600;" onclick="resumeCluster('${{s.instance_id}}', '${{escapeHtml(skey)}}')">Resume</button>
-                    <button class="account-btn" onclick="openServerConsole('${{s.instance_id}}', '${{escapeHtml(s.tier_name)}}', ${{s.allocated_cores}}, ${{s.allocated_ram_gb}}, '${{escapeHtml(s.endpoint)}}', '${{escapeHtml(akid)}}', '${{escapeHtml(skey)}}')">Console</button>
-                    <button class="account-btn" style="color:var(--danger); border-color:rgba(239,68,68,0.35);" onclick="terminateCluster('${{s.instance_id}}', '${{escapeHtml(skey)}}')">Terminate</button>
+                    <button class="account-btn" style="background:#10b981; border-color:#10b981; color:#000; font-weight:600;" onclick="resumeCluster('${{escapeHtml(s.instance_id)}}', '${{escapeHtml(skey)}}')">Resume</button>
+                    <button class="account-btn" onclick="openServerConsole('${{escapeHtml(s.instance_id)}}', '${{escapeHtml(s.tier_name)}}', ${{s.allocated_cores}}, ${{s.allocated_ram_gb}}, '${{escapeHtml(s.endpoint)}}', '${{escapeHtml(akid)}}', '${{escapeHtml(skey)}}')">Console</button>
+                    <button class="account-btn" style="color:var(--danger); border-color:rgba(239,68,68,0.35);" onclick="terminateCluster('${{escapeHtml(s.instance_id)}}', '${{escapeHtml(skey)}}')">Terminate</button>
                   ` : `<span style="color:var(--text-muted); font-size:0.74rem; font-family:var(--font-mono);">TERMINATED</span>`}}
                 </div>
               </td>
@@ -4474,7 +4489,7 @@ def get_web_ui_html(node_id: str, active_models: list, feature_counts: dict) -> 
                 <div style="background:#090a0f; border:1px solid var(--border); border-radius:6px; padding:0.45rem 0.65rem; display:flex; justify-content:space-between; align-items:center;">
                   <div>
                     <span style="font-weight:700; color:var(--warning);">ROUND #${{w.round_number}}</span>
-                    <span style="color:var(--text-muted); margin-left:0.4rem;">RECIPIENT: <code style="color:var(--accent);">${{w.winner_worker_id}}</code></span>
+                    <span style="color:var(--text-muted); margin-left:0.4rem;">RECIPIENT: <code style="color:var(--accent);">${{escapeHtml(w.winner_worker_id)}}</code></span>
                   </div>
                   <div style="font-weight:700; color:var(--success);">+${{w.jackpot_credits}} UMAIS <span style="font-size:0.7rem; color:var(--danger);">(-${{w.burned_credits}} BURNED)</span></div>
                 </div>

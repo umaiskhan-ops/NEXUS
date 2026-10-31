@@ -96,24 +96,77 @@ def _ensure_default_machines(grid) -> dict:
     return grid.machines
 
 
+def _is_safe_subpath(target: Path, root: Path) -> bool:
+    """Strictly verifies target is inside root using Path.is_relative_to (fixes H7 prefix bypass)."""
+    try:
+        return target.resolve().is_relative_to(root.resolve())
+    except Exception:
+        return False
+
+
 def make_handler(grid, client):
     cfg = grid.config
+    _rate_lock = threading.Lock()
+    _ip_hits: dict[str, list[float]] = {}
+    _peer_replay_lock = threading.Lock()
+    _peer_replay_cache: dict[str, float] = {}
+
+    def _check_rate_limit(ip: str, limit: int = 600, window_s: float = 60.0) -> bool:
+        now = time.time()
+        with _rate_lock:
+            hits = [t for t in _ip_hits.get(ip, []) if now - t < window_s]
+            if len(hits) >= limit:
+                _ip_hits[ip] = hits
+                return False
+            hits.append(now)
+            _ip_hits[ip] = hits
+            return True
+
+    def _sign_ota_payload(worker_id: str, version: str, sha256_hex: str) -> str:
+        import hashlib
+        secret = ""
+        if worker_id and getattr(grid, "hub", None):
+            wrec = grid.hub.get_worker(worker_id)
+            if wrec and wrec.key:
+                secret = wrec.key
+        if not secret:
+            secret = cfg.peer_shared_secret or cfg.dashboard_token or "nexus-ota-signing-key"
+        msg = f"OTA:{version}:{sha256_hex}".encode("utf-8")
+        return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "SovereignMesh/2026.4"
+        server_version = "SovereignMesh/2026.5"
 
         def log_message(self, fmt, *args):  # quieter logs, no request bodies
             print(f"[HTTP] {self.address_string()} {fmt % args}")
 
-        def _send(self, code: int, body, ctype: str = "application/json") -> None:
+        def _send(self, code: int, body, ctype: str = "application/json", extra_headers: dict | None = None) -> None:
             data = body if isinstance(body, bytes) else (
                 body.encode("utf-8") if isinstance(body, str) else json.dumps(body, default=str).encode("utf-8"))
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self' 'unsafe-inline' data: blob:; frame-ancestors 'none'",
+            )
+            if extra_headers:
+                for hk, hv in extra_headers.items():
+                    self.send_header(hk, hv)
             self.end_headers()
             self.wfile.write(data)
+
+        def _get_cookie(self, name: str) -> str:
+            raw = self.headers.get("Cookie", "")
+            for part in raw.split(";"):
+                if "=" in part:
+                    k, v = part.strip().split("=", 1)
+                    if k.strip() == name:
+                        return v.strip()
+            return ""
 
         def _read_json_body(self, allow_empty: bool = False):
             try:
@@ -136,26 +189,55 @@ def make_handler(grid, client):
                 return None
             return parsed
 
-        def _auth_ok(self) -> bool:
-            if not cfg.dashboard_token:
-                return True
+        def _extract_supplied_token(self) -> str:
             supplied = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            if not supplied:
+                supplied = self._get_cookie("nexus_session")
             if not supplied and "?" in self.path:
                 qs = parse_qs(urlparse(self.path).query)
                 supplied = qs.get("token", [""])[0]
+            return supplied
+
+        def _auth_ok(self) -> bool:
+            if not cfg.dashboard_token:
+                return True
+            supplied = self._extract_supplied_token()
             return bool(supplied and hmac.compare_digest(supplied, cfg.dashboard_token))
 
         def _caller_id(self) -> int:
             if cfg.dashboard_token:
-                supplied = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-                if not supplied and "?" in self.path:
-                    qs = parse_qs(urlparse(self.path).query)
-                    supplied = qs.get("token", [""])[0]
+                supplied = self._extract_supplied_token()
                 if supplied and hmac.compare_digest(supplied, cfg.dashboard_token):
                     return grid.owner_tg_id
             return 999999999  # Public Web User (Role.OPERATOR, strictly blocked from Role.OWNER features)
 
+        def _require_secret_worker(self, raw_credential: str):
+            """Strictly authenticates a worker via private secret key, rejecting public worker_id (fixes C3)."""
+            cred = str(raw_credential or "").strip()
+            if not cred:
+                self._send(400, {"ok": False, "error": "Secret Account Key is required"})
+                return None
+            if getattr(grid, "hub", None):
+                if grid.hub.is_public_worker_id(cred):
+                    self._send(403, {
+                        "ok": False,
+                        "error": (
+                            f"Security Violation (C3): '{cred}' is a public Worker ID, not a private Secret Account Key. "
+                            "Financial, Staking, Lottery, and P2P Escrow actions require your private 64-character Secret Account Key."
+                        ),
+                    })
+                    return None
+                wrec = grid.hub.authenticate_worker_key(cred)
+                if not wrec:
+                    self._send(401, {"ok": False, "error": "Invalid or unregistered Secret Account Key"})
+                    return None
+                return wrec
+            return None
+
         def do_GET(self):  # noqa: N802
+            client_ip = self.client_address[0] if self.client_address else "127.0.0.1"
+            if not _check_rate_limit(client_ip):
+                return self._send(429, {"ok": False, "error": "rate limit exceeded"})
             path = self.path.split("?", 1)[0]
             if path in {"/api/worker/download", "/download/worker"}:
                 from .worker_package import generate_worker_zip
@@ -174,6 +256,7 @@ def make_handler(grid, client):
                 self.send_header("Content-Type", "application/zip")
                 self.send_header("Content-Disposition", 'attachment; filename="nexus-worker-1click.zip"')
                 self.send_header("Content-Length", str(len(zip_bytes)))
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(zip_bytes)
                 return
@@ -193,6 +276,7 @@ def make_handler(grid, client):
                 b_url = getattr(cfg, "bootstrap_anchor_url", "") or getattr(grid, "bootstrap_anchor_url", "") or f"{hub_url}/api/tunnel/bootstrap"
                 launcher_code = get_worker_launcher_code(hub_url, default_bootstrap_url=b_url)
                 script_sha256 = hashlib.sha256(launcher_code.encode("utf-8")).hexdigest()
+                ota_sig = _sign_ota_payload(client_wid, WORKER_PROTOCOL_VERSION, script_sha256)
 
                 update_avail = bool(client_ver and client_ver != WORKER_PROTOCOL_VERSION)
 
@@ -210,6 +294,7 @@ def make_handler(grid, client):
                     "current_version": client_ver,
                     "update_available": update_avail,
                     "script_sha256": script_sha256,
+                    "ota_signature": ota_sig,
                     "download_url": "/api/worker/ota_download",
                     "changelog": "Zero-Touch Over-The-Air hot reload, model shard weight synchronization, zero-dependency resilience.",
                     "model_sync": {
@@ -224,6 +309,7 @@ def make_handler(grid, client):
                 from .worker_package import WORKER_PROTOCOL_VERSION, get_worker_launcher_code
                 qs = parse_qs(urlparse(self.path).query)
                 raw = qs.get("raw", ["0"])[0] == "1"
+                client_wid = qs.get("worker_id", [""])[0].strip()
                 host = self.headers.get("Host") or f"{cfg.host}:{cfg.port}"
                 proto_hdr = self.headers.get("X-Forwarded-Proto", "").lower()
                 scheme = "https" if (proto_hdr == "https" or host.endswith(":443")) else "http"
@@ -231,14 +317,17 @@ def make_handler(grid, client):
                 b_url = getattr(cfg, "bootstrap_anchor_url", "") or getattr(grid, "bootstrap_anchor_url", "") or f"{hub_url}/api/tunnel/bootstrap"
                 launcher_code = get_worker_launcher_code(hub_url, default_bootstrap_url=b_url)
                 script_sha256 = hashlib.sha256(launcher_code.encode("utf-8")).hexdigest()
+                ota_sig = _sign_ota_payload(client_wid, WORKER_PROTOCOL_VERSION, script_sha256)
 
                 if raw:
                     code_bytes = launcher_code.encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/x-python; charset=utf-8")
                     self.send_header("X-Script-Sha256", script_sha256)
+                    self.send_header("X-OTA-Signature", ota_sig)
                     self.send_header("X-Worker-Version", WORKER_PROTOCOL_VERSION)
                     self.send_header("Content-Length", str(len(code_bytes)))
+                    self.send_header("X-Content-Type-Options", "nosniff")
                     self.end_headers()
                     self.wfile.write(code_bytes)
                     return
@@ -247,6 +336,7 @@ def make_handler(grid, client):
                     "ok": True,
                     "version": WORKER_PROTOCOL_VERSION,
                     "sha256": script_sha256,
+                    "ota_signature": ota_sig,
                     "code": launcher_code,
                     "changelog": "Zero-Touch Over-The-Air hot reload, model shard weight synchronization, zero-dependency resilience.",
                 })
@@ -281,7 +371,8 @@ def make_handler(grid, client):
                         self.send_header("Content-Type", "application/octet-stream")
                         self.send_header("Content-Disposition", f'attachment; filename="{st_path.name}"')
                         self.send_header("Content-Length", str(len(raw_bytes)))
-                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Access-Control-Allow-Origin", f"http://127.0.0.1:{cfg.port}")
+                        self.send_header("X-Content-Type-Options", "nosniff")
                         self.end_headers()
                         self.wfile.write(raw_bytes)
                         return
@@ -420,7 +511,7 @@ def make_handler(grid, client):
             if path == "/api/crypto/quantum_spec":
                 return self._send(200, {
                     "ok": True,
-                    "protocol": "NEXUS Hyper-Sovereign Multi-Vault Quantum Key (HSQK-4096)",
+                    "protocol": "NEXUS Multi-Vault Hybrid Key Engine (HSQK-4096)",
                     "entropy_bits": 4096,
                     "entropy_bytes": 512,
                     "security_comparison": {
@@ -429,35 +520,33 @@ def make_handler(grid, client):
                             "entropy_bits": 256,
                             "key_space": "2^256 (~1.15 x 10^77)",
                             "symmetric_security_level": 128,
-                            "quantum_resistance": "0% (Broken by Shor's Algorithm in O(n^3) polynomial time)",
-                            "hardware_binding": "None (Static key; cloneable to any device or VM)",
-                            "forward_secrecy": "None (Static key; past/future transactions compromised upon leakage)",
+                            "quantum_resistance": "Vulnerable to Shor's Algorithm on sufficiently large quantum computers",
+                            "hardware_binding": "None (Static key)",
+                            "forward_secrecy": "None (Static key)",
                             "address_format": "bc1q... (160/256 bits)",
                         },
                         "nexus_hsqk_4096": {
-                            "algorithm": "Multi-Vault Hybrid (NIST FIPS 204 ML-DSA Lattice + Ed448 + SHAKE256 + SHA3 + BLAKE2b)",
+                            "algorithm": "Multi-Vault Hybrid (Ed448 / Ed25519 + Module-LWE Ring + SHAKE256 + SHA3 + BLAKE2b)",
                             "entropy_bits": 4096,
-                            "key_space": "2^4096 (~1.04 x 10^1233) = (2^256)^16",
-                            "bitcoin_multiplier": "16x Parallel Multiplied Bitcoin Key Spaces (Mathematically larger than 10^1000 universes)",
+                            "key_space": "512-byte master seed derived across 4 independent cryptographic chambers",
                             "symmetric_security_level": 256,
-                            "quantum_resistance": "100% Post-Quantum Lattice Immunity (Shortest Vector Problem over Module Lattices)",
-                            "hardware_binding": "Chamber 4: Physical Unclonable Function (PUF) Silicon-Drift Lock",
-                            "forward_secrecy": "Ephemeral Double-Ratchet evolving session state on every compute proof",
-                            "address_format": "nxq1... (Bech32m Post-Quantum Address with polynomial error detection)",
+                            "quantum_resistance": "Hybrid Classical (Ed448) + Cyclotomic Ring Module-LWE Commitment",
+                            "hardware_binding": "Chamber 4: Host Hardware Fingerprint + Timing Jitter Anchor",
+                            "forward_secrecy": "Hash-Ratchet evolving session state on every compute proof",
+                            "address_format": "nxq1... (Bech32m Address with polynomial error detection)",
                         }
                     },
                     "chambers": {
-                        "chamber_1": "NIST FIPS 204 ML-DSA Lattice Module-LWE Ring Engine in Z_q[X]/(X^32 + 1)",
-                        "chamber_2": "Ed448-Goldilocks High-Degree Asymmetric Engine (224-bit symmetric security level)",
+                        "chamber_1": "Cyclotomic Polynomial Ring Module-LWE Engine in Z_q[X]/(X^32 + 1)",
+                        "chamber_2": "Ed448-Goldilocks Asymmetric Signature Engine (RFC 8032)",
                         "chamber_3": "Triple Cascaded Hash Tree Root (SHAKE-256 + SHA3-512 + BLAKE2b-512)",
-                        "chamber_4": "Silicon-Drift Hardware PUF Seal (Nanosecond CPU Jitter + Motherboard Hardware UUID)",
+                        "chamber_4": "Host Hardware Fingerprint Seal (OS/Motherboard UUID + CPU Timing Jitter)",
                     }
                 })
 
             if path == "/api/account/status":
-                import secrets
                 qs = parse_qs(urlparse(self.path).query)
-                key = qs.get("key", [""])[0].strip()
+                key = (qs.get("key", [""])[0] or self._get_cookie("nexus_account_key")).strip()
                 if not key:
                     return self._send(400, {"ok": False, "error": "Account key is required"})
                 if getattr(grid, "hub", None) and grid.hub.is_public_worker_id(key):
@@ -471,11 +560,10 @@ def make_handler(grid, client):
                     })
                 rec = grid.hub.get_worker_by_key(key) if getattr(grid, "hub", None) else None
                 if not rec:
-                    new_wid = f"worker-{secrets.token_hex(3)}"
-                    rec = grid.hub.register_worker(new_wid, url="local")
-                    rec.key = key
-                    if hasattr(grid.hub, "_flush"):
-                        grid.hub._flush()
+                    return self._send(401, {
+                        "ok": False,
+                        "error": "Invalid or unregistered Secret Account Key (N3 Security Enforcement: auto-creation disabled).",
+                    })
                 tier_name = "COMMUNITY"
                 if rec.credits >= 200:
                     tier_name = "SOVEREIGN_VIP"
@@ -517,11 +605,15 @@ def make_handler(grid, client):
                 return self._send(200, {"ok": True, "machines": list(machines.values())})
 
             if path == "/api/ide/projects":
+                if not self._auth_ok():
+                    return self._send(401, {"ok": False, "error": "unauthorized"})
                 curr = str(resolve_project_root(grid))
                 recent = get_recent_projects(getattr(grid.config, "data_dir", Path("./data")), curr)
                 return self._send(200, {"ok": True, "current_project": curr, "projects": recent})
 
             if path == "/api/ide/files":
+                if not self._auth_ok():
+                    return self._send(401, {"ok": False, "error": "unauthorized"})
                 qs = parse_qs(urlparse(self.path).query)
                 proj_param = qs.get("project", [""])[0].strip()
                 root = resolve_project_root(grid, proj_param)
@@ -545,6 +637,8 @@ def make_handler(grid, client):
                 return self._send(200, {"ok": True, "root": str(root), "files": files})
 
             if path == "/api/ide/file":
+                if not self._auth_ok():
+                    return self._send(401, {"ok": False, "error": "unauthorized"})
                 qs = parse_qs(urlparse(self.path).query)
                 rel_path = qs.get("path", [""])[0].strip()
                 proj_param = qs.get("project", [""])[0].strip()
@@ -552,7 +646,7 @@ def make_handler(grid, client):
                     return self._send(400, {"ok": False, "error": "path is required"})
                 root = resolve_project_root(grid, proj_param)
                 target = (root / rel_path).resolve()
-                if not str(target).startswith(str(root)) or not target.is_file():
+                if not _is_safe_subpath(target, root) or not target.is_file():
                     return self._send(404, {"ok": False, "error": "file not found"})
                 try:
                     content = target.read_text(encoding="utf-8", errors="replace")
@@ -598,14 +692,48 @@ def make_handler(grid, client):
                 return self._send(404, {"error": "not found"})
             ts = self.headers.get("X-Peer-Timestamp", "")
             sig = self.headers.get("X-Peer-Signature", "")
-            fresh = ts.isdigit() and abs(time.time() - int(ts)) < 60
-            if not fresh or not hmac.compare_digest(sig, grid.peer_signature(ts)):
+            nonce = self.headers.get("X-Peer-Nonce", "")
+            now = time.time()
+            fresh = ts.isdigit() and abs(now - int(ts)) < 60
+            if not fresh or not sig:
                 return self._send(401, {"error": "bad peer signature"})
+            expected_bound = grid.peer_signature(ts, path="/p2p/head", nonce=nonce)
+            expected_legacy = grid.peer_signature(ts) if not nonce else ""
+            sig_ok = hmac.compare_digest(sig, expected_bound) or (
+                bool(expected_legacy) and hmac.compare_digest(sig, expected_legacy)
+            )
+            if not sig_ok:
+                return self._send(401, {"error": "bad peer signature"})
+            replay_key = f"{ts}:{nonce}:{sig}"
+            with _peer_replay_lock:
+                expired = [k for k, exp_t in _peer_replay_cache.items() if now - exp_t > 65.0]
+                for k in expired:
+                    _peer_replay_cache.pop(k, None)
+                if replay_key in _peer_replay_cache:
+                    return self._send(401, {"error": "replayed peer signature (H8 blocked)"})
+                _peer_replay_cache[replay_key] = now
             return self._send(200, {"node_id": grid.node_id, "ledger_len": len(grid.ledger),
                                     "head_hash": grid.ledger.head_hash})
 
         def do_POST(self):  # noqa: N802
+            client_ip = self.client_address[0] if self.client_address else "127.0.0.1"
+            if not _check_rate_limit(client_ip):
+                return self._send(429, {"ok": False, "error": "rate limit exceeded"})
             path = self.path.split("?", 1)[0]
+
+            if path == "/api/auth/session":
+                body = self._read_json_body(allow_empty=True)
+                if body is None:
+                    return
+                tok = str(body.get("token", "")).strip()
+                acc_key = str(body.get("account_key", "")).strip()
+                headers_out = {}
+                if tok:
+                    headers_out["Set-Cookie"] = f"nexus_session={tok}; HttpOnly; SameSite=Strict; Path=/"
+                elif acc_key:
+                    headers_out["Set-Cookie"] = f"nexus_account_key={acc_key}; HttpOnly; SameSite=Strict; Path=/"
+                return self._send(200, {"ok": True, "session": "HttpOnly cookie set"}, extra_headers=headers_out)
+
             if path in {"/api/lottery/buy_ticket", "/api/lottery/draw", "/api/staking/stake", "/api/staking/unstake"}:
                 body = self._read_json_body(allow_empty=True)
                 if body is None:
@@ -617,8 +745,9 @@ def make_handler(grid, client):
                 acc = str(body.get("account_key") or body.get("worker_id") or "").strip()
 
                 if path == "/api/lottery/buy_ticket":
-                    if not acc:
-                        return self._send(400, {"ok": False, "error": "account_key is required"})
+                    wrec = self._require_secret_worker(acc)
+                    if not wrec:
+                        return
                     raw_tickets = body.get("tickets") if body.get("tickets") is not None else body.get("count", 1)
                     if raw_tickets == "":
                         raw_tickets = 1
@@ -626,19 +755,31 @@ def make_handler(grid, client):
                         tickets = int(raw_tickets)
                     except (ValueError, TypeError):
                         return self._send(400, {"ok": False, "error": "tickets must be an integer"})
-                    res = grid.token_sink.buy_lottery_ticket(acc, count=tickets)
+                    res = grid.token_sink.buy_lottery_ticket(wrec.key, count=tickets)
                     code = 200 if res.get("ok") else 400
                     return self._send(code, res)
 
                 if path == "/api/lottery/draw":
-                    force = bool(body.get("force", True))
+                    force = bool(body.get("force", False))
+                    if force:
+                        is_owner_caller = (cfg.dashboard_token and self._caller_id() == grid.owner_tg_id)
+                        if not is_owner_caller and acc and getattr(grid, "hub", None):
+                            wrec_owner = grid.hub.authenticate_worker_key(acc)
+                            if wrec_owner and wrec_owner.worker_id == "owner-master":
+                                is_owner_caller = True
+                        if not is_owner_caller:
+                            return self._send(403, {
+                                "ok": False,
+                                "error": "Security Enforcement (H1): Forced lottery draw requires Sovereign Owner authentication.",
+                            })
                     res = grid.token_sink.draw_lottery_winner(force=force)
                     code = 200 if res.get("ok") else 400
                     return self._send(code, res)
 
                 if path == "/api/staking/stake":
-                    if not acc:
-                        return self._send(400, {"ok": False, "error": "account_key is required"})
+                    wrec = self._require_secret_worker(acc)
+                    if not wrec:
+                        return
                     raw_amt = body.get("amount", 50)
                     if raw_amt is None or raw_amt == "":
                         raw_amt = 50
@@ -646,13 +787,14 @@ def make_handler(grid, client):
                         amt = int(raw_amt)
                     except (ValueError, TypeError):
                         return self._send(400, {"ok": False, "error": "amount must be an integer"})
-                    res = grid.token_sink.stake_credits(acc, amt)
+                    res = grid.token_sink.stake_credits(wrec.key, amt)
                     code = 200 if res.get("ok") else 400
                     return self._send(code, res)
 
                 if path == "/api/staking/unstake":
-                    if not acc:
-                        return self._send(400, {"ok": False, "error": "account_key is required"})
+                    wrec = self._require_secret_worker(acc)
+                    if not wrec:
+                        return
                     raw_amt = body.get("amount", 50)
                     if raw_amt is None or raw_amt == "":
                         raw_amt = 50
@@ -660,7 +802,7 @@ def make_handler(grid, client):
                         amt = int(raw_amt)
                     except (ValueError, TypeError):
                         return self._send(400, {"ok": False, "error": "amount must be an integer"})
-                    res = grid.token_sink.unstake_credits(acc, amt)
+                    res = grid.token_sink.unstake_credits(wrec.key, amt, enforce_lock=True)
                     code = 200 if res.get("ok") else 400
                     return self._send(code, res)
 
@@ -774,7 +916,7 @@ def make_handler(grid, client):
                         return self._send(400, {"ok": False, "error": str(exc)})
 
                 if path == "/api/worker/register":
-                    wid = body.get("worker_id") or f"worker-{secrets.token_hex(3)}"
+                    wid = body.get("worker_id") or f"worker-{secrets.token_hex(8)}"
                     wurl = body.get("url", "local")
                     payout = body.get("payout_address", "")
                     hw_uuid = body.get("hardware_uuid", "")
@@ -855,6 +997,7 @@ def make_handler(grid, client):
                     hub_url = f"{scheme}://{host}"
                     launcher_code = get_worker_launcher_code(hub_url)
                     script_sha256 = hashlib.sha256(launcher_code.encode("utf-8")).hexdigest()
+                    ota_sig = _sign_ota_payload(rec.worker_id, WORKER_PROTOCOL_VERSION, script_sha256)
 
                     update_avail = bool(client_ver and client_ver != WORKER_PROTOCOL_VERSION)
 
@@ -892,6 +1035,7 @@ def make_handler(grid, client):
                         "latest_version": WORKER_PROTOCOL_VERSION,
                         "update_available": update_avail,
                         "script_sha256": script_sha256,
+                        "ota_signature": ota_sig,
                         "model_sync_available": model_sync_available,
                         "latest_deltas_count": deltas_count,
                         "ota_download_url": "/api/worker/ota_download",
@@ -909,7 +1053,7 @@ def make_handler(grid, client):
 
                 if path == "/api/p2p/buyback":
                     acc = str(body.get("account_key") or body.get("worker_id", "")).strip()
-                    wrec = grid.hub.get_worker(acc) if (acc and getattr(grid, "hub", None)) else None
+                    wrec = grid.hub.authenticate_worker_key(acc) if (acc and getattr(grid, "hub", None)) else None
                     if not is_owner and (not wrec or wrec.worker_id != "owner-master"):
                         return self._send(403, {"ok": False, "error": "Only the Sovereign Owner (owner-master) can execute the Weekly Top 3 Miners Buyback."})
                     try:
@@ -921,92 +1065,131 @@ def make_handler(grid, client):
                     return self._send(200 if res.get("ok") else 400, res)
 
                 if path == "/api/p2p/sell":
-                    wid = str(body.get("worker_id", ""))
+                    raw_cred = str(body.get("account_key") or body.get("worker_id", ""))
+                    wrec = self._require_secret_worker(raw_cred)
+                    if not wrec:
+                        return
                     method = str(body.get("payment_method", ""))
                     curr = str(body.get("currency", "PKR"))
                     try:
                         amt = int(body.get("amount", 0) or 0)
                         price = float(body.get("price", 0.0) or 0.0)
-                        res = grid.p2p.create_sell_order(wid, amt, price, method, currency=curr)
-                        return self._send(200, res)
+                        res = grid.p2p.create_sell_order(wrec.key, amt, price, method, currency=curr)
+                        return self._send(200 if res.get("ok") else 400, res)
                     except Exception as exc:
                         return self._send(400, {"ok": False, "error": str(exc)})
 
                 if path == "/api/p2p/buy_order":
-                    bid = str(body.get("buyer_id") or body.get("worker_id", ""))
+                    raw_cred = str(body.get("account_key") or body.get("buyer_id") or body.get("worker_id", ""))
+                    wrec = self._require_secret_worker(raw_cred)
+                    if not wrec:
+                        return
                     method = str(body.get("payment_method", "EasyPaisa / JazzCash"))
                     curr = str(body.get("currency", "PKR"))
                     try:
                         amt = int(body.get("amount", 0) or 0)
                         price = float(body.get("price", 0.0) or 0.0)
-                        res = grid.p2p.create_buy_order(bid, amt, price, method, currency=curr)
-                        return self._send(200, res)
+                        res = grid.p2p.create_buy_order(wrec.key, amt, price, method, currency=curr)
+                        return self._send(200 if res.get("ok") else 400, res)
                     except Exception as exc:
                         return self._send(400, {"ok": False, "error": str(exc)})
 
                 if path == "/api/p2p/accept_buy_order":
                     oid = body.get("order_id", "")
-                    sid = body.get("seller_id") or body.get("worker_id", "")
+                    raw_cred = str(body.get("account_key") or body.get("seller_id") or body.get("worker_id", ""))
+                    wrec = self._require_secret_worker(raw_cred)
+                    if not wrec:
+                        return
                     method = body.get("payment_method", "")
                     try:
-                        res = grid.p2p.accept_buy_order(oid, sid, seller_payment_method=method)
-                        return self._send(200, res)
+                        res = grid.p2p.accept_buy_order(oid, wrec.key, seller_payment_method=method)
+                        return self._send(200 if res.get("ok") else 400, res)
                     except Exception as exc:
                         return self._send(400, {"ok": False, "error": str(exc)})
 
                 if path == "/api/p2p/buy":
                     oid = body.get("order_id", "")
-                    bid = body.get("buyer_id", "")
+                    raw_cred = str(body.get("account_key") or body.get("buyer_id") or body.get("worker_id", ""))
+                    wrec = self._require_secret_worker(raw_cred)
+                    if not wrec:
+                        return
                     try:
-                        res = grid.p2p.initiate_buy(oid, bid)
-                        return self._send(200, res)
+                        res = grid.p2p.initiate_buy(oid, wrec.key)
+                        return self._send(200 if res.get("ok") else 400, res)
                     except Exception as exc:
                         return self._send(400, {"ok": False, "error": str(exc)})
 
                 if path == "/api/p2p/pay":
                     oid = body.get("order_id", "")
-                    bid = body.get("buyer_id", "")
+                    raw_cred = str(body.get("account_key") or body.get("buyer_id") or body.get("worker_id", ""))
+                    wrec = self._require_secret_worker(raw_cred)
+                    if not wrec:
+                        return
                     ref = body.get("payment_reference", "")
                     try:
-                        res = grid.p2p.submit_payment(oid, bid, ref)
-                        return self._send(200, res)
+                        res = grid.p2p.submit_payment(oid, wrec.key, ref)
+                        return self._send(200 if res.get("ok") else 400, res)
                     except Exception as exc:
                         return self._send(400, {"ok": False, "error": str(exc)})
 
                 if path == "/api/p2p/dispute":
                     oid = body.get("order_id", "")
-                    cid = body.get("caller_id") or body.get("worker_id") or body.get("account_key", "")
+                    raw_cred = str(body.get("account_key") or body.get("caller_id") or body.get("worker_id", ""))
+                    if not is_owner:
+                        wrec = self._require_secret_worker(raw_cred)
+                        if not wrec:
+                            return
+                        cid = wrec.key
+                    else:
+                        cid = raw_cred or "owner"
                     reason = body.get("reason", "Payment / Screenshot Dispute")
                     try:
                         res = grid.p2p.raise_dispute(oid, cid, reason=reason, is_owner=is_owner)
-                        return self._send(200, res)
+                        return self._send(200 if res.get("ok") else 400, res)
                     except Exception as exc:
                         return self._send(400, {"ok": False, "error": str(exc)})
 
                 if path == "/api/p2p/release":
                     oid = body.get("order_id", "")
-                    sid = body.get("seller_id", "")
+                    raw_cred = str(body.get("account_key") or body.get("seller_id") or body.get("worker_id", ""))
+                    if not is_owner:
+                        wrec = self._require_secret_worker(raw_cred)
+                        if not wrec:
+                            return
+                        sid = wrec.key
+                    else:
+                        sid = raw_cred or "owner"
                     try:
                         res = grid.p2p.confirm_and_release(oid, sid, is_owner=is_owner)
-                        return self._send(200, res)
+                        return self._send(200 if res.get("ok") else 400, res)
                     except Exception as exc:
                         return self._send(400, {"ok": False, "error": str(exc)})
 
                 if path == "/api/p2p/cancel":
                     oid = body.get("order_id", "")
-                    sid = body.get("seller_id", "")
+                    raw_cred = str(body.get("account_key") or body.get("seller_id") or body.get("worker_id", ""))
+                    if not is_owner:
+                        wrec = self._require_secret_worker(raw_cred)
+                        if not wrec:
+                            return
+                        sid = wrec.key
+                    else:
+                        sid = raw_cred or "owner"
                     try:
                         res = grid.p2p.cancel_order(oid, sid, is_owner=is_owner)
-                        return self._send(200, res)
+                        return self._send(200 if res.get("ok") else 400, res)
                     except Exception as exc:
                         return self._send(400, {"ok": False, "error": str(exc)})
 
                 if path == "/api/p2p/transfer":
-                    from_w = str(body.get("from_worker", ""))
+                    from_cred = str(body.get("account_key") or body.get("from_worker", ""))
+                    wrec = self._require_secret_worker(from_cred)
+                    if not wrec:
+                        return
                     to_w = str(body.get("to_worker", ""))
                     try:
                         amt = int(body.get("amount", 0) or 0)
-                        res = grid.hub.transfer_credits(from_w, to_w, amt)
+                        res = grid.hub.transfer_credits(wrec.worker_id, to_w, amt)
                         ok = bool(res.get("ok", res.get("status") == "TRANSFERRED"))
                         return self._send(200 if ok else 400, {"ok": ok, **res})
                     except Exception as exc:
@@ -1021,7 +1204,7 @@ def make_handler(grid, client):
                 _ensure_default_machines(grid)
 
                 if path == "/api/machine/connect":
-                    mid = body.get("machine_id") or f"mach-{secrets.token_hex(3)}"
+                    mid = body.get("machine_id") or f"mach-{secrets.token_hex(6)}"
                     name = body.get("name", "Physical Machine")
                     mtype = body.get("type", "robotic_arm")
                     target = body.get("target", "COM3")
@@ -1076,12 +1259,15 @@ def make_handler(grid, client):
                 try:
                     if path == "/api/supercomputer/rent":
                         acc = str(body.get("account_key") or body.get("worker_id", "")).strip()
+                        wrec = self._require_secret_worker(acc)
+                        if not wrec:
+                            return
                         tier = str(body.get("tier_name", "Cluster Node"))
                         cores = int(body.get("cores", 8) or 8)
                         ram = int(body.get("ram_gb", 32) or 32)
                         duration = int(body.get("duration_hours", 1) or 1)
                         auto_renew = bool(body.get("auto_renew", True))
-                        res = grid.supercomputer.provision_server(acc, tier, cores, ram, duration, auto_renew=auto_renew)
+                        res = grid.supercomputer.provision_server(wrec.key, tier, cores, ram, duration, auto_renew=auto_renew)
                         return self._send(200 if res.get("ok") else 400, res)
 
                     if path == "/api/supercomputer/connect":
@@ -1094,6 +1280,11 @@ def make_handler(grid, client):
                         iid = str(body.get("instance_id") or body.get("access_key_id", "")).strip()
                         acc = str(body.get("account_key") or body.get("worker_id", "")).strip()
                         secret = str(body.get("server_secret_key") or body.get("password", "")).strip()
+                        if acc and not secret:
+                            wrec = self._require_secret_worker(acc)
+                            if not wrec:
+                                return
+                            acc = wrec.key
                         job_name = str(body.get("job_name", "Distributed Task"))
                         code = str(body.get("payload_code", ""))
                         req_cores = int(body.get("requested_cores", 0) or 0)
@@ -1108,6 +1299,11 @@ def make_handler(grid, client):
                         secret = str(body.get("server_secret_key") or body.get("password", "")).strip()
                         if not acc and not secret and self._caller_id() != grid.owner_tg_id:
                             return self._send(403, {"ok": False, "error": "Account Key or Server Secret Key is required"})
+                        if acc and not secret:
+                            wrec = self._require_secret_worker(acc)
+                            if not wrec:
+                                return
+                            acc = wrec.key
                         if path == "/api/supercomputer/pause":
                             res = grid.supercomputer.pause_server(iid, acc, server_secret_key=secret)
                         elif path == "/api/supercomputer/resume":
@@ -1122,7 +1318,10 @@ def make_handler(grid, client):
                 supplied = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
                 if not cfg.webhook_secret or not hmac.compare_digest(supplied, cfg.webhook_secret):
                     return self._send(401, {"error": "unauthorized"})
-                length = int(self.headers.get("Content-Length", "0") or 0)
+                try:
+                    length = int(self.headers.get("Content-Length", "0") or 0)
+                except ValueError:
+                    return self._send(400, {"error": "invalid Content-Length"})
                 if length <= 0 or length > MAX_BODY:
                     return self._send(413, {"error": "bad length"})
                 try:
@@ -1142,11 +1341,10 @@ def make_handler(grid, client):
                 if body is None:
                     return
 
-                acc_key = str(body.get("account_key", "")).strip()
+                acc_key = str(body.get("account_key", "") or self._get_cookie("nexus_account_key")).strip()
                 credits_info = None
                 _free_paths = {"/api/ide/file/save", "/api/ide/launch_vscode", "/api/ide/projects/open", "/api/ide/projects/create"}
                 if acc_key and getattr(grid, "hub", None) and path not in _free_paths:
-                    import secrets
                     from .models import compute_task_credit_cost, is_frontier_complex_task
                     if grid.hub.is_public_worker_id(acc_key):
                         return self._send(403, {
@@ -1155,11 +1353,10 @@ def make_handler(grid, client):
                         })
                     wrec = grid.hub.get_worker_by_key(acc_key)
                     if not wrec:
-                        new_wid = f"worker-{secrets.token_hex(3)}"
-                        wrec = grid.hub.register_worker(new_wid, url="local")
-                        wrec.key = acc_key
-                        if hasattr(grid.hub, "_flush"):
-                            grid.hub._flush()
+                        return self._send(401, {
+                            "ok": False,
+                            "error": "Invalid or unregistered Secret Account Key (N3 Security Enforcement: auto-creation disabled).",
+                        })
 
                     prompt_or_instr = (body.get("prompt") or body.get("instruction") or "").strip()
                     mode_str = (body.get("mode") or body.get("model_tier") or ("frontier" if body.get("frontier_mode") else "")).strip()
@@ -1269,7 +1466,7 @@ def make_handler(grid, client):
                         timeout_val = float(body.get("timeout", 10.0) or 10.0)
                     except (ValueError, TypeError):
                         timeout_val = 10.0
-                    res = run_python(code, enabled=True, timeout=timeout_val, cwd=str(root))
+                    res = run_python(code, enabled=bool(cfg.enable_code_execution), timeout=timeout_val, cwd=str(root))
                     if res.get("security_blocked"):
                         caller_acc = str(body.get("account_key", "")).strip()
                         if caller_acc and getattr(grid, "hub", None):
@@ -1330,7 +1527,7 @@ def make_handler(grid, client):
 
                     root = resolve_project_root(grid, body.get("project", "").strip())
                     combined = f"{code}\n\n# --- AUTO-GENERATED TEST SUITE ---\n{test_code}"
-                    exec_res = run_python(combined, enabled=True, timeout=12.0, cwd=str(root))
+                    exec_res = run_python(combined, enabled=bool(cfg.enable_code_execution), timeout=12.0, cwd=str(root))
                     return self._send(200, {
                         "ok": exec_res["ok"],
                         "test_code": test_code,
@@ -1367,7 +1564,7 @@ def make_handler(grid, client):
                         if vscode_exe:
                             subprocess.Popen([vscode_exe, str(root)])
                         else:
-                            subprocess.Popen(["code", str(root)], shell=True)
+                            subprocess.Popen(["code", str(root)])
                         return self._send(200, {"ok": True, "project": str(root), "message": f"Visual Studio Code Desktop launched for {root}"})
                     except Exception as exc:
                         return self._send(500, {"ok": False, "error": f"Failed to launch VS Code: {exc}"})
@@ -1379,8 +1576,8 @@ def make_handler(grid, client):
                         return self._send(400, {"ok": False, "error": "path is required"})
                     root = resolve_project_root(grid, body.get("project", "").strip())
                     target = (root / rel_path).resolve()
-                    if not str(target).startswith(str(root)):
-                        return self._send(403, {"ok": False, "error": "access denied"})
+                    if not _is_safe_subpath(target, root):
+                        return self._send(403, {"ok": False, "error": "access denied (path traversal blocked)"})
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_text(content, encoding="utf-8")
                     grid.ledger.append("ide_file_saved", {"path": rel_path, "project": str(root), "bytes": len(content)})
@@ -1403,7 +1600,7 @@ def make_handler(grid, client):
                     existing_code = ""
                     if target_file:
                         tf_path = (root / target_file).resolve()
-                        if str(tf_path).startswith(str(root)) and tf_path.exists() and tf_path.is_file():
+                        if _is_safe_subpath(tf_path, root) and tf_path.exists() and tf_path.is_file():
                             existing_code = tf_path.read_text(encoding="utf-8", errors="ignore")[:3500]
 
                     from .features.registry import extract_code
@@ -1429,7 +1626,7 @@ def make_handler(grid, client):
                     dest_str = target_file if target_file else "agent_workspace_output.py"
                     dest_file = (root / dest_str).resolve()
                     file_saved = False
-                    if str(dest_file).startswith(str(root)) and generated_code:
+                    if _is_safe_subpath(dest_file, root) and generated_code:
                         dest_file.parent.mkdir(parents=True, exist_ok=True)
                         dest_file.write_text(generated_code, encoding="utf-8")
                         file_saved = True
@@ -1438,7 +1635,7 @@ def make_handler(grid, client):
                     chk = compile_check(generated_code)
                     test_output = ""
                     if chk["ok"] and generated_code:
-                        run_res = run_python(generated_code, enabled=True, timeout=10.0)
+                        run_res = run_python(generated_code, enabled=bool(cfg.enable_code_execution), timeout=10.0)
                         test_output = run_res.get("stdout", "") or run_res.get("stderr", "")
 
                     elapsed = round((time.perf_counter() - t0) * 1000 + 15.0, 1)
@@ -1505,6 +1702,11 @@ def make_handler(grid, client):
                 from .models import is_frontier_complex_task
                 mode_str = (body.get("mode") or body.get("model_tier") or ("frontier" if body.get("frontier_mode") else "")).strip()
                 frontier_flag = is_frontier_complex_task(prompt, mode_str)
+                if frontier_flag and caller_id != grid.owner_tg_id and credits_info is None:
+                    return self._send(401, {
+                        "ok": False,
+                        "error": "Security Enforcement (H12): Frontier LLM reasoning requires a valid Secret Account Key with credits.",
+                    })
                 swarm_parallel = grid.brain_matrix.execute_parallel_swarm_reasoning(prompt) if getattr(grid, "brain_matrix", None) else None
                 try:
                     ask_res = grid.router.ask(
@@ -1581,6 +1783,11 @@ def make_handler(grid, client):
 
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
+    _conn_semaphore = threading.BoundedSemaphore(64)
+
+    def process_request_thread(self, request, client_address):
+        with self._conn_semaphore:
+            super().process_request_thread(request, client_address)
 
 
 def _start_builtin_spoke_worker(grid) -> tuple[str, int]:
@@ -1605,12 +1812,13 @@ def _start_builtin_spoke_worker(grid) -> tuple[str, int]:
                 self.end_headers()
                 return
             if clean_path == "/status":
-                html = f"<html><body><h2>NEXUS Built-in Worker Online</h2><p>Worker ID: {worker_id}</p><p><a href='http://127.0.0.1:8443/?account_key={rec.key}'>Open Studio</a></p></body></html>"
-                data = html.encode("utf-8")
+                html_page = f"<html><body><h2>NEXUS Built-in Worker Online</h2><p>Worker ID: {worker_id}</p><p><a href='http://127.0.0.1:8443/?account_key={rec.key}'>Open Studio</a></p></body></html>"
+                data = html_page.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:8443")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(data)
                 return
@@ -1637,7 +1845,8 @@ def _start_builtin_spoke_worker(grid) -> tuple[str, int]:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(out)))
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:8443")
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(out)
                 return
@@ -1649,12 +1858,27 @@ def _start_builtin_spoke_worker(grid) -> tuple[str, int]:
                 self.send_response(404)
                 self.end_headers()
                 return
-            length = int(self.headers.get("Content-Length", "0") or 0)
-            packet = json.loads(self.rfile.read(length)) if length > 0 else {}
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_response(400)
+                self.end_headers()
+                return
+            if length < 0 or length > MAX_BODY:
+                self.send_response(413)
+                self.end_headers()
+                return
+            try:
+                packet = json.loads(self.rfile.read(length)) if length > 0 else {}
+            except ValueError:
+                self.send_response(400)
+                self.end_headers()
+                return
             out = json.dumps(worker_node.execute_signed_task(packet), default=str).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(out)))
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(out)
 
@@ -1699,6 +1923,7 @@ def _ensure_owner_studio_account(grid) -> tuple[str, str, int]:
 
 def serve(grid, open_browser: bool = False) -> None:
     import os
+    import ssl
     import sys
     import webbrowser
 
@@ -1757,19 +1982,29 @@ def serve(grid, open_browser: bool = False) -> None:
         grid.public_hub_url = tunnel_mgr.get_public_url()
 
     httpd = _ReusableThreadingHTTPServer((cfg.host, cfg.port), make_handler(grid, client))
+    scheme = "http"
+    tls_cert = getattr(cfg, "tls_cert_file", "")
+    tls_key = getattr(cfg, "tls_key_file", "")
+    if tls_cert and tls_key and Path(tls_cert).exists() and Path(tls_key).exists():
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(certfile=tls_cert, keyfile=tls_key)
+        httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+
     grid.start()
     threading.Thread(target=lambda: (grid.shutdown_event.wait(), tunnel_mgr.stop(), httpd.shutdown()), daemon=True).start()
 
-    studio_url = f"http://localhost:{cfg.port}"
+    studio_url = f"{scheme}://localhost:{cfg.port}"
     auto_login_url = f"{studio_url}/?account_key={owner_key}"
+    masked_owner_key = f"{owner_key[:6]}...{owner_key[-4:]} (saved in data/owner_account.json)" if len(owner_key) >= 12 else "[REDACTED]"
     public_status_line = grid.public_hub_url if grid.public_hub_url else "Localhost Only (Use --tunnel or ENABLE_TUNNEL=1 for Cloudflare HTTPS)"
 
     print("=" * 72)
     print("  [*] SUP AGENTIC MESH (POWERED BY NEXUS) - ALL SYSTEMS ONLINE")
     print("=" * 72)
     print(f"  [1] Main Web Studio & IDE : {studio_url}")
-    print(f"  [2] Owner Auto-Login URL  : {auto_login_url}")
-    print(f"  [3] Owner Secret Key      : {owner_key}")
+    print(f"  [2] Owner Auto-Login URL  : {studio_url}/ (key stored in data/owner_account.json)")
+    print(f"  [3] Owner Secret Key      : {masked_owner_key}")
     print(f"  [4] Owner Telegram Bot    : {tg_status}")
     print(f"  [5] Built-in Worker Node  : {spoke_id} (http://127.0.0.1:{spoke_port})")
     print(f"  [6] Capabilities Active   : {len(grid.registry)} Features | P2P Market | Supercomputer")

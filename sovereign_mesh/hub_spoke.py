@@ -205,6 +205,7 @@ class MasterHubCoordinator:
         self.spot_check_rate = spot_check_rate
         self.gradient_spot_check_rate = gradient_spot_check_rate
         self.force_gradient_spot_check = False
+        self.max_referral_cap = 500
         self._path = state_path
         self._workers: Dict[str, WorkerNodeRecord] = {}
         self._pending: Dict[str, dict] = {}
@@ -247,7 +248,13 @@ class MasterHubCoordinator:
             "current_epoch": self.current_epoch,
             "workers": [w.to_dict(include_key=True) for w in self._workers.values()],
         }
-        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, indent=1))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
         tmp.replace(self._path)
         try:
             os.chmod(self._path, 0o600)
@@ -268,12 +275,15 @@ class MasterHubCoordinator:
             return None
 
     def _award_referral_bonus(self, earner: WorkerNodeRecord, earned_credits: int, source: str) -> int:
-        """Awards +5% extra bonus credits to earner's referrer without deducting from earner."""
+        """Awards +5% extra bonus credits to earner's referrer without deducting from earner (capped per N4 Fix)."""
         if not earner.referred_by or earned_credits <= 0:
             return 0
+        max_referral_cap = int(getattr(self, "max_referral_cap", 500))
         with self._lock:
             referrer = self._workers.get(earner.referred_by)
             if not referrer or referrer.status != "ACTIVE" or referrer.worker_id == earner.worker_id:
+                return 0
+            if referrer.referral_bonus_credits >= max_referral_cap:
                 return 0
             exact_bonus = float(earned_credits) * REFERRAL_BONUS_RATE
             referrer.referral_bonus_accumulator = round(referrer.referral_bonus_accumulator + exact_bonus, 4)
@@ -285,6 +295,7 @@ class MasterHubCoordinator:
                 minted = int(referrer.referral_bonus_accumulator)
                 if minted > 0:
                     referrer.referral_bonus_accumulator = round(referrer.referral_bonus_accumulator - minted, 4)
+            minted = min(minted, max(0, max_referral_cap - referrer.referral_bonus_credits))
             if minted > 0:
                 referrer.credits += minted
                 referrer.referral_bonus_credits += minted
@@ -414,6 +425,24 @@ class MasterHubCoordinator:
             w = self._workers.get(candidate)
             return bool(w and w.key != candidate)
 
+    def authenticate_worker_key(self, secret_key: str) -> WorkerNodeRecord:
+        """Strictly authenticates a worker by private 64-char secret key, rejecting public worker_ids (C3 Fix)."""
+        cand = (secret_key or "").strip()
+        if not cand:
+            raise PermissionError("Authentication Error (C3): Secret Account Key is required")
+        with self._lock:
+            if self.is_public_worker_id(cand):
+                raise PermissionError(
+                    f"Security Error (C3): Public Worker ID {cand!r} cannot be used as an authentication key. "
+                    "Use your private 64-character Secret Account Key."
+                )
+            w = self.get_worker_by_key(cand)
+            if not w:
+                raise PermissionError("Authentication Error (C3/N3): Invalid or unregistered Secret Account Key")
+            if w.status == "SLASHED":
+                raise PermissionError(f"Worker {w.worker_id!r} is SLASHED and blacklisted")
+            return w
+
     def get_worker(self, worker_id: str) -> Optional[WorkerNodeRecord]:
         with self._lock:
             w = self._workers.get(worker_id)
@@ -511,8 +540,10 @@ class MasterHubCoordinator:
             last_ts = getattr(rec, "last_reward_time", None) or rec.last_heartbeat_reward_at or rec.registered_at or now
             elapsed = now - last_ts
             if elapsed >= interval_s:
-                intervals = int(elapsed // interval_s)
-                hw_multiplier = 2 if int(cores or 4) >= 16 else 1
+                # Cap intervals per single heartbeat ping to prevent offline clock-jump farming (N4 Fix)
+                intervals = min(2, max(1, int(elapsed // interval_s)))
+                capped_cores = min(64, max(1, int(cores or 4)))
+                hw_multiplier = 2 if capped_cores >= 16 else 1
                 earned = intervals * hw_multiplier
                 rec.credits += earned
                 rec.uptime_minutes_verified += int((intervals * interval_s) // 60)
@@ -676,7 +707,7 @@ class MasterHubCoordinator:
         if worker:
             worker.rejected_packets += 1
             self._flush()
-        return {"status": "REJECTED", "reason": reason,
+        return {"ok": False, "status": "REJECTED", "reason": reason,
                 "note": "Unattributable failures are rejected, never slashed."}
 
     def verify_and_settle(self, response: dict) -> dict:
@@ -722,15 +753,20 @@ class MasterHubCoordinator:
 
             if not is_valid_sig:
                 return self._reject(worker, "invalid_proof_signature")
+            if not isinstance(result, dict) or not result or result.get("status") == "ERROR":
+                return self._reject(worker, "empty_or_failed_task_result")
             self._pending.pop(task_id, None)  # proof is authentic -> task consumed (replay-safe)
 
-        verified = False
+        verified = bool(quantum_verified)
         if self.grid is not None and _spot_checkable(task["feature"], task["payload"]) \
                 and secrets.randbelow(10_000) < int(self.spot_check_rate * 10_000):
             expected = self.grid.registry.get(task["feature"]).handler(self.grid, sanitize_payload(task["payload"])[0])
             if _canonical(_comparable(expected)) != _canonical(_comparable(result)):
                 with self._lock:
                     return self._slash(worker, f"spot_check_mismatch on {task['feature']} (task {task_id})")
+            verified = True
+        elif isinstance(result, dict) and not isinstance(result.get("lora_gradients"), dict):
+            # Structural & cryptographic proof verification when deterministic spot-check handler is not attached
             verified = True
 
         # Problem #3 Defense: Cryptographic Proof-of-Neural-Work Cosine Similarity Spot-Check on LoRA Gradients
@@ -819,7 +855,7 @@ class MasterHubCoordinator:
         self._flush()
         block = self.ledger.append("worker_slashed", {"worker_id": worker.worker_id, "reason": reason,
                                                       "burned_credits": burned})
-        return {"status": "SLASHED", "worker_id": worker.worker_id, "reason": reason, "burned_credits": burned,
+        return {"ok": False, "status": "SLASHED", "worker_id": worker.worker_id, "reason": reason, "burned_credits": burned,
                 "remaining_credits": 0, "ledger_block": block["hash"][:16]}
 
     def slash_worker(self, worker_id: str, reason: str = "Provable misbehaviour or security violation") -> dict:
@@ -850,10 +886,16 @@ class MasterHubCoordinator:
                         "balance": worker.credits, "required": amount,
                         "error": (f"Insufficient credits (balance: {worker.credits}, required: {amount}). "
                                   f"Run worker node to execute network tasks and earn compute credits!")}
-            worker.credits -= amount
-            self._flush()
-            block = self.ledger.append("credits_spent", {
-                "worker_id": worker.worker_id, "amount": amount, "reason": reason, "remaining": worker.credits})
+            prev_bal = worker.credits
+            new_bal = prev_bal - amount
+            try:
+                worker.credits = new_bal
+                block = self.ledger.append("credits_spent", {
+                    "worker_id": worker.worker_id, "amount": amount, "reason": reason, "remaining": new_bal})
+                self._flush()
+            except Exception:
+                worker.credits = prev_bal
+                raise
             return {"status": "SPENT", "worker_id": worker.worker_id, "amount": amount,
                     "remaining_credits": worker.credits, "reason": reason,
                     "ledger_block": block["hash"][:16]}
@@ -866,19 +908,25 @@ class MasterHubCoordinator:
             if not worker:
                 worker = self.register_worker(worker_id, url="local", initial_credits=0)
             prev_credits = worker.credits
-            worker.credits += amount
-            if worker.status == "SLASHED" and reason == "owner_grant":
-                worker.status = "ACTIVE"
-            self._flush()
-            tier = "SOVEREIGN_VIP" if worker.credits >= 200 else ("PRO" if worker.credits >= 50 else "COMMUNITY")
-            block = self.ledger.append("owner_credits_granted", {
-                "worker_id": worker.worker_id,
-                "amount": amount,
-                "reason": reason,
-                "previous_balance": prev_credits,
-                "new_balance": worker.credits,
-                "tier": tier,
-            })
+            prev_status = worker.status
+            try:
+                worker.credits += amount
+                if worker.status == "SLASHED" and reason == "owner_grant":
+                    worker.status = "ACTIVE"
+                tier = "SOVEREIGN_VIP" if worker.credits >= 200 else ("PRO" if worker.credits >= 50 else "COMMUNITY")
+                block = self.ledger.append("owner_credits_granted", {
+                    "worker_id": worker.worker_id,
+                    "amount": amount,
+                    "reason": reason,
+                    "previous_balance": prev_credits,
+                    "new_balance": worker.credits,
+                    "tier": tier,
+                })
+                self._flush()
+            except Exception:
+                worker.credits = prev_credits
+                worker.status = prev_status
+                raise
             return {
                 "status": "GRANTED",
                 "worker_id": worker.worker_id,
@@ -913,12 +961,18 @@ class MasterHubCoordinator:
                 return {"ok": False, "status": "INSUFFICIENT_CREDITS", "worker_id": w_from.worker_id,
                         "balance": w_from.credits, "required": amount,
                         "error": f"Insufficient credits in {w_from.worker_id} (balance: {w_from.credits}, required: {amount})"}
-            w_from.credits -= amount
-            w_to.credits += amount
-            self._flush()
-            block = self.ledger.append("credits_transferred", {
-                "from_worker": w_from.worker_id, "to_worker": w_to.worker_id, "amount": amount,
-                "from_balance": w_from.credits, "to_balance": w_to.credits})
+            prev_from, prev_to = w_from.credits, w_to.credits
+            try:
+                w_from.credits -= amount
+                w_to.credits += amount
+                block = self.ledger.append("credits_transferred", {
+                    "from_worker": w_from.worker_id, "to_worker": w_to.worker_id, "amount": amount,
+                    "from_balance": w_from.credits, "to_balance": w_to.credits})
+                self._flush()
+            except Exception:
+                w_from.credits = prev_from
+                w_to.credits = prev_to
+                raise
             return {"ok": True, "status": "TRANSFERRED", "from_worker": w_from.worker_id, "to_worker": w_to.worker_id,
                     "amount": amount, "from_balance": w_from.credits, "to_balance": w_to.credits,
                     "ledger_block": block["hash"][:16]}

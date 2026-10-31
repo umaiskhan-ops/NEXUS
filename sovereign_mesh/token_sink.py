@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import hmac
 import json
+import os
 import secrets
 import threading
 import time
@@ -23,6 +25,7 @@ TICKET_PRICE_CREDITS = 5
 DEFAULT_TARGET_POOL_TICKETS = 10  # 10 tickets = 50 credits
 JACKPOT_WINNER_SHARE = 0.90       # 90% (45 credits) to lucky winner
 DEFLATIONARY_BURN_SHARE = 0.10    # 10% (5 credits) permanently burned forever!
+DEFAULT_STAKE_LOCK_SECONDS = 86400.0  # 24-hour lock window (H3 Fix)
 
 
 @dataclass
@@ -42,6 +45,8 @@ class StakingRecord:
     staked_amount: int
     staked_at: float = field(default_factory=time.time)
     tier: str = "BRONZE"  # BRONZE | SILVER | GOLD
+    locked_until: float = 0.0
+    last_lottery_round_used: int = 0
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -57,21 +62,25 @@ class TokenSinkManager:
         storage_path: Optional[Path] = None,
         ticket_price: int = TICKET_PRICE_CREDITS,
         target_pool_tickets: int = DEFAULT_TARGET_POOL_TICKETS,
+        min_stake_lock_seconds: float = DEFAULT_STAKE_LOCK_SECONDS,
     ):
         self.hub = hub
         self.ledger = ledger
         self._path = storage_path
         self.ticket_price = ticket_price
         self.target_pool_tickets = target_pool_tickets
+        self.min_stake_lock_seconds = float(min_stake_lock_seconds)
         self._lock = threading.RLock()
 
-        # Lottery State
+        # Lottery State & Commit-Reveal Beacon (H2 Fix)
         self.current_round: int = 1
         self.current_tickets: List[LotteryTicket] = []
         self.past_winners: List[dict] = []
         self.total_lottery_rounds_completed: int = 0
         self.total_deflationary_burned_credits: int = 0
         self.total_jackpot_credits_awarded: int = 0
+        self._round_seed_secret: str = secrets.token_hex(32)
+        self.round_seed_commit: str = hashlib.sha256(self._round_seed_secret.encode("utf-8")).hexdigest()
 
         # Staking State
         self._stakers: Dict[str, StakingRecord] = {}
@@ -91,8 +100,12 @@ class TokenSinkManager:
                 for t in data.get("current_tickets", []):
                     self.current_tickets.append(LotteryTicket(**t))
 
+                valid_staker_fields = {f.name for f in dataclasses.fields(StakingRecord)}
                 for wid, s in data.get("stakers", {}).items():
-                    self._stakers[wid] = StakingRecord(**s)
+                    self._stakers[wid] = StakingRecord(**{k: v for k, v in s.items() if k in valid_staker_fields})
+                if data.get("round_seed_secret"):
+                    self._round_seed_secret = str(data["round_seed_secret"])
+                    self.round_seed_commit = hashlib.sha256(self._round_seed_secret.encode("utf-8")).hexdigest()
             except Exception:
                 pass
 
@@ -104,6 +117,8 @@ class TokenSinkManager:
             tmp = self._path.with_suffix(".tmp")
             payload = {
                 "current_round": self.current_round,
+                "round_seed_commit": self.round_seed_commit,
+                "round_seed_secret": self._round_seed_secret,
                 "total_lottery_rounds_completed": self.total_lottery_rounds_completed,
                 "total_deflationary_burned_credits": self.total_deflationary_burned_credits,
                 "total_jackpot_credits_awarded": self.total_jackpot_credits_awarded,
@@ -111,7 +126,13 @@ class TokenSinkManager:
                 "current_tickets": [t.to_dict() for t in self.current_tickets],
                 "stakers": {wid: s.to_dict() for wid, s in self._stakers.items()},
             }
-            tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, indent=2, default=str))
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
             tmp.replace(self._path)
         except Exception:
             pass
@@ -154,7 +175,12 @@ class TokenSinkManager:
                 reason=f"lottery_tickets_round_{self.current_round}"
             )
 
-            # Generate tickets
+            # Generate tickets & lock staker position if staked in this round (H3 Fix)
+            staker_rec = self._stakers.get(worker.worker_id)
+            if staker_rec:
+                staker_rec.last_lottery_round_used = self.current_round
+                staker_rec.locked_until = max(staker_rec.locked_until, time.time() + max(60.0, self.min_stake_lock_seconds))
+
             new_ticket_ids = []
             for _ in range(count):
                 tid = f"ticket-{secrets.token_hex(4)}"
@@ -169,6 +195,7 @@ class TokenSinkManager:
             # Ledger record
             block = self.ledger.append("lottery_ticket_purchased", {
                 "round_number": self.current_round,
+                "round_seed_commit": self.round_seed_commit,
                 "worker_id": worker.worker_id,
                 "ticket_count": count,
                 "credits_spent": cost,
@@ -188,6 +215,7 @@ class TokenSinkManager:
                 "ok": True,
                 "status": "TICKETS_PURCHASED",
                 "round_number": self.current_round,
+                "round_seed_commit": self.round_seed_commit,
                 "worker_id": worker.worker_id,
                 "tickets_bought": count,
                 "cost_credits": cost,
@@ -200,11 +228,30 @@ class TokenSinkManager:
                 "draw_result": draw_info,
             }
 
+    @staticmethod
+    def verify_draw_proof(draw_entry: dict) -> bool:
+        """Publicly verifies the Commit-Reveal lottery beacon (H2 Fix)."""
+        try:
+            revealed_seed = str(draw_entry["revealed_seed"])
+            seed_commit = str(draw_entry["seed_commit"])
+            if hashlib.sha256(revealed_seed.encode("utf-8")).hexdigest() != seed_commit:
+                return False
+            raw_entropy = f"{draw_entry['round_number']}:{draw_entry['tail_hash']}:{draw_entry['total_tickets']}:{revealed_seed}"
+            expected_beacon = hashlib.sha256(raw_entropy.encode("utf-8")).hexdigest()
+            return hmac.compare_digest(expected_beacon, str(draw_entry["beacon_hash"]))
+        except Exception:
+            return False
+
     def draw_lottery_winner(self, force: bool = False) -> dict:
-        """Selects 1 lucky winner via Verifiable Random Beacon, awards 90% (45 cr) and permanently burns 10% (5 cr)."""
+        """Selects 1 lucky winner via Commit-Reveal Verifiable Random Beacon, awards 90% and permanently burns 10%."""
         with self._lock:
             if not self.current_tickets:
                 return {"ok": False, "error": "No tickets in the current lottery pool"}
+            if len(self.current_tickets) < self.target_pool_tickets and not force:
+                return {
+                    "ok": False,
+                    "error": f"Lottery pool requires {self.target_pool_tickets} tickets for automatic draw (currently {len(self.current_tickets)})",
+                }
             if len(self.current_tickets) < 2 and not force:
                 return {"ok": False, "error": "Need at least 2 tickets in the pool to trigger lottery draw"}
 
@@ -212,20 +259,26 @@ class TokenSinkManager:
             jackpot_amount = int(round(total_pot * JACKPOT_WINNER_SHARE))
             burn_amount = total_pot - jackpot_amount
 
-            # Verifiable Random Consensus Beacon (Tamper-proof Cryptographic Seed)
+            # Commit-Reveal Verifiable Random Consensus Beacon (H2 Fix: deterministic & publicly verifiable)
             ledger_tail = self.ledger.tail(1)
             tail_hash = ledger_tail[0]["hash"] if ledger_tail else "genesis_seed"
-            raw_entropy = f"{self.current_round}:{tail_hash}:{len(self.current_tickets)}:{time.time()}:{secrets.token_hex(16)}"
+            total_tickets_count = len(self.current_tickets)
+            revealed_seed = self._round_seed_secret
+            seed_commit = self.round_seed_commit
+            raw_entropy = f"{self.current_round}:{tail_hash}:{total_tickets_count}:{revealed_seed}"
             beacon_hash = hashlib.sha256(raw_entropy.encode("utf-8")).hexdigest()
 
-            # Account for staker luck multipliers if staker bought tickets
-            # Stakers with GOLD tier get slightly enhanced winning weight
+            # Account for staker luck multipliers if staker bought tickets AND stake has matured >= min_stake_lock_seconds (H3 Fix)
+            now = time.time()
             ticket_pool = []
             for t in self.current_tickets:
                 ticket_pool.append(t)
                 staker_rec = self._stakers.get(t.worker_id)
-                if staker_rec and staker_rec.tier == "GOLD":
-                    ticket_pool.append(t)  # Extra winning weight for Gold Stakers
+                if staker_rec:
+                    staker_rec.last_lottery_round_used = self.current_round
+                    staker_rec.locked_until = max(staker_rec.locked_until, now + max(60.0, self.min_stake_lock_seconds))
+                    if staker_rec.tier == "GOLD" and (now - staker_rec.staked_at) >= self.min_stake_lock_seconds:
+                        ticket_pool.append(t)  # Extra winning weight only for matured Gold Stakers
 
             winning_index = int(beacon_hash[:8], 16) % len(ticket_pool)
             winning_ticket = ticket_pool[winning_index]
@@ -251,9 +304,12 @@ class TokenSinkManager:
                 "jackpot_amount": jackpot_amount,
                 "deflationary_burned_amount": burn_amount,
                 "total_pot": total_pot,
-                "beacon_hash": beacon_hash[:24],
+                "beacon_hash": beacon_hash,
+                "seed_commit": seed_commit,
+                "revealed_seed": revealed_seed,
+                "tail_hash": tail_hash,
                 "participants_count": len(set(t.worker_id for t in self.current_tickets)),
-                "total_tickets": len(self.current_tickets),
+                "total_tickets": total_tickets_count,
             })
 
             result_entry = {
@@ -263,16 +319,22 @@ class TokenSinkManager:
                 "jackpot_credits": jackpot_amount,
                 "burned_credits": burn_amount,
                 "total_pot_credits": total_pot,
+                "total_tickets": total_tickets_count,
                 "winner_new_balance": grant_res.get("new_balance"),
                 "beacon_hash": beacon_hash,
-                "drawn_at": time.time(),
+                "seed_commit": seed_commit,
+                "revealed_seed": revealed_seed,
+                "tail_hash": tail_hash,
+                "drawn_at": now,
                 "ledger_block": block_jackpot["hash"][:16],
             }
             self.past_winners.append(result_entry)
 
-            # Advance to next round
+            # Advance to next round and generate new Commit-Reveal seed
             self.current_round += 1
             self.current_tickets = []
+            self._round_seed_secret = secrets.token_hex(32)
+            self.round_seed_commit = hashlib.sha256(self._round_seed_secret.encode("utf-8")).hexdigest()
             self._flush()
 
             return {
@@ -290,6 +352,7 @@ class TokenSinkManager:
                 "currency_symbol": "UMAIS",
                 "credit_to_umais_parity": "1 Credit = 1 UMAIS",
                 "current_round": self.current_round,
+                "round_seed_commit": self.round_seed_commit,
                 "ticket_price_credits": self.ticket_price,
                 "ticket_price_umais": self.ticket_price,
                 "current_pool_credits": pool_val,
@@ -342,12 +405,16 @@ class TokenSinkManager:
             current_rec = self._stakers.get(worker.worker_id)
             new_amount = (current_rec.staked_amount if current_rec else 0) + amount
 
+            now = time.time()
+            has_active_tickets = any(t.worker_id == worker.worker_id for t in self.current_tickets)
             tier = "GOLD" if new_amount >= 150 else ("SILVER" if new_amount >= 50 else "BRONZE")
             self._stakers[worker.worker_id] = StakingRecord(
                 worker_id=worker.worker_id,
                 staked_amount=new_amount,
                 tier=tier,
-                staked_at=time.time(),
+                staked_at=now,
+                locked_until=now + self.min_stake_lock_seconds,
+                last_lottery_round_used=self.current_round if has_active_tickets else (current_rec.last_lottery_round_used if current_rec else 0),
             )
             self._flush()
 
@@ -356,12 +423,13 @@ class TokenSinkManager:
                 "amount_staked": amount,
                 "total_staked": new_amount,
                 "tier": tier,
+                "locked_until": now + self.min_stake_lock_seconds,
             })
 
             perks = {
                 "BRONZE": "+5% Compute Task Yield Bonus",
                 "SILVER": "+10% Compute Task Yield + Priority Supercomputer Task Dispatch",
-                "GOLD": "+20% Compute Task Yield + 2x Lottery Luck Odds + Gold Sovereign Badge",
+                "GOLD": "+20% Compute Task Yield + 2x Lottery Luck Odds (after 24h maturity) + Gold Sovereign Badge",
             }
 
             return {
@@ -372,11 +440,12 @@ class TokenSinkManager:
                 "total_staked": new_amount,
                 "remaining_credits": spent["remaining_credits"],
                 "tier": tier,
+                "locked_until": now + self.min_stake_lock_seconds,
                 "perks": perks[tier],
                 "ledger_block": block["hash"][:16],
             }
 
-    def unstake_credits(self, worker_id_or_key: str, amount: int) -> dict:
+    def unstake_credits(self, worker_id_or_key: str, amount: int, enforce_lock: bool = False) -> dict:
         amount = int(amount or 0)
         if amount <= 0:
             return {"ok": False, "error": "Unstake amount must be positive"}
@@ -399,6 +468,26 @@ class TokenSinkManager:
             if not rec or rec.staked_amount < amount:
                 curr = rec.staked_amount if rec else 0
                 return {"ok": False, "error": f"Insufficient staked balance (Staked: {curr}, Requested: {amount})"}
+
+            # H3 Anti-Flash-Stake Lock Enforcement:
+            # Block unstaking if caller has active lottery tickets in the current round, participated in a lottery draw
+            # during their lock window, or when enforce_lock=True (HTTP API) and lock period has not elapsed.
+            now = time.time()
+            has_active_round_tickets = any(t.worker_id == worker.worker_id for t in self.current_tickets)
+            if has_active_round_tickets or rec.last_lottery_round_used > 0 or enforce_lock:
+                effective_lock_until = rec.locked_until or (rec.staked_at + self.min_stake_lock_seconds)
+                if now < effective_lock_until:
+                    rem_s = int(max(1.0, effective_lock_until - now))
+                    return {
+                        "ok": False,
+                        "stake_locked": True,
+                        "locked_until": effective_lock_until,
+                        "remaining_lock_seconds": rem_s,
+                        "error": (
+                            f"Staking Lock Active (H3 Anti-Flash-Stake Guard): Cannot unstake for {rem_s}s "
+                            f"(locked until lottery/vault maturity period completes)."
+                        ),
+                    }
 
             rec.staked_amount -= amount
             if rec.staked_amount == 0:

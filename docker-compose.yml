@@ -3,11 +3,11 @@ version: "3.8"
 services:
   # Local Open-Source Swarm Execution Engine (Ollama Backend)
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.5.7
     container_name: sovereign-mesh-ollama
     restart: unless-stopped
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ollama_models:/root/.ollama
     environment:
@@ -31,7 +31,7 @@ services:
     depends_on:
       - ollama
     ports:
-      - "8443:8443"
+      - "127.0.0.1:8443:8443"
     environment:
       - HOST=0.0.0.0
       - PORT=8443
@@ -40,7 +40,7 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_WEBHOOK_SECRET=${TELEGRAM_WEBHOOK_SECRET:-}
       - PUBLIC_WEBHOOK_URL=${PUBLIC_WEBHOOK_URL:-}
-      - DASHBOARD_TOKEN=${DASHBOARD_TOKEN:-}
+      - DASHBOARD_TOKEN=${DASHBOARD_TOKEN:?DASHBOARD_TOKEN must be set for container deployment}
       - PEER_SHARED_SECRET=${PEER_SHARED_SECRET:-}
       - OLLAMA_URL=http://ollama:11434
       - ENABLE_CODE_EXECUTION=false

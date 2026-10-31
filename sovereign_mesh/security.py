@@ -14,12 +14,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------- passphrase KDF
 # Format uses ':' separators so the hash is safe inside docker-compose env files ('$' is interpolated).
-_SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 14, 8, 1
+# Upgraded to N=2^15 (32768), r=8, p=1 per OWASP scrypt recommendation (L7 Fix).
+_SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 15, 8, 1
+_SCRYPT_MAXMEM = 64 * 1024 * 1024
 
 
 def hash_passphrase(phrase: str) -> str:
     salt = os.urandom(16)
-    dk = hashlib.scrypt(phrase.encode("utf-8"), salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=64)
+    dk = hashlib.scrypt(
+        phrase.encode("utf-8"), salt=salt,
+        n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, maxmem=_SCRYPT_MAXMEM, dklen=64,
+    )
     return f"scrypt:{_SCRYPT_N}:{_SCRYPT_R}:{_SCRYPT_P}:{salt.hex()}:{dk.hex()}"
 
 
@@ -30,7 +35,7 @@ def verify_passphrase(phrase: str, stored: str) -> bool:
             return False
         dk = hashlib.scrypt(
             phrase.encode("utf-8"), salt=bytes.fromhex(salt_hex),
-            n=int(n), r=int(r), p=int(p), dklen=len(dk_hex) // 2,
+            n=int(n), r=int(r), p=int(p), maxmem=_SCRYPT_MAXMEM, dklen=len(dk_hex) // 2,
         )
         return hmac.compare_digest(dk.hex(), dk_hex)
     except (ValueError, TypeError, AttributeError, OverflowError):
@@ -38,7 +43,7 @@ def verify_passphrase(phrase: str, stored: str) -> bool:
 
 
 class AuthGuard:
-    """Constant-time passphrase verification with brute-force lockout."""
+    """Constant-time passphrase verification with per-actor/IP brute-force lockout (M1 Fix)."""
 
     def __init__(self, stored_hash: str, max_failures: int = 5, lockout_s: float = 900.0):
         self._hash = stored_hash
@@ -46,22 +51,44 @@ class AuthGuard:
         self._lockout_s = lockout_s
         self._failures = 0
         self._locked_until = 0.0
+        self._actor_state: Dict[str, Tuple[int, float]] = {}
         self._lock = threading.Lock()
 
-    def verify(self, phrase: Optional[str]) -> Tuple[bool, str]:
+    def verify(self, phrase: Optional[str], actor_id: str = "default") -> Tuple[bool, str]:
+        actor_key = str(actor_id or "default")[:128]
+        now = time.monotonic()
         with self._lock:
-            if time.monotonic() < self._locked_until:
+            failures, locked_until = self._actor_state.get(actor_key, (0, 0.0))
+            if actor_key == "default":
+                locked_until = max(locked_until, self._locked_until)
+            if now < locked_until:
                 return False, "AUTH_LOCKED"
         ok = bool(phrase) and verify_passphrase(phrase or "", self._hash)
         with self._lock:
+            now = time.monotonic()
+            failures, locked_until = self._actor_state.get(actor_key, (0, 0.0))
             if ok:
-                self._failures = 0
+                self._actor_state.pop(actor_key, None)
+                if actor_key == "default":
+                    self._failures = 0
+                    self._locked_until = 0.0
                 return True, "OK"
-            self._failures += 1
-            if self._failures >= self._max:
-                self._failures = 0
-                self._locked_until = time.monotonic() + self._lockout_s
+            failures += 1
+            if actor_key == "default":
+                self._failures = failures
+            if failures >= self._max:
+                lock_deadline = now + self._lockout_s
+                self._actor_state[actor_key] = (0, lock_deadline)
+                if actor_key == "default":
+                    self._failures = 0
+                    self._locked_until = lock_deadline
                 return False, "AUTH_LOCKED"
+            self._actor_state[actor_key] = (failures, locked_until)
+            if len(self._actor_state) > 4096:
+                # Evict expired entries to bound memory
+                expired = [k for k, (_, lu) in self._actor_state.items() if lu and now >= lu]
+                for k in expired[:1024]:
+                    self._actor_state.pop(k, None)
             return False, "INVALID"
 
 
@@ -112,12 +139,15 @@ class EncryptionLayer:
 
 
 # ---------------------------------------------------------------- input sanitization
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
+_DELIMITER_STRIP = re.compile(r"(?:<\|im_start\|>\s*(?:system|user|assistant)?|<\|im_end\|>|<\|system\|>|\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>)", re.IGNORECASE)
 _INJECTION_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
-    r"ignore\s+(all\s+|any\s+|the\s+)?(previous|prior|above)\s+instructions",
-    r"disregard\s+(the\s+)?(system|previous)\s+(prompt|instructions)",
-    r"reveal\s+(your|the)\s+(system\s+prompt|passphrase|secret|token)",
-    r"begin\s+(system|admin)\s+prompt",
+    r"(?:ignore|disregard|forget|override|bypass)\s+(?:all\s+|any\s+|the\s+|your\s+)?(?:previous|prior|above|system|safety|constitutional)\s+(?:instructions|prompts|rules|directives|constraints)",
+    r"(?:reveal|print|show|dump|output|leak|repeat)\s+(?:your|the)\s+(?:system\s+prompt|passphrase|secret|token|api\s*key|private\s*key|credentials|hidden\s+instructions)",
+    r"(?:begin|start|enter)\s+(?:system|admin|developer|god|unrestricted|jailbreak)\s+(?:prompt|mode|override)",
+    r"(?:you\s+are\s+now\s+in\s+|enable\s+|activate\s+)(?:developer\s+mode|dan\s+mode|do\s+anything\s+now|jailbreak\s+mode|unfiltered\s+mode)",
+    r"(?:<\|im_start\|>\s*system|<\|system\|>|\[INST\]\s*<<SYS>>|###\s*System\s*(?:Prompt|Instruction)\s*:)",
+    r"(?:base64\.b64decode|bytes\.fromhex)\s*\(.*(?:eval|exec|os\.system|subprocess)",
 )]
 MAX_TEXT_LEN = 16_000
 MAX_DEPTH = 6
@@ -131,8 +161,9 @@ def sanitize_text(text: str) -> Tuple[str, List[str]]:
     if len(clean) > MAX_TEXT_LEN:
         clean = clean[:MAX_TEXT_LEN]
         flags.append("truncated")
-    if any(p.search(clean) for p in _INJECTION_PATTERNS):
+    if any(p.search(clean) for p in _INJECTION_PATTERNS) or _DELIMITER_STRIP.search(clean):
         flags.append("prompt_injection_suspected")
+        clean = _DELIMITER_STRIP.sub("", clean)
     return clean, flags
 
 

@@ -543,7 +543,7 @@ class TestP2PMarketplace(unittest.TestCase):
         queued_pkt = self.hub.enqueue_nat_task(
             "worker-behind-nat",
             "brain_inference",
-            {"prompt": "Synthesize distributed consensus proof"},
+            {"prompt": "Implement distributed Byzantine-fault-tolerant FedAvg consensus"},
         )
         pulled = self.hub.pull_pending_tasks("worker-behind-nat", max_tasks=5)
         self.assertEqual(len(pulled), 1)
@@ -554,7 +554,7 @@ class TestP2PMarketplace(unittest.TestCase):
             "status": "OK",
             "inferred_by_worker": "worker-behind-nat",
             "lora_gradients": {
-                "domain_shard": nat_worker.brain_shard,
+                "domain_shard": "CODE_DEBUG_EXEC",
                 "delta_A": bp["delta_A"],
                 "delta_B": bp["delta_B"],
                 "initial_loss": bp["initial_loss"],

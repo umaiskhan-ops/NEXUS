@@ -367,15 +367,24 @@ class UltimateAgiSovereignGrid:
         self.ledger.append("disaster_recovery_restore", {"backup": name})
         return {"backup": name, "ledger_blocks": len(self.ledger)}
 
-    def peer_signature(self, timestamp: str) -> str:
-        return hmac.new(self.config.peer_shared_secret.encode(), timestamp.encode(), hashlib.sha256).hexdigest()
+    def peer_signature(self, timestamp: str, path: str = "", nonce: str = "") -> str:
+        msg = timestamp if not path else (f"{timestamp}:{path}:{nonce}" if nonce else f"{timestamp}:{path}")
+        return hmac.new(self.config.peer_shared_secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def peer_status(self, timeout: float = 3.0) -> List[dict]:
         out = []
         for peer in self.config.peers:
             ts = str(int(time.time()))
-            req = urllib.request.Request(peer["url"].rstrip("/") + "/p2p/head",
-                                         headers={"X-Peer-Timestamp": ts, "X-Peer-Signature": self.peer_signature(ts)})
+            nonce = secrets.token_hex(8)
+            path = "/p2p/head"
+            req = urllib.request.Request(
+                peer["url"].rstrip("/") + path,
+                headers={
+                    "X-Peer-Timestamp": ts,
+                    "X-Peer-Nonce": nonce,
+                    "X-Peer-Signature": self.peer_signature(ts, path=path, nonce=nonce),
+                },
+            )
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     out.append({"peer": peer.get("name", peer["url"]), "reachable": True, **json.loads(resp.read())})

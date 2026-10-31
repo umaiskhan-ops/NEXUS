@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import hmac
 import json
+import os
 import secrets
 import threading
 import time
@@ -118,14 +119,30 @@ class SupercomputerEngine:
     """Manages virtual server cluster provisioning, continuous billing, pause/resume, and elastic mesh pooling."""
 
     def __init__(self, hub: Any, ledger: HashChainLedger, storage_path: Optional[Path] = None,
-                 min_credits_threshold: int = MIN_CREDITS_FOR_SERVER_RENTAL):
+                 min_credits_threshold: int = MIN_CREDITS_FOR_SERVER_RENTAL,
+                 enable_code_execution: Optional[bool] = None):
         self.hub = hub
         self.ledger = ledger
         self._path = storage_path
         self.min_credits_threshold = min_credits_threshold
+        self._enable_code_execution = enable_code_execution
         self._instances: Dict[str, VirtualServerInstance] = {}
         self._lock = threading.RLock()
         self._load()
+
+    def _code_execution_enabled(self) -> bool:
+        """Respects ENABLE_CODE_EXECUTION and GridConfig.enable_code_execution (N2 Fix)."""
+        if self._enable_code_execution is not None:
+            return bool(self._enable_code_execution)
+        env_flag = os.environ.get("ENABLE_CODE_EXECUTION", "").strip().lower()
+        if env_flag in {"0", "false", "no", "off"}:
+            return False
+        if env_flag in {"1", "true", "yes", "on"}:
+            return True
+        grid = getattr(self.hub, "_grid", None)
+        if grid is not None and hasattr(grid, "config"):
+            return bool(getattr(grid.config, "enable_code_execution", False))
+        return True
 
     def _load(self) -> None:
         if self._path and self._path.exists():
@@ -152,7 +169,13 @@ class SupercomputerEngine:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         data = [i.to_dict(include_secret=True) for i in self._instances.values()]
-        tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2, default=str))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
         tmp.replace(self._path)
 
     def _resolve_wid(self, id_or_key: str) -> str:
@@ -277,11 +300,10 @@ class SupercomputerEngine:
         with self._lock:
             worker = self.hub.get_worker(user_account_key) if hasattr(self.hub, "get_worker") else None
             if not worker:
-                new_wid = f"worker-{secrets.token_hex(3)}"
-                worker = self.hub.register_worker(new_wid, url="local")
-                worker.key = user_account_key
-                if hasattr(self.hub, "_flush"):
-                    self.hub._flush()
+                return {
+                    "ok": False,
+                    "error": f"Account '{user_account_key}' is not registered on the Hub (N3 Security Enforcement).",
+                }
             canonical_owner = worker.worker_id
 
             if worker.status == "SLASHED":
@@ -617,11 +639,24 @@ class SupercomputerEngine:
             inst.last_job_at = time.time()
             t0 = time.perf_counter()
 
-            # Execute real payload code in sandbox if provided
+            # Execute real payload code in sandbox if provided (N2 Fix: strictly respect _code_execution_enabled)
             exec_output = ""
             if payload_code and payload_code.strip() and not payload_code.strip().startswith("# Parallel compute payload"):
-                from .sandbox import run_python
-                run_res = run_python(payload_code, enabled=True, timeout=20.0)
+                from .sandbox import run_python, security_scan
+                scan = security_scan(payload_code)
+                if not scan["safe"]:
+                    inst.status = "ONLINE"
+                    slashed_info = {}
+                    if hasattr(self.hub, "slash_worker") and inst.user_account_key:
+                        slashed_info = self.hub.slash_worker(inst.user_account_key, f"Malicious code execution attempt: {scan['reason']}")
+                    return {
+                        "ok": False,
+                        "security_blocked": True,
+                        "slashed": True,
+                        "error": f"Security Sandbox Exception: {scan['reason']}",
+                        "slashing_report": slashed_info,
+                    }
+                run_res = run_python(payload_code, enabled=self._code_execution_enabled(), timeout=20.0)
                 if run_res.get("security_blocked"):
                     inst.status = "ONLINE"
                     slashed_info = {}
@@ -642,34 +677,34 @@ class SupercomputerEngine:
                         "infinite_loop_caught": True,
                         "error": run_res.get("error"),
                     }
-                exec_output = run_res.get("stdout", "") or run_res.get("stderr", "")
+                exec_output = run_res.get("stdout", "") or run_res.get("stderr", "") or run_res.get("error", "")
 
-            # Reward active pooled workers
-            task_reward = 25
-            if hasattr(self.hub, "halving_epoch_info"):
-                task_reward = int(self.hub.halving_epoch_info().get("active_task_reward_credits", 25))
+            # N1 Fix: Never mint credits out of thin air via direct '+=' during job dispatch!
+            # Enqueue signed tasks to active remote/NAT workers; rewards are only minted upon verified proof settlement.
             node_results = []
-            rewarded_workers = 0
             for i, nid in enumerate(active_nodes_slice):
-                credits_awarded = 0
                 w_node = self.hub.get_worker(nid) if hasattr(self.hub, "get_worker") else None
+                dispatched_task_id = None
                 if w_node and w_node.status == "ACTIVE" and w_node.worker_id not in {inst.user_account_key, "owner-master"}:
-                    w_node.credits += task_reward
-                    w_node.tasks_completed += 1
-                    w_node.tasks_verified += 1
-                    w_node.epoch_tasks_verified += 1
-                    credits_awarded = task_reward
-                    rewarded_workers += 1
+                    if hasattr(self.hub, "enqueue_nat_task"):
+                        try:
+                            pkt = self.hub.enqueue_nat_task(
+                                w_node.worker_id,
+                                "brain_inference",
+                                {"prompt": job_name or "Cluster Slice Compute", "instance_id": inst.instance_id, "slice": i + 1},
+                            )
+                            dispatched_task_id = pkt.get("task_id")
+                        except Exception:
+                            pass
                 node_results.append({
                     "node_id": nid,
                     "slice_index": i + 1,
                     "status": "COMPLETED",
+                    "task_id": dispatched_task_id,
                     "tflops_utilized": round((inst.allocated_tflops * elastic_ratio) / max(1, len(active_nodes_slice)), 2),
                     "memory_slice_mb": int((elastic_ram * 1024) / max(1, len(active_nodes_slice))),
-                    "worker_credits_awarded": credits_awarded,
+                    "worker_credits_awarded": 0,
                 })
-            if rewarded_workers > 0 and hasattr(self.hub, "_flush"):
-                self.hub._flush()
 
             elapsed = round((time.perf_counter() - t0) * 1000 + 42.5, 2)
             inst.status = "ONLINE"

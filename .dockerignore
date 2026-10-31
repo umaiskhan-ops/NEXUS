@@ -1,0 +1,20 @@
+# Exclude secrets, local runtime state, git history, and caches from Docker image layers (C5 Fix)
+.git
+.gitignore
+.env
+.env.*
+*.key
+*.pem
+data/
+worker_config.json
+owner_account.json
+public_tunnel_active.json
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+tests/
+docs/
+*.md

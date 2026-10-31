@@ -247,7 +247,13 @@ class DistillationCache:
                 "api_calls_saved": self.api_calls_saved,
                 "entries": list(self._entries.values()),
             }
-            tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, indent=2, default=str))
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
             tmp.replace(self._path)
         except Exception:
             pass
@@ -256,29 +262,49 @@ class DistillationCache:
     def _normalize(text: str) -> str:
         return " ".join(re.findall(r"[a-z0-9_]+", (text or "").lower()))
 
+    _NEGATION_WORDS = {"not", "no", "never", "without", "none", "neither", "nor", "dont", "cannot", "cant", "won", "wont", "disable", "block", "forbid", "prohibit"}
+
     @classmethod
     def _tokens(cls, text: str) -> set:
         stop = {"the", "a", "an", "to", "for", "of", "in", "on", "and", "or", "with", "please", "write", "use", "using"}
-        return {t for t in cls._normalize(text).split() if len(t) > 2 and t not in stop}
+        return {
+            t for t in cls._normalize(text).split()
+            if (len(t) > 2 or t in cls._NEGATION_WORDS) and t not in stop
+        }
 
     @classmethod
-    def _hash_prompt(cls, prompt: str) -> str:
-        return hashlib.sha256(cls._normalize(prompt).encode("utf-8")).hexdigest()[:24]
+    def _negation_signature(cls, text: str) -> frozenset:
+        return frozenset(t for t in cls._normalize(text).split() if t in cls._NEGATION_WORDS)
 
-    def find_similar(self, prompt: str, threshold: float = 0.60) -> Optional[dict]:
+    @classmethod
+    def _hash_prompt(cls, prompt: str, namespace: str = "global") -> str:
+        ns = (namespace or "global").strip()
+        raw = cls._normalize(prompt) if ns == "global" else f"{ns}:{cls._normalize(prompt)}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+    def find_similar(self, prompt: str, threshold: float = 0.60, namespace: str = "global") -> Optional[dict]:
         if not prompt:
             return None
+        ns = (namespace or "global").strip()
         with self._lock:
-            phash = self._hash_prompt(prompt)
+            phash = self._hash_prompt(prompt, namespace=ns)
             if phash in self._entries:
                 return dict(self._entries[phash])
             q_tokens = self._tokens(prompt)
             if not q_tokens:
                 return None
+            q_neg = self._negation_signature(prompt)
             best_entry = None
             best_score = 0.0
             for entry in self._entries.values():
-                e_tokens = set(entry.get("tokens") or self._tokens(entry.get("prompt", "")))
+                entry_ns = entry.get("namespace", "global")
+                if entry_ns != ns:
+                    continue
+                entry_prompt = entry.get("prompt", "")
+                # N5 Fix: Never match prompts with opposite negation polarity ("allow" vs "do not allow")
+                if self._negation_signature(entry_prompt) != q_neg:
+                    continue
+                e_tokens = set(entry.get("tokens") or self._tokens(entry_prompt))
                 if not e_tokens:
                     continue
                 inter = len(q_tokens & e_tokens)
@@ -294,9 +320,10 @@ class DistillationCache:
             return None
 
     def record(self, prompt: str, response_text: str, cot_reasoning: str = "",
-               source_tier: str = "Frontier-CoT-Distiller") -> dict:
+               source_tier: str = "Frontier-CoT-Distiller", namespace: str = "global") -> dict:
+        ns = (namespace or "global").strip()
         with self._lock:
-            phash = self._hash_prompt(prompt)
+            phash = self._hash_prompt(prompt, namespace=ns)
             tokens = sorted(self._tokens(prompt))
             if not cot_reasoning:
                 cot_reasoning = (
@@ -306,6 +333,7 @@ class DistillationCache:
                 )
             entry = {
                 "prompt_hash": phash,
+                "namespace": ns,
                 "prompt": prompt[:2000],
                 "tokens": tokens,
                 "cot_reasoning": cot_reasoning[:3000],

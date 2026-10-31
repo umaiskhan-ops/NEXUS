@@ -226,8 +226,9 @@ def _rollback(grid, p):
 def _testing_sandbox(grid, p):
     if not grid.config.enable_code_execution:
         return {"status": "DISABLED", "hint": "set ENABLE_CODE_EXECUTION=true"}
+    import sys
     root = Path(__file__).resolve().parents[2]
-    proc = subprocess.run([os.sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+    proc = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
                           cwd=root, capture_output=True, text=True, timeout=300)
     return {"status": "PASS" if proc.returncode == 0 else "FAIL", "output": (proc.stdout + proc.stderr)[-4000:]}
 

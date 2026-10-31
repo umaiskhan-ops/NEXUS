@@ -91,6 +91,13 @@ class NativeSandboxEngine:
 
     def validate_path(self, target_path: Path | str) -> Path:
         """Ensures the target file path stays strictly inside the sandbox workspace or base directory."""
+        raw_str = str(target_path or "")
+        # Cross-platform guard (L5/C6): reject Windows drive paths and backslash traversals even on Linux/POSIX
+        if re.match(r"^[a-zA-Z]:[\\/]", raw_str):
+            if not os.path.normcase(raw_str).startswith(os.path.normcase(str(self.base_dir))):
+                raise SandboxSecurityViolation(f"External drive/host path blocked outside sandbox jail: {target_path}")
+        if "..\\" in raw_str or "../" in raw_str or raw_str.startswith("\\\\"):
+            raise SandboxSecurityViolation(f"Path traversal sequence blocked outside sandbox jail: {target_path}")
         p = Path(target_path)
         resolved = (self.base_dir / p).resolve() if not p.is_absolute() else p.resolve()
         try:
@@ -394,6 +401,13 @@ class NativeSandboxEngine:
         return any(d in raw_text for d in self.DANGEROUS_TOKENS)
 
     def validate_path(self, target_path: Path | str) -> Path:
+        import re
+        raw_str = str(target_path or "")
+        if re.match(r"^[a-zA-Z]:[\\\\/]", raw_str):
+            if not os.path.normcase(raw_str).startswith(os.path.normcase(str(self.base_dir))):
+                raise SandboxSecurityViolation(f"External drive/host path blocked outside sandbox jail: {{target_path}}")
+        if "..\\\\" in raw_str or "../" in raw_str or raw_str.startswith("\\\\\\\\"):
+            raise SandboxSecurityViolation(f"Path traversal sequence blocked outside sandbox jail: {{target_path}}")
         p = Path(target_path)
         resolved = (self.base_dir / p).resolve() if not p.is_absolute() else p.resolve()
         try:
@@ -634,7 +648,7 @@ class WorkerState:
             except Exception:
                 pass
         if not self.worker_id:
-            self.worker_id = f"worker-{{secrets.token_hex(3)}}"
+            self.worker_id = f"worker-{{secrets.token_hex(8)}}"
         if not self.worker_key or self.worker_key == self.worker_id:
             self.worker_key = secrets.token_hex(32)
         if not self.referral_code:
@@ -749,7 +763,7 @@ class WorkerState:
         print(f"[*] Continuing in Standalone Node mode (Public Worker ID: {{self.worker_id}})")
         return bool(self.worker_key)
 
-    def trigger_ota_update(self, target_version: str, target_sha256: str = ""):
+    def trigger_ota_update(self, target_version: str, target_sha256: str = "", ota_signature: str = ""):
         if self.updating:
             return
         self.updating = True
@@ -760,17 +774,27 @@ class WorkerState:
         print(f"[*] [OTA] Fetching signed Over-The-Air update payload from Hub...")
         print(f"[*] ========================================================")
         try:
-            download_url = f"{{self.hub_url.rstrip('/')}}/api/worker/ota_download"
+            hub_base = self.hub_url.rstrip("/")
+            is_loopback = any(h in hub_base for h in ("127.0.0.1", "localhost", "[::1]"))
+            if not is_loopback and not hub_base.startswith("https://") and os.environ.get("NEXUS_ALLOW_HTTP_OTA") != "1":
+                print("[!] [OTA] Security Policy (C4): Remote OTA updates require HTTPS. Aborting update.")
+                self.updating = False
+                self.ota_status = "HTTPS_REQUIRED_BLOCKED"
+                return
+
+            download_url = f"{{hub_base}}/api/worker/ota_download?worker_id={{urllib.parse.quote(self.worker_id)}}"
             req = urllib.request.Request(download_url, headers={{"User-Agent": f"NexusWorker/{{self.version}}"}})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 raw_data = resp.read()
                 code_to_write = ""
-                expected_hash = target_sha256
+                expected_hash = target_sha256 or resp.headers.get("X-Script-Sha256", "")
+                received_sig = ota_signature or resp.headers.get("X-OTA-Signature", "")
                 try:
                     j = json.loads(raw_data.decode("utf-8"))
                     if j.get("ok") and j.get("code"):
                         code_to_write = j["code"]
                         expected_hash = j.get("sha256") or expected_hash
+                        received_sig = j.get("ota_signature") or received_sig
                 except Exception:
                     code_to_write = raw_data.decode("utf-8")
 
@@ -780,13 +804,31 @@ class WorkerState:
                     self.ota_status = "UPDATE_ABORTED"
                     return
 
+                # Mandatory SHA-256 verification (C4 Fix: hash check is NEVER optional)
                 code_bytes = code_to_write.encode("utf-8")
                 calc_sha256 = hashlib.sha256(code_bytes).hexdigest()
-                if expected_hash and calc_sha256 != expected_hash:
-                    print(f"[!] [OTA] Cryptographic integrity check failed! Expected {{expected_hash[:16]}}, got {{calc_sha256[:16]}}.")
+                if not expected_hash or not hmac.compare_digest(calc_sha256, expected_hash):
+                    print(f"[!] [OTA] Mandatory SHA-256 check failed! Expected {{expected_hash[:16] if expected_hash else 'NONE'}}, got {{calc_sha256[:16]}}.")
                     self.updating = False
                     self.ota_status = "INTEGRITY_MISMATCH"
                     return
+
+                # Mandatory Cryptographic Signature check when worker_key is provisioned (C4 Fix)
+                if self.worker_key:
+                    expected_sig = hmac.new(
+                        self.worker_key.encode("utf-8"),
+                        f"OTA:{{target_version}}:{{calc_sha256}}".encode("utf-8"),
+                        hashlib.sha256,
+                    ).hexdigest()
+                    if not received_sig or not hmac.compare_digest(received_sig, expected_sig):
+                        print("[!] [OTA] Cryptographic OTA signature verification failed! Rejecting unsigned/untrusted update.")
+                        self.updating = False
+                        self.ota_status = "SIGNATURE_INVALID"
+                        return
+
+                # Validate syntax via AST before writing to disk
+                import ast
+                ast.parse(code_to_write)
 
                 launcher_path = Path(__file__).resolve()
                 tmp_path = launcher_path.with_suffix(".py.tmp")
@@ -885,7 +927,9 @@ class WorkerState:
         payload = packet.get("payload") if isinstance(packet.get("payload"), dict) else {{}}
         nonce = packet.get("nonce")
         hub_sig = str(packet.get("hub_signature", ""))
-        if hub_sig and self.worker_key:
+        if self.worker_key:
+            if not hub_sig:
+                return {{"ok": False, "error": "invalid_hub_signature"}}
             envelope = {{k: v for k, v in packet.items() if k != "hub_signature"}}
             expected_sig = compute_hmac(self.worker_key, envelope)
             if not hmac.compare_digest(hub_sig, expected_sig):
@@ -1547,7 +1591,9 @@ class WorkerHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", f"http://localhost:{{state.port}}")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
         try:
             self.end_headers()
             self.wfile.write(data)
@@ -1666,11 +1712,11 @@ def main():
     print(f"[*] Protocol Version:   {{state.version}} (Zero-Touch OTA Enabled)")
     print(f"[*] Neural Shard:       {{state.brain_shard}} ({{state.synced_deltas_count}} Synced Deltas)")
 
-    # Find free port first
+    # Find free port first (bind strictly to 127.0.0.1 loopback to protect worker_key from LAN/cross-origin theft)
     server = None
     for p in range(8450, 8480):
         try:
-            server = http.server.ThreadingHTTPServer(("0.0.0.0", p), WorkerHandler)
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", p), WorkerHandler)
             state.port = p
             break
         except OSError:

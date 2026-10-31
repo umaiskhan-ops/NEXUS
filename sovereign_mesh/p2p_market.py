@@ -2,12 +2,14 @@
 
 Allows users needing compute credits to buy from miners/contributors selling credits
 in exchange for local fiat (EasyPaisa, JazzCash, Raast, Bank Transfer, USDT).
-Features 100% cryptographic escrow to prevent double-spending and fraud.
+Features ledger-audited programmatic credit escrow with anti-replay TID validation
+and anti-griefing dispute arbitration.
 """
 from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import secrets
 import threading
 import time
@@ -84,7 +86,13 @@ class P2PMarketplace:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
         data = [o.to_dict() for o in self._orders.values()]
-        tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2, default=str))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
         tmp.replace(self._path)
 
     # ------------------------------------------------------------------ Market Operations
@@ -525,9 +533,9 @@ class P2PMarketplace:
 
     def submit_payment(self, order_id: str, buyer_id: str, payment_ref: str) -> dict:
         """Buyer marks that they sent the payment and submits receipt reference."""
-        payment_ref = payment_ref.strip()
-        if not payment_ref:
-            raise ValueError("Payment reference / Transaction ID (TID) is required")
+        payment_ref = (payment_ref or "").strip()
+        if not payment_ref or len(payment_ref) < 5:
+            raise ValueError("Valid Payment reference / Transaction ID (TID >= 5 chars) is required")
 
         with self._lock:
             order = self._orders.get(order_id)
@@ -538,6 +546,17 @@ class P2PMarketplace:
                 raise PermissionError("Only the assigned buyer can submit payment")
             if order.status not in {"IN_ESCROW", "PAYMENT_SUBMITTED"}:
                 return {"ok": False, "error": f"Order status is {order.status}, cannot submit payment"}
+
+            # H5 Anti-Replay Guard: Prevent reusing the same TID across multiple orders
+            ref_norm = payment_ref.upper()
+            for other in self._orders.values():
+                if other.order_id != order_id and other.status != "CANCELLED":
+                    if other.payment_reference and other.payment_reference.strip().upper() == ref_norm:
+                        return {
+                            "ok": False,
+                            "duplicate_payment_reference": True,
+                            "error": f"Payment reference '{payment_ref}' has already been submitted on another order (H5 Anti-Replay Guard).",
+                        }
 
             order.payment_reference = payment_ref
             order.status = "PAYMENT_SUBMITTED"
@@ -571,8 +590,25 @@ class P2PMarketplace:
             caller_wid = self._resolve_wid(caller_id)
             if not is_owner and caller_wid not in {order.seller_id, order.buyer_id} and caller_id not in {order.seller_id, order.buyer_id}:
                 raise PermissionError("Only the Buyer, Seller, or Sovereign Owner of this order can raise a dispute")
-            if order.status not in {"IN_ESCROW", "PAYMENT_SUBMITTED", "DISPUTED"}:
+            if order.status == "IN_ESCROW" and not is_owner:
+                return {
+                    "ok": False,
+                    "griefing_blocked": True,
+                    "error": "Cannot raise a dispute before a payment reference (TID) has been submitted (H6 Anti-Griefing Guard).",
+                }
+            if order.status not in {"PAYMENT_SUBMITTED", "DISPUTED"} and not is_owner:
                 return {"ok": False, "error": f"Cannot dispute order in status {order.status}"}
+            if not is_owner:
+                active_disputes = sum(
+                    1 for o in self._orders.values()
+                    if o.order_id != order_id and o.status == "DISPUTED" and (o.disputed_by == caller_wid or o.buyer_id == caller_wid)
+                )
+                if active_disputes >= 1:
+                    return {
+                        "ok": False,
+                        "griefing_blocked": True,
+                        "error": "You already have an unresolved P2P dispute pending arbitration (H6 Anti-Griefing Guard).",
+                    }
 
             order.status = "DISPUTED"
             order.dispute_reason = reason

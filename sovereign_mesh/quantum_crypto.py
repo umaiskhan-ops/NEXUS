@@ -1,15 +1,17 @@
-"""NEXUS Hyper-Sovereign Multi-Vault Quantum Cryptography Engine (HSQK-4096).
+"""NEXUS Multi-Vault Hybrid Cryptography & Hardware Fingerprint Engine (HSQK-4096).
 
-Surpasses Bitcoin (secp256k1, 256-bit, 128-bit classical security, 0% quantum resistance):
-1. Key Space: 4096 bits of physical & cryptographic entropy (2^4096 = (2^256)^16).
-   Mathematically equivalent to 16 full Bitcoin blockchain key spaces multiplexed.
-2. Chamber 1 (Post-Quantum): NIST FIPS 204 ML-DSA Lattice Module-LWE Polynomial Ring Engine.
-   Immune to Shor's Algorithm and Grover's Quantum Search.
-3. Chamber 2 (High-Degree Asymmetric): Ed448-Goldilocks (224-bit symmetric security, 2^96x harder than Bitcoin).
-4. Chamber 3 (Cascaded Hash Tree): SHAKE-256 (NIST XOF) + SHA3-512 (Keccak) + BLAKE2b-512.
-5. Chamber 4 (Hardware PUF): Physical Unclonable Function Silicon-Drift Seal (Silicon-Locked).
-6. Forward Secrecy: Ephemeral Double-Ratchet evolving state per proof-of-compute.
-7. Address Format: 'nxq1...' Bech32m Post-Quantum Address with polynomial error detection.
+Provides layered defense-in-depth authentication for decentralized mesh nodes:
+1. Key Material: 4096 bits (512 bytes) of OS CSPRNG entropy (`secrets.token_bytes(512)`),
+   partitioned across independent cryptographic chambers.
+2. Chamber 1 (Lattice Ring Layer): Pure-Python Module-LWE cyclotomic ring commitment & signature
+   (`R_q = Z_q[X]/(X^32 + 1)`, `q = 8380417`) for structural defense-in-depth.
+3. Chamber 2 (Standard Asymmetric Signatures): RFC 8032 Ed448-Goldilocks (224-bit classical security)
+   and Ed25519 via OpenSSL (`cryptography`), strictly fail-closed on verification.
+4. Chamber 3 (Cascaded Hash MAC): SHAKE-256 (NIST XOF) + SHA3-512 + BLAKE2b-512.
+5. Chamber 4 (Software Hardware Fingerprint Seal): Host UUID/CPU/platform identity digest combined
+   with timing jitter telemetry (software-level anti-clone host binding).
+6. Forward Secrecy: Monotonic hash-ratchet evolving per task proof to prevent replay attacks.
+7. Address Format: 'nxq1...' BIP-350 Bech32m checksummed node address.
 """
 from __future__ import annotations
 
@@ -251,14 +253,23 @@ def lattice_sign(priv_bundle: Dict[str, Any], pub_bundle: Dict[str, Any], messag
         "z1": z1,
         "z2": z2,
         "c": c,
+        "w0": w0,
+        "w1": w1,
         "w0_head": w0[:4],
         "w1_head": w1[:4],
     }
 
 
+def _centered_mod_q(val: int) -> int:
+    v = val % LATTICE_Q
+    return v if v <= LATTICE_Q // 2 else v - LATTICE_Q
+
+
 def lattice_verify(pub_bundle: Dict[str, Any], message: bytes, sig: Dict[str, Any]) -> bool:
-    """Verifies a Post-Quantum Lattice Signature by checking polynomial relations in R_q."""
+    """Verifies a Module-LWE Lattice Signature by checking polynomial relations and challenge in R_q."""
     try:
+        if not isinstance(pub_bundle, dict) or not isinstance(sig, dict):
+            return False
         a_seed = bytes.fromhex(pub_bundle["a_seed_hex"])
         matrix_a = _expand_lattice_matrix_a(a_seed)
         t0 = pub_bundle["t0"]
@@ -266,61 +277,82 @@ def lattice_verify(pub_bundle: Dict[str, Any], message: bytes, sig: Dict[str, An
         z1 = sig["z1"]
         z2 = sig["z2"]
         c = sig["c"]
-        
-        # Verify norms of z1, z2 are within valid lattice bounds
+        if len(t0) != LATTICE_N or len(t1) != LATTICE_N:
+            return False
+        if len(z1) != LATTICE_N or len(z2) != LATTICE_N or len(c) != LATTICE_N:
+            return False
+
+        # Verify norms of z1, z2 and c are within valid short lattice bounds
         for val in z1 + z2:
-            centered = val if val <= LATTICE_Q // 2 else val - LATTICE_Q
-            if abs(centered) > 200_000:  # Valid rejection bound
+            if abs(_centered_mod_q(int(val))) > 200:
                 return False
-                
-        # Reconstruct approximate commitment: w' = A*z - c*t
-        # w0_prime = (A00*z1 + A01*z2) - c*t0
+        for val in c:
+            if abs(_centered_mod_q(int(val))) > 1:
+                return False
+
+        # Reconstruct approximate commitment: w' = A*z - c*t = w - c*e
         Az0 = _poly_add(_poly_mul_mod_ring(matrix_a[0], z1), _poly_mul_mod_ring(matrix_a[1], z2))
         w0_prime = _poly_sub(Az0, _poly_mul_mod_ring(c, t0))
-        
+
         Az1 = _poly_add(_poly_mul_mod_ring(matrix_a[2], z1), _poly_mul_mod_ring(matrix_a[3], z2))
         w1_prime = _poly_sub(Az1, _poly_mul_mod_ring(c, t1))
-        
-        # In exact LWE, w_prime = w - c*e. Check that reconstructed high-order bits match commitment
-        # Check consistency with reported commitment heads
+
+        # Verify commitment heads match within small error bound ||c*e||_inf <= LATTICE_N * LATTICE_ETA
+        max_err = LATTICE_N * LATTICE_ETA
+        w0_ref = sig.get("w0") or sig.get("w0_head")
+        w1_ref = sig.get("w1") or sig.get("w1_head")
+        if not w0_ref or not w1_ref:
+            return False
+        for wp, wr in zip(w0_prime[:len(w0_ref)], w0_ref):
+            if abs(_centered_mod_q(wp - wr)) > max_err:
+                return False
+        for wp, wr in zip(w1_prime[:len(w1_ref)], w1_ref):
+            if abs(_centered_mod_q(wp - wr)) > max_err:
+                return False
+
+        # If full w0/w1 commitments are present, strictly verify Fiat-Shamir challenge c = H(msg || w0 || w1)
+        if "w0" in sig and "w1" in sig and len(sig["w0"]) >= 8 and len(sig["w1"]) >= 8:
+            c_hash = hashlib.sha3_256(message + f"{sig['w0'][:8]}:{sig['w1'][:8]}".encode("utf-8")).digest()
+            expected_c = [((b % 3) - 1) % LATTICE_Q for b in c_hash[:LATTICE_N]]
+            if c != expected_c:
+                return False
+
         return True
     except Exception:
         return False
 
 
-# ---------------------------------------------------------------- Chamber 2: Ed448 Engine
+# ---------------------------------------------------------------- Chamber 2: Ed448 / Ed25519 Engine
 _HAS_CRYPTOGRAPHY = False
 try:
-    from cryptography.hazmat.primitives.asymmetric import ed448
+    from cryptography.hazmat.primitives.asymmetric import ed448, ed25519
     _HAS_CRYPTOGRAPHY = True
 except ImportError:
     _HAS_CRYPTOGRAPHY = False
 
 
 def ed448_sign(ed448_priv_bytes: bytes, message: bytes) -> bytes:
-    """Signs message using Ed448-Goldilocks (224-bit security) or Pure-Python 448-bit scalar HMAC."""
-    if _HAS_CRYPTOGRAPHY:
-        try:
-            priv = ed448.Ed448PrivateKey.from_private_bytes(ed448_priv_bytes[:57])
-            return priv.sign(message)
-        except Exception:
-            pass
-    # Pure-Python High-Degree fallback (448-bit HMAC-SHA3-512)
-    return hmac.new(ed448_priv_bytes[:57], message, hashlib.sha3_512).digest()
+    """Signs message using RFC 8032 Ed448-Goldilocks private key."""
+    if not _HAS_CRYPTOGRAPHY:
+        raise RuntimeError("cryptography package is required for Ed448 signing")
+    priv = ed448.Ed448PrivateKey.from_private_bytes(ed448_priv_bytes[:57])
+    return priv.sign(message)
 
 
 def ed448_verify(ed448_pub_bytes: bytes, message: bytes, signature: bytes) -> bool:
-    """Verifies Ed448-Goldilocks signature."""
-    if _HAS_CRYPTOGRAPHY:
-        try:
-            pub = ed448.Ed448PublicKey.from_public_bytes(ed448_pub_bytes[:57])
-            pub.verify(signature, message)
-            return True
-        except Exception:
-            pass
-    # Pure-Python verification fallback
-    expected = hmac.new(ed448_pub_bytes[:57], message, hashlib.sha3_512).digest()
-    return hmac.compare_digest(expected, signature)
+    """Verifies RFC 8032 Ed448-Goldilocks signature. Strictly fail-closed (C1 Fix)."""
+    if not _HAS_CRYPTOGRAPHY:
+        return False
+    if not isinstance(ed448_pub_bytes, (bytes, bytearray)) or len(ed448_pub_bytes) < 57:
+        return False
+    if not isinstance(signature, (bytes, bytearray)) or len(signature) != 114:
+        return False
+    try:
+        pub = ed448.Ed448PublicKey.from_public_bytes(bytes(ed448_pub_bytes[:57]))
+        pub.verify(bytes(signature), message)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------- Master 4096-Bit Hyper-Sovereign Key Vault
@@ -533,16 +565,17 @@ def verify_hyper_proof(public_bundle: Dict[str, Any], payload: Any, proof: Dict[
     if ratchet_step < last_known_step:
         return False, f"stale_or_replayed_ratchet_step ({ratchet_step} <= {last_known_step})"
 
-    # 5. Verify Chamber 2 Ed448 High-Degree Asymmetric Signature
+    # 5. Verify Chamber 2 Ed448 High-Degree Asymmetric Signature (Mandatory & Fail-Closed)
     ed_sig_hex = proof.get("ed448_sig_hex", "")
     ed_pub_hex = public_bundle.get("ed448_pub_hex", "")
-    if ed_sig_hex and ed_pub_hex:
-        try:
-            sig_bytes = bytes.fromhex(ed_sig_hex)
-            pub_bytes = bytes.fromhex(ed_pub_hex)
-            if not ed448_verify(pub_bytes, canonical_bytes, sig_bytes):
-                return False, "chamber_2_ed448_signature_invalid"
-        except Exception as exc:
-            return False, f"chamber_2_ed448_parse_error: {exc}"
+    if not ed_sig_hex or not ed_pub_hex:
+        return False, "chamber_2_ed448_signature_missing"
+    try:
+        sig_bytes = bytes.fromhex(ed_sig_hex)
+        pub_bytes = bytes.fromhex(ed_pub_hex)
+        if not ed448_verify(pub_bytes, canonical_bytes, sig_bytes):
+            return False, "chamber_2_ed448_signature_invalid"
+    except Exception as exc:
+        return False, f"chamber_2_ed448_parse_error: {exc}"
 
     return True, "OK_QUANTUM_VERIFIED"

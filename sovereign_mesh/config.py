@@ -35,8 +35,10 @@ class GridConfig:
     public_webhook_url: str = ""
     dashboard_token: str = ""
     peer_shared_secret: str = ""
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8443
+    tls_cert_file: str = ""
+    tls_key_file: str = ""
     ollama_url: str = "http://localhost:11434"
     llm_api_key: str = ""
     llm_base_url: str = ""
@@ -118,16 +120,25 @@ class GridConfig:
         except ValueError as exc:
             raise ConfigError(f"Invalid numeric config in PORT/LLM_TIMEOUT_S/TOKEN_BUDGET: {exc}") from exc
 
+        host_val = (os.environ.get("HOST") or "127.0.0.1").strip()
+        dash_token = os.environ.get("DASHBOARD_TOKEN", "").strip()
+        if host_val not in ("127.0.0.1", "localhost", "::1") and not dash_token:
+            raise ConfigError(
+                f"Security Error (C2): DASHBOARD_TOKEN must be set when binding to non-loopback HOST={host_val!r}"
+            )
+
         return cls(
             owner_telegram_id=owner_id,
             master_passphrase_hash=pw_hash,
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             webhook_secret=os.environ.get("TELEGRAM_WEBHOOK_SECRET", ""),
             public_webhook_url=os.environ.get("PUBLIC_WEBHOOK_URL", ""),
-            dashboard_token=os.environ.get("DASHBOARD_TOKEN", ""),
+            dashboard_token=dash_token,
             peer_shared_secret=os.environ.get("PEER_SHARED_SECRET", ""),
-            host=os.environ.get("HOST") or "0.0.0.0",
+            host=host_val,
             port=port_val,
+            tls_cert_file=os.environ.get("TLS_CERT_FILE", "").strip(),
+            tls_key_file=os.environ.get("TLS_KEY_FILE", "").strip(),
             ollama_url=os.environ.get("OLLAMA_URL") or "http://localhost:11434",
             llm_api_key=(os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
                          or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GROQ_API_KEY") or "").strip(),
