@@ -127,12 +127,14 @@ class UltimateAgiSovereignGrid:
 
     # ------------------------------------------------------------ lifecycle
     def _load_node_id(self) -> str:
+        from .ledger import interprocess_file_lock
         path = self.data_dir / "node_id"
-        if path.exists():
-            return path.read_text(encoding="utf-8").strip()
-        nid = str(uuid.uuid4())
-        path.write_text(nid, encoding="utf-8")
-        return nid
+        with interprocess_file_lock(path):
+            if path.exists():
+                return path.read_text(encoding="utf-8").strip()
+            nid = str(uuid.uuid4())
+            path.write_text(nid, encoding="utf-8")
+            return nid
 
     def start(self) -> None:
         if self._started:
@@ -419,8 +421,13 @@ class UltimateAgiSovereignGrid:
                     approved: bool = False, passphrase: Optional[str] = None, log: bool = True) -> dict:
         payload = dict(payload or {})
         payload.pop("passphrase", None)  # never let secrets reach handlers, logs or the ledger
-        if "session" not in payload and sender_id:
-            payload["session"] = f"user_{sender_id}"
+        if sender_id and sender_id != self.owner_tg_id:
+            # N9 Fix: Non-owner users are strictly isolated to their own session namespace
+            sub_sess = str(payload.get("session") or "").strip()
+            if not sub_sess or not sub_sess.startswith(f"user_{sender_id}"):
+                payload["session"] = f"user_{sender_id}" if not sub_sess else f"user_{sender_id}:{sub_sess}"
+        elif "session" not in payload or not payload.get("session"):
+            payload["session"] = "default"
         entry = {"ts": time.time(), "sender": sender_id, "feature": key, "via": via}
 
         def finish(result: dict) -> dict:

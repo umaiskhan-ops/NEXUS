@@ -103,55 +103,53 @@ class MemoryStore:
             self._prune_locked(active_session=sess)
             self._flush()
 
-    def get(self, key: str, session: Optional[str] = None) -> Any:
+    def get(self, key: str, session: str = "default") -> Any:
+        sess = str(session or "default").strip() or "default"
         with self._lock:
             self._prune_locked()
-            if session is not None:
-                skey = self._storage_key(key, session)
-                entry = self._data.get(skey)
-                if entry and entry.get("session") == session:
-                    return entry["value"]
-                entry_legacy = self._data.get(key)
-                if entry_legacy and entry_legacy.get("session") == session:
-                    return entry_legacy["value"]
-                return None
-            entry = self._data.get(key)
-            if entry:
+            skey = self._storage_key(key, sess)
+            entry = self._data.get(skey)
+            if entry and str(entry.get("session") or "default") == sess:
                 return entry["value"]
+            entry_legacy = self._data.get(key)
+            if entry_legacy and str(entry_legacy.get("session") or "default") == sess:
+                return entry_legacy["value"]
             return None
 
-    def delete(self, key: str, session: Optional[str] = None) -> bool:
+    def delete(self, key: str, session: str = "default") -> bool:
+        sess = str(session or "default").strip() or "default"
         with self._lock:
             existed = False
-            if session is not None:
-                skey = self._storage_key(key, session)
-                if skey in self._data:
-                    self._data.pop(skey, None)
-                    existed = True
-                elif key in self._data and self._data[key].get("session") == session:
-                    self._data.pop(key, None)
-                    existed = True
-            else:
-                existed = self._data.pop(key, None) is not None
+            skey = self._storage_key(key, sess)
+            if skey in self._data and str(self._data[skey].get("session") or "default") == sess:
+                self._data.pop(skey, None)
+                existed = True
+            elif key in self._data and str(self._data[key].get("session") or "default") == sess:
+                self._data.pop(key, None)
+                existed = True
             if existed:
                 self._flush()
             return existed
 
-    def keys(self, session: Optional[str] = None) -> List[str]:
+    def keys(self, session: str = "default") -> List[str]:
+        sess = str(session or "default").strip() or "default"
         with self._lock:
             self._prune_locked()
-            if session is not None:
-                return sorted(self._logical_key(k, e) for k, e in self._data.items() if e.get("session") == session)
-            return sorted(self._logical_key(k, e) for k, e in self._data.items())
+            return sorted(
+                self._logical_key(k, e)
+                for k, e in self._data.items()
+                if str(e.get("session") or "default") == sess
+            )
 
-    def search(self, query: str, k: int = 5, session: Optional[str] = None) -> List[Tuple[str, float, Any]]:
+    def search(self, query: str, k: int = 5, session: str = "default") -> List[Tuple[str, float, Any]]:
+        sess = str(session or "default").strip() or "default"
         q = tokenize(query)
         with self._lock:
             self._prune_locked()
             scored = [
                 (self._logical_key(skey, e), cosine(q, tokenize(f"{self._logical_key(skey, e)} {e['value']}")), e["value"])
                 for skey, e in self._data.items()
-                if session is None or e.get("session") == session
+                if str(e.get("session") or "default") == sess
             ]
         scored.sort(key=lambda x: x[1], reverse=True)
         return [s for s in scored[:k] if s[1] > 0]

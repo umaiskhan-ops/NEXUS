@@ -12,10 +12,70 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .ledger import interprocess_file_lock
 from .telegram_gateway import TelegramClient, handle_update, parse_command
 from .web_ui import get_web_ui_html
 
 MAX_BODY = 1_000_000
+
+
+def ensure_tls_certificates(data_dir: Path) -> tuple[str, str]:
+    """Auto-generates or loads X.509 TLS certificate and private key for HTTPS transport security (M4 Fix)."""
+    data_dir = Path(data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    cert_path = data_dir / "tls_cert.pem"
+    key_path = data_dir / "tls_key.pem"
+    if cert_path.exists() and key_path.exists():
+        return str(cert_path), str(key_path)
+    try:
+        import datetime
+        import ipaddress
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "PK"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "NEXUS Sovereign Mesh"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+        ])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(priv_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=365))
+            .add_extension(
+                x509.SubjectAlternativeName([
+                    x509.DNSName("localhost"),
+                    x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                ]),
+                critical=False,
+            )
+            .sign(priv_key, hashes.SHA256())
+        )
+        with interprocess_file_lock(key_path):
+            key_path.write_bytes(
+                priv_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption(),
+                )
+            )
+            try:
+                os.chmod(key_path, 0o600)
+            except OSError:
+                pass
+        with interprocess_file_lock(cert_path):
+            cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        return str(cert_path), str(key_path)
+    except Exception:
+        return "", ""
 
 
 def get_recent_projects(data_dir: Path, default_path: str = "e:/NEXUS") -> list:
@@ -24,7 +84,8 @@ def get_recent_projects(data_dir: Path, default_path: str = "e:/NEXUS") -> list:
     default_list = [norm_default]
     if f.exists():
         try:
-            items = json.loads(f.read_text(encoding="utf-8"))
+            with interprocess_file_lock(f):
+                items = json.loads(f.read_text(encoding="utf-8"))
             if isinstance(items, list):
                 out = []
                 for p in items:
@@ -48,7 +109,16 @@ def add_recent_project(data_dir: Path, proj_path: str, default_path: str = "e:/N
     items = items[:15]
     f = Path(data_dir) / "recent_projects.json"
     f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    with interprocess_file_lock(f):
+        tmp = f.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps(items, indent=2))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        tmp.replace(f)
     return items
 
 
@@ -131,18 +201,35 @@ def make_handler(grid, client):
             if wrec and wrec.key:
                 secret = wrec.key
         if not secret:
-            secret = cfg.peer_shared_secret or cfg.dashboard_token or "nexus-ota-signing-key"
+            secret = cfg.peer_shared_secret or cfg.dashboard_token or ""
+        if not secret:
+            return ""
         msg = f"OTA:{version}:{sha256_hex}".encode("utf-8")
         return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
     def _sign_ota_ed25519(version: str, sha256_hex: str) -> tuple[str, str]:
-        """Asymmetric Ed25519 code signing for OTA updates matching worker's pinned public key (fixes C4)."""
+        """Asymmetric Ed25519 code signing for OTA updates (C4 Fix: prefers offline manifest; no default public seed)."""
         import hashlib
+        data_dir = Path(getattr(cfg, "data_dir", Path("./data")))
+        manifest_file = data_dir / "ota_release_manifest.json"
+        if manifest_file.exists():
+            try:
+                with interprocess_file_lock(manifest_file):
+                    mdata = json.loads(manifest_file.read_text(encoding="utf-8"))
+                if mdata.get("version") == version and mdata.get("sha256") == sha256_hex:
+                    sig_m = str(mdata.get("ota_ed25519_sig", "")).strip()
+                    pub_m = str(mdata.get("ota_ed25519_pub", "")).strip()
+                    if len(sig_m) == 128 and len(pub_m) == 64:
+                        return sig_m, pub_m
+            except Exception:
+                pass
+        raw_seed = os.environ.get("NEXUS_OTA_PRIVATE_SEED", "").strip()
+        if not raw_seed:
+            return "", os.environ.get("NEXUS_OTA_PUBLIC_KEY_HEX", "").strip()
         try:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
             from cryptography.hazmat.primitives import serialization
-            seed_material = (os.environ.get("NEXUS_OTA_PRIVATE_SEED", "") or "nexus-ota-ed25519-root").encode("utf-8")
-            seed32 = hashlib.sha256(b"NEXUS_OTA_ED25519:" + seed_material).digest()
+            seed32 = hashlib.sha256(b"NEXUS_OTA_ED25519:" + raw_seed.encode("utf-8")).digest()
             priv = Ed25519PrivateKey.from_private_bytes(seed32)
             pub_hex = priv.public_key().public_bytes(
                 encoding=serialization.Encoding.Raw,
@@ -179,6 +266,7 @@ def make_handler(grid, client):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
             script_policy = f"'self' 'nonce-{csp_nonce}'" if csp_nonce else "'self'"
             self.send_header(
                 "Content-Security-Policy",
@@ -1979,7 +2067,8 @@ def _ensure_owner_studio_account(grid) -> tuple[str, str, int]:
     saved_key = ""
     if owner_file.exists():
         try:
-            saved_key = json.loads(owner_file.read_text(encoding="utf-8")).get("account_key", "")
+            with interprocess_file_lock(owner_file):
+                saved_key = json.loads(owner_file.read_text(encoding="utf-8")).get("account_key", "")
         except Exception:
             pass
     rec = grid.hub.get_worker("owner-master")
@@ -1989,10 +2078,19 @@ def _ensure_owner_studio_account(grid) -> tuple[str, str, int]:
             rec.key = saved_key
             if hasattr(grid.hub, "_flush"):
                 grid.hub._flush()
-    owner_file.write_text(json.dumps({
-        "worker_id": rec.worker_id,
-        "account_key": rec.key,
-    }, indent=2), encoding="utf-8")
+    with interprocess_file_lock(owner_file):
+        tmp = owner_file.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "worker_id": rec.worker_id,
+                "account_key": rec.key,
+            }, indent=2))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        tmp.replace(owner_file)
     return rec.worker_id, rec.key, rec.credits
 
 
@@ -2060,8 +2158,14 @@ def serve(grid, open_browser: bool = False) -> None:
     scheme = "http"
     tls_cert = getattr(cfg, "tls_cert_file", "")
     tls_key = getattr(cfg, "tls_key_file", "")
+    is_non_loopback = cfg.host not in ("127.0.0.1", "localhost", "::1")
+    enable_tls = bool(tls_cert and tls_key) or is_non_loopback or os.environ.get("ENABLE_TLS", "").strip().lower() in {"1", "true", "yes"}
+    if enable_tls and os.environ.get("NEXUS_ALLOW_INSECURE_HTTP", "") != "1":
+        if not (tls_cert and tls_key and Path(tls_cert).exists() and Path(tls_key).exists()):
+            tls_cert, tls_key = ensure_tls_certificates(getattr(cfg, "data_dir", Path("./data")))
     if tls_cert and tls_key and Path(tls_cert).exists() and Path(tls_key).exists():
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_ctx.load_cert_chain(certfile=tls_cert, keyfile=tls_key)
         httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
         scheme = "https"

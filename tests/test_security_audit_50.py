@@ -645,13 +645,31 @@ class TestSecurityAudit50(unittest.TestCase):
                 except urllib.error.HTTPError as e:
                     self.assertEqual(e.code, 413)
 
+                # C4 Fix: Without offline release manifest or private seed, fail-closed (no forged signatures)
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/api/worker/ota_check?version=2026.1.0&worker_id=strict-worker-r3",
+                    timeout=5,
+                ) as resp_ota_empty:
+                    ota_empty = json.loads(resp_ota_empty.read().decode("utf-8"))
+                    self.assertEqual(ota_empty.get("ota_ed25519_sig", ""), "")
+
+                # C4 Fix: When signed offline via air-gapped signer manifest, Ed25519 signature is verified
+                from sovereign_mesh.worker_package import sign_ota_release_offline
+                offline_manifest = sign_ota_release_offline(
+                    "nexus-offline-airgapped-signing-seed-999",
+                    version="2026.5.0",
+                    sha256_hex=ota_empty.get("script_sha256", ""),
+                    manifest_path=cfg.data_dir / "ota_release_manifest.json",
+                )
+
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{port}/api/worker/ota_check?version=2026.1.0&worker_id=strict-worker-r3",
                     timeout=5,
                 ) as resp_ota:
                     ota_data = json.loads(resp_ota.read().decode("utf-8"))
-                    self.assertTrue(len(ota_data.get("ota_ed25519_sig", "")) == 128)
-                    self.assertTrue(len(ota_data.get("ota_ed25519_pub", "")) == 64)
+                    self.assertEqual(len(ota_data.get("ota_ed25519_sig", "")), 128)
+                    self.assertEqual(len(ota_data.get("ota_ed25519_pub", "")), 64)
+                    self.assertEqual(ota_data.get("ota_ed25519_sig"), offline_manifest["ota_ed25519_sig"])
             finally:
                 srv.shutdown()
                 srv.server_close()

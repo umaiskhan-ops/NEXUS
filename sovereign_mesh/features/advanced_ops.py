@@ -248,8 +248,10 @@ def _vector(grid, p):
     adapter = grid.adapters.get("vector_db_retriever_milvus")
     if adapter:
         return adapter(grid, p)
+    sess = str(p.get("session") or "default")
     return {"status": "OK", "backend": "local-lexical-fallback (register a Milvus adapter for vectors)",
-            "results": grid.memory.search(require_text(p), clamp(p.get("k"), 1, 50, 5))}
+            "session": sess,
+            "results": grid.memory.search(require_text(p), clamp(p.get("k"), 1, 50, 5), session=sess)}
 
 
 FEATURES = [
@@ -264,7 +266,7 @@ FEATURES = [
         "settle the disagreement."),
     core("latent_skill_discovery", "Latent Skill Discovery", B, _latent_skills, "Unused / error-prone features."),
     core("temporal_replay", "Temporal Replay", B, _temporal_replay, "Replay ledger history by index range."),
-    core("cross_session_memory_fusion", "Cross-Session Memory Fusion", B, _memory_fusion),
+    core("cross_session_memory_fusion", "Cross-Session Memory Fusion", B, _memory_fusion, min_role=Role.OWNER),
     llm("blindspot_injection", "Blindspot Injection", B,
         "List the blind spots, unstated assumptions, and overlooked risks in the following plan or reasoning."),
     core("silent_observer_mode", "Silent Observer Mode", B, _toggle("silent_observer", "silent_observer"),

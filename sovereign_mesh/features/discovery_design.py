@@ -12,7 +12,8 @@ B = Block.DISCOVERY
 
 def _novelty(grid, p):
     q = tokenize(require_text(p))
-    corpus = [f"{k} {grid.memory.get(k)}" for k in grid.memory.keys()]
+    sess = str(p.get("session") or "default")
+    corpus = [f"{k} {grid.memory.get(k, session=sess)}" for k in grid.memory.keys(session=sess)]
     corpus += [str(b["data"]["payload"]) for b in grid.ledger.tail(500)]
     best = max((cosine(q, tokenize(c)) for c in corpus), default=0.0)
     return {"status": "OK", "novelty_score": round(1.0 - best, 4), "max_similarity": round(best, 4),

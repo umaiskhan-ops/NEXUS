@@ -19,6 +19,8 @@ import urllib.error
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+from .ledger import interprocess_file_lock
+
 
 class PublicTunnelManager:
     """Manages an automatic Cloudflare Tunnel (cloudflared) process and zero-cost Dynamic Bootstrap Anchors."""
@@ -63,13 +65,22 @@ class PublicTunnelManager:
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             active_file = self.data_dir / "public_tunnel_active.json"
-            active_file.write_text(json.dumps({
-                "active_hub_url": clean_url,
-                "local_port": self.local_port,
-                "status": "ONLINE",
-                "updated_at": time.time(),
-                "iso_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }, indent=2), encoding="utf-8")
+            with interprocess_file_lock(active_file):
+                tmp = active_file.with_suffix(".tmp")
+                with tmp.open("w", encoding="utf-8") as fh:
+                    fh.write(json.dumps({
+                        "active_hub_url": clean_url,
+                        "local_port": self.local_port,
+                        "status": "ONLINE",
+                        "updated_at": time.time(),
+                        "iso_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }, indent=2))
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                tmp.replace(active_file)
             results["local_state_saved"] = True
         except Exception as exc:
             results["local_save_error"] = str(exc)

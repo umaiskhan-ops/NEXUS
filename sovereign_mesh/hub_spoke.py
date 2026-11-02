@@ -123,12 +123,27 @@ def solve_pow_challenge(worker_id: str, challenge: str, difficulty: int = POW_DI
 
 
 def verify_pow_solution(worker_id: str, challenge: str, nonce: str, difficulty: int = POW_DIFFICULTY) -> bool:
-    """Verifies a worker's Micro-PoW solution for a heartbeat ping."""
+    """Verifies a worker's Micro-PoW solution for a heartbeat ping (N4 Fix: strict difficulty check, no '00' fallback)."""
     if not challenge or nonce is None or str(nonce).strip() == "":
         return False
-    prefix = "0" * max(2, int(difficulty))
+    prefix = "0" * max(1, int(difficulty))
     digest = hashlib.sha256(f"{worker_id}:{challenge}:{str(nonce).strip()}".encode("utf-8")).hexdigest()
-    return digest.startswith(prefix) or digest.startswith("00")
+    return digest.startswith(prefix)
+
+
+def _ip_subnet_prefix(ip_str: str) -> str:
+    """Extracts /24 IPv4 or /48 IPv6 subnet prefix to mitigate proxy/VPN rotation within the same ASN block (N4 Fix)."""
+    clean = (ip_str or "").strip()
+    if not clean or clean in {"127.0.0.1", "localhost", "::1", "local"}:
+        return ""
+    if "." in clean:
+        parts = clean.split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+    if ":" in clean:
+        hextets = clean.split(":")
+        return ":".join(hextets[:3]) + "::/48"
+    return clean
 
 
 @dataclass
@@ -138,6 +153,7 @@ class WorkerNodeRecord:
     url: str = "local"
     status: str = "ACTIVE"  # ACTIVE | SLASHED
     credits: int = WELCOME_CREDITS
+    welcome_credits_locked: int = 0
     burned_credits: int = 0
     tasks_completed: int = 0
     tasks_verified: int = 0

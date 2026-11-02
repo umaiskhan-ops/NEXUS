@@ -18,6 +18,7 @@ import concurrent.futures
 import hashlib
 import json
 import math
+import os
 import re
 import struct
 import threading
@@ -25,6 +26,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from .ledger import interprocess_file_lock
 
 
 BRAIN_SPECIALIZATION_SHARDS: Dict[str, Dict[str, Any]] = {
@@ -159,9 +162,16 @@ class SafeTensorsIO:
         payload = prefix + header_bytes + b"".join(binary_chunks)
         sha256_hex = hashlib.sha256(payload).hexdigest()
 
-        tmp_path = file_path.with_suffix(".safetensors.tmp")
-        tmp_path.write_bytes(payload)
-        tmp_path.replace(file_path)
+        with interprocess_file_lock(file_path):
+            tmp_path = file_path.with_suffix(".safetensors.tmp")
+            with tmp_path.open("wb") as fh:
+                fh.write(payload)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            tmp_path.replace(file_path)
 
         return {
             "path": str(file_path),
@@ -697,7 +707,8 @@ class DecentralizedBrainMatrix:
     def _load(self) -> None:
         if self._path and self._path.exists():
             try:
-                raw = json.loads(self._path.read_text(encoding="utf-8"))
+                with interprocess_file_lock(self._path):
+                    raw = json.loads(self._path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
                     self.self_play_cycles_run = int(raw.get("self_play_cycles_run", 0))
                     self.synthetic_samples_generated = int(raw.get("synthetic_samples_generated", 0))
@@ -732,17 +743,24 @@ class DecentralizedBrainMatrix:
             return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(".tmp")
-            payload = {
-                "self_play_cycles_run": self.self_play_cycles_run,
-                "synthetic_samples_generated": self.synthetic_samples_generated,
-                "synthetic_samples_verified": self.synthetic_samples_verified,
-                "attention_routes_executed": self.attention_routes_executed,
-                "fedavg_merges_completed": self.fedavg_merges_completed,
-                "deltas": [d.to_dict() for d in list(self._deltas.values())[-500:]],
-            }
-            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            tmp.replace(self._path)
+            with interprocess_file_lock(self._path):
+                tmp = self._path.with_suffix(".tmp")
+                payload = {
+                    "self_play_cycles_run": self.self_play_cycles_run,
+                    "synthetic_samples_generated": self.synthetic_samples_generated,
+                    "synthetic_samples_verified": self.synthetic_samples_verified,
+                    "attention_routes_executed": self.attention_routes_executed,
+                    "fedavg_merges_completed": self.fedavg_merges_completed,
+                    "deltas": [d.to_dict() for d in list(self._deltas.values())[-500:]],
+                }
+                with tmp.open("w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, indent=2))
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                tmp.replace(self._path)
         except Exception:
             pass
 

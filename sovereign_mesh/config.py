@@ -126,6 +126,13 @@ class GridConfig:
             raise ConfigError(
                 f"Security Error (C2): DASHBOARD_TOKEN must be set when binding to non-loopback HOST={host_val!r}"
             )
+        data_dir_path = Path(os.environ.get("DATA_DIR") or "./data")
+        tls_cert = os.environ.get("TLS_CERT_FILE", "").strip()
+        tls_key = os.environ.get("TLS_KEY_FILE", "").strip()
+        if (host_val not in ("127.0.0.1", "localhost", "::1") or _env_bool("ENABLE_TLS", False)) and not _env_bool("NEXUS_ALLOW_INSECURE_HTTP", False):
+            if not tls_cert or not tls_key:
+                from .server import ensure_tls_certificates
+                tls_cert, tls_key = ensure_tls_certificates(data_dir_path)
 
         return cls(
             owner_telegram_id=owner_id,
@@ -137,8 +144,8 @@ class GridConfig:
             peer_shared_secret=os.environ.get("PEER_SHARED_SECRET", ""),
             host=host_val,
             port=port_val,
-            tls_cert_file=os.environ.get("TLS_CERT_FILE", "").strip(),
-            tls_key_file=os.environ.get("TLS_KEY_FILE", "").strip(),
+            tls_cert_file=tls_cert,
+            tls_key_file=tls_key,
             ollama_url=os.environ.get("OLLAMA_URL") or "http://localhost:11434",
             llm_api_key=(os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
                          or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GROQ_API_KEY") or "").strip(),
@@ -146,7 +153,7 @@ class GridConfig:
                           or "https://openrouter.ai/api/v1").strip(),
             llm_timeout_s=timeout_val,
             mesh=mesh,
-            data_dir=Path(os.environ.get("DATA_DIR") or "./data"),
+            data_dir=data_dir_path,
             peers=peers,
             collaborators=collaborators,
             enable_code_execution=_env_bool("ENABLE_CODE_EXECUTION"),

@@ -248,7 +248,11 @@ def _autonomous(grid, p):
 def _preferences(grid, p):
     if p.get("key"):
         grid.memory.set(f"pref:{p['key']}", p.get("value"), session="preferences")
-    prefs = {k[5:]: grid.memory.get(k) for k in grid.memory.keys() if k.startswith("pref:")}
+    prefs = {
+        k[5:]: grid.memory.get(k, session="preferences")
+        for k in grid.memory.keys(session="preferences")
+        if k.startswith("pref:")
+    }
     return {"status": "OK", "preferences": prefs}
 
 
@@ -518,26 +522,29 @@ def _sliding_window_attention(grid, p):
 
 def _hierarchical_memory_system(grid, p):
     op = p.get("op", "query")
+    sess = str(p.get("session") or "default")
     if op == "status":
         return {
             "status": "OK",
-            "L1_working_keys": len(grid.memory.keys()),
+            "session": sess,
+            "L1_working_keys": len(grid.memory.keys(session=sess)),
             "L2_snapshots": len(grid.snapshots.names()),
             "L3_ledger_blocks": len(grid.ledger),
         }
     key = p.get("key", "")
     if op == "promote" and key:
-        val = grid.memory.get(key)
+        val = grid.memory.get(key, session=sess)
         if val is not None:
-            block = grid.ledger.append("memory_promoted_L3", {"key": key, "val": val})
-            return {"status": "PROMOTED_TO_L3", "key": key, "block": block["hash"][:16]}
-    return {"status": "OK", "hierarchy": {"L1": "RAM/KeyStore", "L2": "SnapshotManager", "L3": "HashChainLedger"}}
+            block = grid.ledger.append("memory_promoted_L3", {"key": key, "val": val, "session": sess})
+            return {"status": "PROMOTED_TO_L3", "key": key, "session": sess, "block": block["hash"][:16]}
+    return {"status": "OK", "session": sess, "hierarchy": {"L1": "RAM/KeyStore", "L2": "SnapshotManager", "L3": "HashChainLedger"}}
 
 
 def _on_demand_memory_recall(grid, p):
     query = require_text(p, "query")
     k = clamp(p.get("k", 5), 1, 50, 5)
-    mem_results = grid.memory.search(query, k=k)
+    sess = str(p.get("session") or "default")
+    mem_results = grid.memory.search(query, k=k, session=sess)
     ledger_hits = []
     q_tokens = tokenize(query)
     for b in grid.ledger.tail(200):

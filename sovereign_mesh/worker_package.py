@@ -301,24 +301,72 @@ Requirements:
 """
 
 
-def get_pinned_ota_public_key_hex(seed_override: str = "") -> str:
-    """Returns the offline-pinned Ed25519 OTA public key hex (C4 Fix: never trusted from HTTP headers)."""
+def sign_ota_release_offline(
+    private_seed: str,
+    version: str = WORKER_PROTOCOL_VERSION,
+    sha256_hex: str = "",
+    manifest_path: Path | None = None,
+) -> dict:
+    """Offline signer utility (C4 Fix): signs an OTA release on an air-gapped/offline signer machine
+    and optionally writes ota_release_manifest.json so the Hub never holds the private key online.
+    """
+    import hashlib
+    clean_seed = (private_seed or "").strip()
+    if not clean_seed or len(clean_seed) < 16:
+        raise ValueError("Offline OTA private_seed must be at least 16 characters")
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    seed32 = hashlib.sha256(b"NEXUS_OTA_ED25519:" + clean_seed.encode("utf-8")).digest()
+    priv = Ed25519PrivateKey.from_private_bytes(seed32)
+    pub_hex = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    ).hex()
+    msg = f"OTA:{version}:{sha256_hex}".encode("utf-8")
+    sig_hex = priv.sign(msg).hex()
+    manifest = {
+        "version": version,
+        "sha256": sha256_hex,
+        "ota_ed25519_sig": sig_hex,
+        "ota_ed25519_pub": pub_hex,
+    }
+    if manifest_path is not None:
+        manifest_path = Path(manifest_path)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def get_pinned_ota_public_key_hex(seed_override: str = "", data_dir: Path | None = None) -> str:
+    """Returns the offline-pinned Ed25519 OTA public key hex (C4 Fix: no default public seed; fail-closed if unset)."""
     env_pub = os.environ.get("NEXUS_OTA_PUBLIC_KEY_HEX", "").strip()
     if len(env_pub) == 64:
         return env_pub
+    manifest_dir = Path(data_dir) if data_dir else Path(os.environ.get("DATA_DIR", "./data"))
+    manifest_file = manifest_dir / "ota_release_manifest.json"
+    if manifest_file.exists():
+        try:
+            mdata = json.loads(manifest_file.read_text(encoding="utf-8"))
+            mpub = str(mdata.get("ota_ed25519_pub", "")).strip()
+            if len(mpub) == 64:
+                return mpub
+        except Exception:
+            pass
+    raw_seed = (seed_override or os.environ.get("NEXUS_OTA_PRIVATE_SEED", "")).strip()
+    if not raw_seed:
+        return ""
     import hashlib
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from cryptography.hazmat.primitives import serialization
-        raw_seed = (seed_override or os.environ.get("NEXUS_OTA_PRIVATE_SEED", "") or "nexus-ota-ed25519-root").encode("utf-8")
-        seed32 = hashlib.sha256(b"NEXUS_OTA_ED25519:" + raw_seed).digest()
+        seed32 = hashlib.sha256(b"NEXUS_OTA_ED25519:" + raw_seed.encode("utf-8")).digest()
         priv = Ed25519PrivateKey.from_private_bytes(seed32)
         return priv.public_key().public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         ).hex()
     except Exception:
-        return hashlib.sha256(b"NEXUS_OTA_ED25519_FALLBACK_PIN").hexdigest()
+        return ""
 
 
 def get_worker_launcher_code(default_hub_url: str, default_bootstrap_url: str = "", pinned_ota_pub_hex: str = "") -> str:
@@ -472,11 +520,11 @@ def detect_hardware_spec() -> str:
     cores = os.cpu_count() or 4
     return f"{{cpu}} ({{cores}} Cores)"
 
-def solve_pow_challenge(worker_id: str, challenge: str, difficulty_prefix: str = "000") -> str:
+def solve_pow_challenge(worker_id: str, challenge: str, difficulty_prefix: str = "0000") -> str:
     if not challenge:
         return ""
     prefix = f"{{worker_id}}:{{challenge}}:"
-    for idx in range(500_000):
+    for idx in range(2_000_000):
         nonce = str(idx)
         digest = hashlib.sha256(f"{{prefix}}{{nonce}}".encode("utf-8")).hexdigest()
         if digest.startswith(difficulty_prefix):
@@ -814,6 +862,11 @@ class WorkerState:
                 ota_ed25519_sig = resp.headers.get("X-OTA-Ed25519-Signature", "")
                 # C4 Fix: Public key MUST come strictly from pinned constant or local env, NEVER from server response header/body
                 ota_ed25519_pub = (os.environ.get("NEXUS_OTA_PUBLIC_KEY_HEX", "").strip() or PINNED_OTA_PUBLIC_KEY_HEX).strip()
+                if len(ota_ed25519_pub) != 64:
+                    print("[!] [OTA] Security Policy (C4): OTA disabled — no offline-pinned Ed25519 public key configured.")
+                    self.updating = False
+                    self.ota_status = "OTA_DISABLED_NO_PINNED_KEY"
+                    return
                 try:
                     j = json.loads(raw_data.decode("utf-8"))
                     if j.get("ok") and j.get("code"):

@@ -38,7 +38,9 @@ class P2POffer:
     dispute_reason: str = ""
     disputed_by: str = ""
     payment_receipt_hmac: str = ""
-    cryptographic_payment_verified: bool = False
+    receipt_recorded: bool = False
+    payment_verified: bool = False
+    verification_method: str = "UNVERIFIED"
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)
@@ -151,16 +153,39 @@ class P2PMarketplace:
                 self.hub._flush()
 
     def compute_payment_receipt_hmac(self, order_id: str, payment_ref: str) -> str:
-        """Computes cryptographic HMAC-SHA256 payment attestation over order parameters + TID (H5 Fix)."""
+        """Computes HMAC-SHA256 receipt record over order parameters + TID (H5 Fix: no public default secret)."""
         import hashlib
         import hmac
         order = self._orders.get(order_id)
         if not order:
             return ""
         buyer = self._resolve_worker(order.buyer_id)
-        secret = (buyer.key if buyer and buyer.key else os.environ.get("PEER_SHARED_SECRET", "nexus-p2p-receipt-key")).encode("utf-8")
+        raw_secret = (buyer.key if buyer and buyer.key else os.environ.get("PEER_SHARED_SECRET", "")).strip()
+        if not raw_secret:
+            return ""
         msg = f"P2P_RECEIPT:{order.order_id}:{order.seller_id}:{order.buyer_id}:{order.amount_credits}:{order.price_fiat}:{order.currency}:{payment_ref.strip().upper()}".encode("utf-8")
-        return hmac.new(secret, msg, hashlib.sha256).hexdigest()
+        return hmac.new(raw_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+    def verify_payment_via_provider_webhook(self, order_id: str, payment_ref: str, provider_signature: str) -> dict:
+        """Verifies payment receipt via payment provider webhook HMAC (NEXUS_PAYMENT_WEBHOOK_SECRET) (H5 Fix)."""
+        import hashlib
+        import hmac
+        webhook_secret = os.environ.get("NEXUS_PAYMENT_WEBHOOK_SECRET", "").strip()
+        if not webhook_secret:
+            return {"ok": False, "payment_verified": False, "error": "NEXUS_PAYMENT_WEBHOOK_SECRET not configured"}
+        with self._lock:
+            order = self._orders.get(order_id)
+            if not order:
+                raise KeyError(f"Order {order_id!r} not found")
+            msg = f"WEBHOOK_PAID:{order.order_id}:{order.amount_credits}:{order.price_fiat}:{order.currency}:{payment_ref.strip().upper()}".encode("utf-8")
+            expected = hmac.new(webhook_secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+            if not provider_signature or not hmac.compare_digest(provider_signature.strip(), expected):
+                return {"ok": False, "payment_verified": False, "error": "Invalid payment provider webhook signature"}
+            order.payment_verified = True
+            order.verification_method = "PAYMENT_PROVIDER_WEBHOOK"
+            order.updated_at = time.time()
+            self._flush()
+            return {"ok": True, "order_id": order_id, "payment_verified": True, "verification_method": order.verification_method}
 
     def get_user_orders(self, worker_id: str) -> Dict[str, List[dict]]:
         with self._lock:
@@ -586,7 +611,9 @@ class P2PMarketplace:
 
             order.payment_reference = payment_ref
             order.payment_receipt_hmac = self.compute_payment_receipt_hmac(order_id, payment_ref)
-            order.cryptographic_payment_verified = bool(order.payment_receipt_hmac)
+            order.receipt_recorded = True
+            order.payment_verified = False
+            order.verification_method = "AWAITING_SELLER_OR_PROVIDER_CONFIRMATION"
             order.status = "PAYMENT_SUBMITTED"
             order.updated_at = time.time()
             self._flush()
@@ -597,6 +624,8 @@ class P2PMarketplace:
                 "buyer_id": order.buyer_id,
                 "payment_reference": payment_ref,
                 "payment_receipt_hmac": order.payment_receipt_hmac[:24],
+                "receipt_recorded": True,
+                "payment_verified": False,
             })
 
             return {
@@ -605,9 +634,10 @@ class P2PMarketplace:
                 "order_id": order_id,
                 "payment_reference": payment_ref,
                 "payment_receipt_hmac": order.payment_receipt_hmac,
-                "cryptographic_payment_verified": order.cryptographic_payment_verified,
-                "fiat_verification_mode": "CRYPTOGRAPHIC_RECEIPT_COMMIT_PLUS_SELLER_CONFIRMATION",
-                "message": "Payment details & cryptographic receipt HMAC committed! Seller must verify fiat receipt before releasing escrow.",
+                "receipt_recorded": order.receipt_recorded,
+                "payment_verified": order.payment_verified,
+                "verification_method": order.verification_method,
+                "message": "Payment TID receipt recorded! Payment is NOT verified until Seller manual confirmation or Payment Provider API webhook.",
                 "ledger_block": block["hash"][:16]
             }
 
@@ -745,6 +775,9 @@ class P2PMarketplace:
 
             order.status = "COMPLETED"
             order.escrow_locked = False
+            order.payment_verified = True
+            if order.verification_method in {"UNVERIFIED", "AWAITING_SELLER_OR_PROVIDER_CONFIRMATION"}:
+                order.verification_method = "OWNER_ARBITRATION_CONFIRMATION" if is_owner else "SELLER_MANUAL_CONFIRMATION"
             order.updated_at = time.time()
             self._unfreeze_if_no_active_disputes(order.seller_id)
             self._unfreeze_if_no_active_disputes(order.buyer_id)
@@ -759,6 +792,8 @@ class P2PMarketplace:
                 "currency": order.currency,
                 "payment_reference": order.payment_reference,
                 "released_by": "OWNER" if is_owner else "SELLER",
+                "payment_verified": True,
+                "verification_method": order.verification_method,
                 "buyer_new_balance": buyer.credits
             })
 
@@ -769,6 +804,8 @@ class P2PMarketplace:
                 "credits_released": order.amount_credits,
                 "buyer_id": order.buyer_id,
                 "buyer_new_balance": buyer.credits,
+                "payment_verified": True,
+                "verification_method": order.verification_method,
                 "ledger_block": block["hash"][:16]
             }
 
