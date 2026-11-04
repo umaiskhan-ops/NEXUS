@@ -469,6 +469,23 @@ class MasterHubCoordinator:
                     raise PermissionError(
                         f"Anti-Sybil IP Guard (N4): Maximum workers ({self.max_workers_per_ip}) per public IP ({public_ip}) exceeded."
                     )
+                subnet = _ip_subnet_prefix(public_ip)
+                if subnet:
+                    same_subnet_count = sum(
+                        1 for other in self._workers.values()
+                        if other.worker_id != worker_id and other.status == "ACTIVE" and _ip_subnet_prefix(other.public_ip) == subnet
+                    )
+                    max_subnet = int(getattr(self, "max_workers_per_subnet", 5))
+                    if same_subnet_count >= max_subnet:
+                        self.ledger.append("sybil_subnet_limit_blocked", {
+                            "attempted_worker_id": worker_id,
+                            "public_ip": public_ip,
+                            "subnet": subnet,
+                            "existing_count": same_subnet_count,
+                        })
+                        raise PermissionError(
+                            f"Anti-Sybil Subnet Guard (N4): Maximum workers ({max_subnet}) per subnet ({subnet}) exceeded."
+                        )
 
             referrer = self._resolve_referrer(referred_by) if referred_by else None
             ref_wid = referrer.worker_id if (referrer and referrer.worker_id != worker_id) else ""

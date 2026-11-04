@@ -205,6 +205,19 @@ def _semantic_injection_check(normalized_text: str, _depth: int = 0) -> bool:
             window = set(words[idx: idx + 12])
             if (window & _OVERRIDE_VERBS) and (window & _PRIVILEGED_TARGETS):
                 return True
+        # Composite heuristic threat score evaluation (elevates M10 beyond regex)
+        intent_score = 0
+        clean_tokens = set(re.findall(r"[a-z]+", candidate))
+        if clean_tokens & _OVERRIDE_VERBS:
+            intent_score += 2
+        if clean_tokens & _PRIVILEGED_TARGETS:
+            intent_score += 2
+        if any(p in candidate for p in ("you are now", "act as", "pretend to be", "dan mode", "developer mode", "jailbreak", "bypass safety", "new instruction", "system prompt")):
+            intent_score += 3
+        if any(p in candidate for p in ("ignore all", "disregard all", "forget everything", "do anything now", "unrestricted")):
+            intent_score += 3
+        if intent_score >= 5:
+            return True
     # Inspect potential Base64 payloads for hidden instructions
     for b64_match in re.findall(r"\b[A-Za-z0-9+/]{16,}={0,2}\b", normalized_text):
         try:

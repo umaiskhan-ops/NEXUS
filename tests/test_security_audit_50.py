@@ -676,6 +676,129 @@ class TestSecurityAudit50(unittest.TestCase):
         finally:
             grid.stop()
 
+    def test_recheck4_R5_R6_R7_R8_auth_machine_brain_pow(self):
+        """Recheck 4: R5 (Machine auth + honest status), R6 (Brain auth), R7 (clean 403 on invalid key, no HTTP 000), R8 (machines redacted), N4 subnet guard."""
+        cfg = GridConfig(
+            owner_telegram_id=777,
+            master_passphrase_hash="pass_hash_777",
+            data_dir=self.data_dir / "recheck4",
+            dashboard_token="recheck4-token-999",
+            peer_shared_secret="recheck-secret-777",
+        )
+        grid = UltimateAgiSovereignGrid(cfg)
+        grid.start()
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(grid, None))
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            base_url = f"http://127.0.0.1:{port}"
+            auth_headers = {"X-Dashboard-Token": "recheck4-token-999", "Content-Type": "application/json"}
+            unauth_headers = {"Content-Type": "application/json"}
+
+            # --- R5: Machine endpoints require auth, reject unauth with 401 ---
+            req_mc_unauth = urllib.request.Request(
+                f"{base_url}/api/machine/connect",
+                data=json.dumps({"machine_id": "test-arm"}).encode("utf-8"),
+                headers=unauth_headers,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_mc:
+                urllib.request.urlopen(req_mc_unauth, timeout=5)
+            self.assertEqual(ctx_mc.exception.code, 401)
+
+            req_cmd_unauth = urllib.request.Request(
+                f"{base_url}/api/machine/command",
+                data=json.dumps({"machine_id": "mach-cnc", "command": "G0 X10"}).encode("utf-8"),
+                headers=unauth_headers,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_cmd:
+                urllib.request.urlopen(req_cmd_unauth, timeout=5)
+            self.assertEqual(ctx_cmd.exception.code, 401)
+
+            # R5: Machine connect without adapter returns 400 ADAPTER_NOT_CONFIGURED (never fake ONLINE / fake temp_c 210)
+            req_mc_auth = urllib.request.Request(
+                f"{base_url}/api/machine/connect",
+                data=json.dumps({"machine_id": "test-cnc-new", "type": "cnc_mill", "target": "COM9"}).encode("utf-8"),
+                headers=auth_headers,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_mc_cfg:
+                urllib.request.urlopen(req_mc_auth, timeout=5)
+            self.assertEqual(ctx_mc_cfg.exception.code, 400)
+            mc_err_data = json.loads(ctx_mc_cfg.exception.read().decode("utf-8"))
+            self.assertFalse(mc_err_data["ok"])
+            self.assertEqual(mc_err_data["status"], "ADAPTER_NOT_CONFIGURED")
+            self.assertIsNone(mc_err_data["machine"]["last_telemetry"])
+            self.assertNotEqual(mc_err_data["machine"]["status"], "ONLINE")
+
+            # R5: Machine command with approval requirement returns 202 PENDING_APPROVAL, NOT fake outer "EXECUTED"
+            req_cmd_auth = urllib.request.Request(
+                f"{base_url}/api/machine/command",
+                data=json.dumps({"machine_id": "mach-cnc", "command": "G0 X9999"}).encode("utf-8"),
+                headers=auth_headers,
+            )
+            with urllib.request.urlopen(req_cmd_auth, timeout=5) as resp_cmd:
+                self.assertEqual(resp_cmd.status, 202)
+                cmd_data = json.loads(resp_cmd.read().decode("utf-8"))
+                self.assertTrue(cmd_data["ok"])
+                self.assertEqual(cmd_data["status"], "PENDING_APPROVAL")
+                self.assertIn("approval_id", cmd_data)
+                self.assertNotEqual(cmd_data["status"], "EXECUTED")
+
+            # --- R6: Brain endpoints require auth, reject unauth with 401 ---
+            for brain_path in ("/api/brain/self_play", "/api/brain/sync", "/api/brain/route", "/api/brain/fedavg", "/api/brain/swarm_infer"):
+                req_brain = urllib.request.Request(
+                    f"{base_url}{brain_path}",
+                    data=json.dumps({"prompt": "mesh autonomy"}).encode("utf-8"),
+                    headers=unauth_headers,
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx_brain:
+                    urllib.request.urlopen(req_brain, timeout=5)
+                self.assertEqual(ctx_brain.exception.code, 401, f"Expected 401 for unauth {brain_path}")
+
+            # --- R7: Invalid Account Key returns clean 403 JSON, never crashing / dropping connection (no HTTP 000) ---
+            for p2p_lottery_path in ("/api/lottery/buy_ticket", "/api/staking/stake", "/api/p2p/sell"):
+                req_p2p_bad = urllib.request.Request(
+                    f"{base_url}{p2p_lottery_path}",
+                    data=json.dumps({"account_key": "invalid_fake_key_00000000000000000000000000000000"}).encode("utf-8"),
+                    headers=unauth_headers,
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx_r7:
+                    urllib.request.urlopen(req_p2p_bad, timeout=5)
+                self.assertIn(ctx_r7.exception.code, (401, 403), f"Expected 401 or 403 JSON for {p2p_lottery_path}")
+                err_resp = json.loads(ctx_r7.exception.read().decode("utf-8"))
+                self.assertFalse(err_resp["ok"])
+                self.assertIn("error", err_resp)
+
+            # --- R8: GET /api/machines redacts target when unauthenticated ---
+            with urllib.request.urlopen(f"{base_url}/api/machines", timeout=5) as resp_m_unauth:
+                data_m_unauth = json.loads(resp_m_unauth.read().decode("utf-8"))
+                self.assertTrue(data_m_unauth["ok"])
+                self.assertTrue(data_m_unauth.get("redacted"))
+                for m in data_m_unauth["machines"]:
+                    self.assertEqual(m["target"], "[REDACTED] (auth required)")
+
+            req_m_auth = urllib.request.Request(f"{base_url}/api/machines", headers={"X-Dashboard-Token": "recheck4-token-999"})
+            with urllib.request.urlopen(req_m_auth, timeout=5) as resp_m_auth:
+                data_m_auth = json.loads(resp_m_auth.read().decode("utf-8"))
+                self.assertTrue(data_m_auth["ok"])
+                targets = [m["target"] for m in data_m_auth["machines"]]
+                self.assertIn("COM3", targets)
+                self.assertIn("192.168.1.45:7125", targets)
+
+            # --- N4: Subnet Anti-Sybil limits multiple workers from same /24 subnet ---
+            hub = grid.hub
+            subnet_ip_base = "198.51.100."
+            for i in range(1, 6):
+                hub.register_worker(f"subnet-worker-{i}", url="local", public_ip=f"{subnet_ip_base}{i}", hardware_uuid=f"uuid-{i}")
+            # The 6th worker on the same /24 subnet must be blocked by Anti-Sybil Subnet Guard
+            with self.assertRaises(PermissionError) as ctx_sybil:
+                hub.register_worker("subnet-worker-6", url="local", public_ip=f"{subnet_ip_base}6", hardware_uuid="uuid-6")
+            self.assertIn("Anti-Sybil Subnet Guard", str(ctx_sybil.exception))
+
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            grid.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

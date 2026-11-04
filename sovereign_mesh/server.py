@@ -160,9 +160,9 @@ def _ensure_default_machines(grid) -> dict:
                 "type": mtype,
                 "target": target,
                 "baud": "115200",
-                "status": "STANDBY",
-                "connected_at": time.time(),
-                "last_telemetry": {"temp_c": 24, "pos": [0.0, 0.0, 0.0], "limits": "NORMAL"},
+                "status": "DISCONNECTED",
+                "connected_at": None,
+                "last_telemetry": None,
             }
     return grid.machines
 
@@ -331,7 +331,7 @@ def make_handler(grid, client):
             return 999999999  # Public Web User (Role.OPERATOR, strictly blocked from Role.OWNER features)
 
         def _require_secret_worker(self, raw_credential: str):
-            """Strictly authenticates a worker via private secret key, rejecting public worker_id (fixes C3)."""
+            """Strictly authenticates a worker via private secret key, rejecting public worker_id (fixes C3/R7)."""
             cred = str(raw_credential or "").strip()
             if not cred:
                 self._send(400, {"ok": False, "error": "Secret Account Key is required"})
@@ -346,7 +346,14 @@ def make_handler(grid, client):
                         ),
                     })
                     return None
-                wrec = grid.hub.authenticate_worker_key(cred)
+                try:
+                    wrec = grid.hub.authenticate_worker_key(cred)
+                except PermissionError as pe:
+                    self._send(403, {"ok": False, "error": str(pe)})
+                    return None
+                except Exception as ex:
+                    self._send(401, {"ok": False, "error": f"Authentication failed: {str(ex)}"})
+                    return None
                 if not wrec:
                     self._send(401, {"ok": False, "error": "Invalid or unregistered Secret Account Key"})
                     return None
@@ -750,6 +757,13 @@ def make_handler(grid, client):
 
             if path == "/api/machines":
                 machines = _ensure_default_machines(grid)
+                if not self._auth_ok():
+                    redacted = []
+                    for m in machines.values():
+                        item = dict(m)
+                        item["target"] = "[REDACTED] (auth required)"
+                        redacted.append(item)
+                    return self._send(200, {"ok": True, "machines": redacted, "redacted": True})
                 return self._send(200, {"ok": True, "machines": list(machines.values())})
 
             if path == "/api/ide/projects":
@@ -908,9 +922,12 @@ def make_handler(grid, client):
                     if force:
                         is_owner_caller = (cfg.dashboard_token and self._caller_id() == grid.owner_tg_id)
                         if not is_owner_caller and acc and getattr(grid, "hub", None):
-                            wrec_owner = grid.hub.authenticate_worker_key(acc)
-                            if wrec_owner and wrec_owner.worker_id == "owner-master":
-                                is_owner_caller = True
+                            try:
+                                wrec_owner = grid.hub.authenticate_worker_key(acc)
+                                if wrec_owner and wrec_owner.worker_id == "owner-master":
+                                    is_owner_caller = True
+                            except PermissionError:
+                                wrec_owner = None
                         if not is_owner_caller:
                             return self._send(403, {
                                 "ok": False,
@@ -975,6 +992,8 @@ def make_handler(grid, client):
                 })
 
             if path in {"/api/brain/self_play", "/api/brain/sync", "/api/brain/route", "/api/brain/fedavg", "/api/brain/swarm_infer"}:
+                if not self._auth_ok():
+                    return self._send(401, {"ok": False, "error": "unauthorized"})
                 body = self._read_json_body(allow_empty=True)
                 if body is None:
                     return
@@ -1200,7 +1219,10 @@ def make_handler(grid, client):
 
                 if path == "/api/p2p/buyback":
                     acc = str(body.get("account_key") or body.get("worker_id", "")).strip()
-                    wrec = grid.hub.authenticate_worker_key(acc) if (acc and getattr(grid, "hub", None)) else None
+                    try:
+                        wrec = grid.hub.authenticate_worker_key(acc) if (acc and getattr(grid, "hub", None)) else None
+                    except PermissionError:
+                        wrec = None
                     if not is_owner and (not wrec or wrec.worker_id != "owner-master"):
                         return self._send(403, {"ok": False, "error": "Only the Sovereign Owner (owner-master) can execute the Weekly Top 3 Miners Buyback."})
                     try:
@@ -1343,6 +1365,8 @@ def make_handler(grid, client):
                         return self._send(400, {"ok": False, "error": str(exc)})
 
             if path in {"/api/machine/connect", "/api/machine/command"}:
+                if not self._auth_ok():
+                    return self._send(401, {"ok": False, "error": "unauthorized"})
                 import secrets
                 body = self._read_json_body()
                 if body is None:
@@ -1356,19 +1380,51 @@ def make_handler(grid, client):
                     mtype = body.get("type", "robotic_arm")
                     target = body.get("target", "COM3")
                     baud = body.get("baud", "115200")
+                    fkey = "printer_3d_control" if mtype in ("3d_printer", "printer_3d") else ("robotic_arm_ros2" if mtype in ("robotic_arm", "arm") else "cnc_machine_control")
+
+                    adapter = grid.adapters.get(fkey) if hasattr(grid, "adapters") else None
+                    if adapter is None:
+                        machine_record = {
+                            "machine_id": mid,
+                            "name": name,
+                            "type": mtype,
+                            "target": target,
+                            "baud": baud,
+                            "status": "ADAPTER_NOT_CONFIGURED",
+                            "connected_at": None,
+                            "last_telemetry": None,
+                        }
+                        grid.machines[mid] = machine_record
+                        grid.ledger.append("machine_connect_failed", {"machine_id": mid, "reason": f"No active adapter registered for {fkey}"})
+                        return self._send(400, {
+                            "ok": False,
+                            "status": "ADAPTER_NOT_CONFIGURED",
+                            "machine": machine_record,
+                            "error": f"Physical adapter for '{fkey}' is not configured. Connect requires real hardware handshake via grid.register_adapter('{fkey}', fn)."
+                        })
+
+                    try:
+                        handshake = adapter(grid, {"command": "PING", "target": target, "baud": baud})
+                        is_online = isinstance(handshake, dict) and handshake.get("status") in {"OK", "ONLINE"}
+                    except Exception as exc:
+                        handshake = {"status": "ERROR", "error": str(exc)}
+                        is_online = False
+
+                    status = "ONLINE" if is_online else "OFFLINE"
+                    telemetry = handshake.get("telemetry") if is_online and isinstance(handshake, dict) else None
                     machine_record = {
                         "machine_id": mid,
                         "name": name,
                         "type": mtype,
                         "target": target,
                         "baud": baud,
-                        "status": "ONLINE",
-                        "connected_at": time.time(),
-                        "last_telemetry": {"temp_c": 210, "pos": [0.0, 0.0, 0.0], "limits": "NORMAL"}
+                        "status": status,
+                        "connected_at": time.time() if is_online else None,
+                        "last_telemetry": telemetry,
                     }
                     grid.machines[mid] = machine_record
-                    grid.ledger.append("machine_connected", machine_record)
-                    return self._send(200, {"ok": True, "machine": machine_record})
+                    grid.ledger.append("machine_connected" if is_online else "machine_connect_failed", machine_record)
+                    return self._send(200 if is_online else 400, {"ok": is_online, "machine": machine_record})
 
                 if path == "/api/machine/command":
                     mid = str(body.get("machine_id", "")).strip()
@@ -1386,10 +1442,34 @@ def make_handler(grid, client):
                         grid.ledger.append("machine_estop", {"machine_id": mid, "time": time.time()})
                         return self._send(200, {"ok": True, "status": "HALTED", "message": "🛑 EMERGENCY STOP TRIPPED. Machine halted."})
 
-                    fkey = "printer_3d_control" if m["type"] == "3d_printer" else ("robotic_arm_ros2" if m["type"] == "robotic_arm" else "cnc_machine_control")
+                    fkey = "printer_3d_control" if m["type"] in ("3d_printer", "printer_3d") else ("robotic_arm_ros2" if m["type"] in ("robotic_arm", "arm") else "cnc_machine_control")
                     res = grid.run_feature(grid.owner_tg_id, fkey, {"command": cmd, "target": m["target"]})
-                    grid.ledger.append("machine_command_executed", {"machine_id": mid, "command": cmd, "result": res})
-                    return self._send(200, {"ok": True, "machine_id": mid, "command": cmd, "status": "EXECUTED", "result": res})
+                    inner_status = res.get("status", "UNKNOWN") if isinstance(res, dict) else "OK"
+                    grid.ledger.append("machine_command_dispatched", {"machine_id": mid, "command": cmd, "status": inner_status, "result": res})
+                    if inner_status == "PENDING_APPROVAL":
+                        return self._send(202, {
+                            "ok": True,
+                            "machine_id": mid,
+                            "command": cmd,
+                            "status": "PENDING_APPROVAL",
+                            "approval_id": res.get("approval_id"),
+                            "result": res,
+                        })
+                    if inner_status in {"OK", "APPROVED_AND_EXECUTED"}:
+                        return self._send(200, {
+                            "ok": True,
+                            "machine_id": mid,
+                            "command": cmd,
+                            "status": "EXECUTED",
+                            "result": res,
+                        })
+                    return self._send(400, {
+                        "ok": False,
+                        "machine_id": mid,
+                        "command": cmd,
+                        "status": inner_status,
+                        "result": res,
+                    })
 
             if path in {
                 "/api/supercomputer/rent",
