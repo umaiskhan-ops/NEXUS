@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .brain_matrix import DecentralizedBrainMatrix
+from .continuous_learning import ContinuousSelfImprovementManager
 from .config import GridConfig
 from .features import Block, FeatureInputError, Kind, build_registry
 from .hub_spoke import LightweightWorkerNode, MasterHubCoordinator
@@ -104,6 +105,10 @@ class UltimateAgiSovereignGrid:
         )
         self.registry = build_registry()
         self.adapters: Dict[str, Callable[[Any, dict], dict]] = {}
+        self.continuous_learning = ContinuousSelfImprovementManager(
+            self.data_dir,
+            ledger=self.ledger,
+        )
 
         self.system_lockdown = False
         self.frozen = False

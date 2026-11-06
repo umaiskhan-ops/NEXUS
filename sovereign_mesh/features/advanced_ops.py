@@ -27,14 +27,27 @@ STRESS_CORPUS = [
 
 
 def _self_improve(grid, p):
+    action = str(p.get("action", "cycle")).strip().lower()
+    if action in {"cycle", "train", "train_cycle", "deploy"}:
+        epochs = int(p.get("epochs", 4) or 4)
+        min_samples = int(p.get("min_samples", 2) or 2)
+        res = grid.continuous_learning.run_training_and_deploy_cycle(epochs=epochs, min_samples=min_samples)
+        return {
+            "status": "IMPROVEMENT_CYCLE_COMPLETE" if res.get("ok") else "ROLLBACK_PRESERVED",
+            **res,
+        }
     stats = json.dumps(grid.feature_stats_summary(), indent=1)[:6000]
     res = grid.router.ask(f"Runtime feature statistics:\n{stats}\n\nOwner focus: {p.get('text', 'general')}",
                           system="Propose concrete, reviewable improvements (config or code). Never claim they are "
                                  "applied. Output a numbered list with a risk level for each.")
     key = f"improvement_proposal_{int(time.time())}"
     grid.memory.set(key, res["text"], session="self_improvement")
-    return {"status": "PROPOSAL_STORED", "memory_key": key, "proposal": res["text"],
-            "note": "Proposals are never auto-applied; a human must implement and review them."}
+    return {
+        "status": "PROPOSAL_STORED",
+        "memory_key": key,
+        "proposal": res["text"],
+        "continuous_learning_status": grid.continuous_learning.status() if hasattr(grid, "continuous_learning") else {},
+    }
 
 
 def _branching(grid, p):

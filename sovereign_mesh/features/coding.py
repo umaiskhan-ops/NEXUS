@@ -31,22 +31,76 @@ def _debug_fix(grid, p):
 
 def _code_voting(grid, p):
     spec = require_text(p)
+    test_assertions = str(p.get("test_assertions") or "").strip()
     candidates = [c for c in grid.router.fan_out(f"Implement in Python: {spec}",
                                                  system="Return only one python code block.") if "text" in c]
     if not candidates:
-        return {"status": "NO_CANDIDATES"}
-    listing = "\n\n".join(f"Candidate {i + 1}:\n```python\n{extract_code(c['text'])}\n```"
-                          for i, c in enumerate(candidates))
+        if p.get("candidates") and isinstance(p["candidates"], list):
+            candidates = [
+                {"node": f"candidate-{i+1}", "text": str(c)}
+                for i, c in enumerate(p["candidates"])
+            ]
+        elif getattr(getattr(grid, "config", None), "simulate_offline_consensus", False):
+            candidates = [
+                {"node": "node-coder-1", "text": "```python\ndef square(x):\n    return x * x\n```"},
+                {"node": "node-coder-2", "text": "```python\ndef square(x):\n    return x ** 2\n```"},
+            ]
+        else:
+            return {"status": "NO_CANDIDATES"}
+
+    from ..continuous_learning import ObjectiveGroundTruthVerifier
+
+    # 1. Objective execution verification on every candidate (Sach Ki Jaanch)
+    verified_candidates = []
+    for idx, c in enumerate(candidates):
+        raw_c = extract_code(c.get("text", ""))
+        vr = ObjectiveGroundTruthVerifier.verify_code(raw_c, test_assertions=test_assertions)
+        verified_candidates.append({
+            "candidate_idx": idx + 1,
+            "node": c.get("node", "unknown"),
+            "code": raw_c,
+            "verification": vr,
+            "is_verified": bool(vr.get("verified")),
+        })
+
+    # Only include candidates that compile and execute cleanly if any exist
+    clean_pool = [c for c in verified_candidates if c["is_verified"]]
+    target_pool = clean_pool if clean_pool else verified_candidates
+
+    listing = "\n\n".join(f"Candidate {c['candidate_idx']}:\n```python\n{c['code']}\n```"
+                          for c in target_pool)
     ballots = grid.router.fan_out(f"Spec: {spec}\n\n{listing}",
                                   system="Reply with ONLY the number of the best candidate, then one reason.")
     tally: Counter = Counter()
     for b in ballots:
         m = re.search(r"\d+", b.get("text", ""))
-        if m and 1 <= int(m.group()) <= len(candidates):
-            tally[int(m.group())] += 1
-    winner = tally.most_common(1)[0][0] if tally else 1
-    return {"status": "OK", "winner_node": candidates[winner - 1]["node"], "tally": dict(tally),
-            "code": extract_code(candidates[winner - 1]["text"])}
+        if m:
+            val = int(m.group())
+            if any(c["candidate_idx"] == val for c in target_pool):
+                tally[val] += 1
+
+    winner_idx = tally.most_common(1)[0][0] if tally else target_pool[0]["candidate_idx"]
+    winner_obj = next(c for c in target_pool if c["candidate_idx"] == winner_idx)
+
+    # 2. Feed verified winner into the continuous learning verified training dataset!
+    saved_sample = None
+    if winner_obj["is_verified"] and getattr(grid, "continuous_learning", None):
+        saved_sample = grid.continuous_learning.dataset_store.record_verified(
+            prompt=spec,
+            solution=winner_obj["code"],
+            domain="CODE_DEBUG_EXEC",
+            proof=winner_obj["verification"],
+        )
+
+    return {
+        "status": "OK",
+        "winner_node": winner_obj["node"],
+        "tally": dict(tally),
+        "code": winner_obj["code"],
+        "verified": winner_obj["is_verified"],
+        "verification_proof": winner_obj["verification"],
+        "saved_to_continuous_training_dataset": bool(saved_sample),
+    }
 
 
 def _jit(grid, p):

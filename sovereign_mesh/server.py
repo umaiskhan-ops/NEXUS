@@ -626,6 +626,11 @@ def make_handler(grid, client):
                 bm = grid.brain_matrix.autonomy_era_status() if getattr(grid, "brain_matrix", None) else {}
                 return self._send(200, {"ok": True, **bm})
 
+            if path == "/api/learning/status":
+                if not getattr(grid, "continuous_learning", None):
+                    return self._send(500, {"ok": False, "error": "continuous_learning not initialized"})
+                return self._send(200, {"ok": True, **grid.continuous_learning.status()})
+
             if path == "/api/lottery/status":
                 if not getattr(grid, "token_sink", None):
                     return self._send(500, {"ok": False, "error": "token_sink not initialized"})
@@ -1055,6 +1060,52 @@ def make_handler(grid, client):
                 if path == "/api/brain/route":
                     prompt = str(body.get("prompt") or "").strip()
                     return self._send(200, {"ok": True, "route": grid.brain_matrix.route_attention(prompt)})
+
+            if path in {"/api/learning/verify", "/api/learning/train"}:
+                if not self._auth_ok():
+                    return self._send(401, {"ok": False, "error": "unauthorized"})
+                body = self._read_json_body(allow_empty=True)
+                if body is None:
+                    return
+                if not getattr(grid, "continuous_learning", None):
+                    return self._send(500, {"ok": False, "error": "continuous_learning not initialized"})
+
+                if path == "/api/learning/verify":
+                    task_type = str(body.get("type", "code")).strip().lower()
+                    if task_type == "code":
+                        code = str(body.get("code", "")).strip()
+                        assertions = str(body.get("test_assertions", "")).strip()
+                        res = grid.continuous_learning.verifier.verify_code(code, test_assertions=assertions)
+                    elif task_type == "math":
+                        expr = str(body.get("expression", "")).strip()
+                        exp_val = body.get("expected_value")
+                        res = grid.continuous_learning.verifier.verify_math(expr, expected_val=exp_val)
+                    elif task_type == "schema":
+                        raw_json = str(body.get("raw_json", "")).strip()
+                        keys = body.get("required_keys") if isinstance(body.get("required_keys"), list) else []
+                        res = grid.continuous_learning.verifier.verify_json_schema(raw_json, keys)
+                    else:
+                        return self._send(400, {"ok": False, "error": f"Unknown verification type: {task_type}"})
+
+                    if res.get("verified") and body.get("save_to_dataset"):
+                        prompt_text = str(body.get("prompt", "Verified Objective Task")).strip()
+                        sol_text = str(body.get("code") or body.get("expression") or body.get("raw_json", "")).strip()
+                        proof_copy = dict(res)
+                        saved = grid.continuous_learning.dataset_store.record_verified(
+                            prompt=prompt_text,
+                            solution=sol_text,
+                            domain=str(body.get("domain", "GENERAL")),
+                            proof=proof_copy,
+                        )
+                        res["saved_sample_id"] = saved.get("id")
+
+                    return self._send(200 if res.get("verified") else 400, {"ok": bool(res.get("verified")), **res})
+
+                if path == "/api/learning/train":
+                    epochs = int(body.get("epochs", 4) or 4)
+                    min_samples = int(body.get("min_samples", 2) or 2)
+                    res = grid.continuous_learning.run_training_and_deploy_cycle(epochs=epochs, min_samples=min_samples)
+                    return self._send(200 if res.get("ok") else 400, res)
 
             if path in {"/api/worker/register", "/api/worker/heartbeat", "/api/worker/submit_result", "/api/worker/enqueue_task"}:
                 import secrets
