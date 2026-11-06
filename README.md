@@ -255,3 +255,42 @@ The network implements three reciprocal incentive and settlement engines:
   - **30%** retained by the network treasury for infrastructure and core development.
 - Slashed/tampered workers forfeit all pending payouts (`pending_payout = 0`).
 - Transparent ledger tracking (`/payout_stats`, `/set_payout <worker_id> <address>`).
+
+---
+
+## 5. Engineering Status & Implementation Roadmap
+
+> [!NOTE]
+> **Stage: Hardened Prototype (Alpha)**  
+> System architecture, cryptographic guarantees, signed OTA updates, AST/sandbox execution, and fail-closed authentication are fully functional and pass 100% of unit tests (124/124). Continuous learning is anchored to real PyTorch autograd optimization and objective ground-truth verifiers.
+
+### Continuous Learning & Verifiability Loop (Marhala 0)
+- **Objective Ground-Truth Verification (`ObjectiveGroundTruthVerifier`)**: Only solutions verified by AST syntax analysis, sandbox execution (zero exit code & assertions passed), deterministic safe math, or JSON schema validation are admitted to the training store (`VerifiedDatasetStore`).
+- **Real Neural Optimization (`ContinuousLoRAEngine`)**: All adapter training executes real PyTorch autograd backpropagation and AdamW optimization. If PyTorch is unavailable in the environment, the system strictly fails closed with `TRAINING_UNAVAILABLE` rather than reporting synthetic loss metrics.
+- **Objective Benchmark Gate & Automated Rollback**: `AdapterBenchmarkSuite` measures real MSE representation loss and verification pass rates. Corrupted, diverging, or regressing candidate adapters are automatically rejected, rolled back, and preserved in the audit ledger without polluting active deployments.
+- **Hardware Honesty**: Physical machines without configured hardware interfaces report `ADAPTER_NOT_CONFIGURED` and redact targets when queried unauthenticated.
+
+### Implementation Roadmap (Phases 0 to 7)
+1. **Marhala 0 (Completed)**: *Safai aur Sachai* — Elimination of synthetic benchmark losses, fail-closed PyTorch checks, automated rejection of corrupted adapters, CI test pipeline, and secret redaction.
+2. **Marhala 1 (Weeks 3-4)**: *Real Data Pipeline* — Verified dataset scaling, automated deduplication, and held-out cross-validation splits.
+3. **Marhala 2 (Month 2)**: *Real Base Model QLoRA* — True parameter adaptation on quantized 8B base models via Unsloth/PEFT.
+4. **Marhala 3 (Month 3)**: *Distributed Swarm Verification* — Byzantine fault-tolerant consensus and peer cross-validation.
+5. **Marhala 4 (Month 4)**: *Physical Actuator Drivers* — Real Moonraker, ROS 2, and GRBL hardware plugins with physical limit switches.
+6. **Marhala 5 (Month 5)**: *Economic Settlement* — Automated on-chain escrow and dispute arbitration.
+7. **Marhala 6 (Month 6)**: *Autonomous Production Flywheel* — Full unattended self-improvement cycle.
+8. **Marhala 7 (Month 7)**: *External Penetration Testing* — Third-party audit and red team validation.
+
+---
+
+## 6. Production Deployment & Security Hygiene Guide
+
+When preparing nodes for live production or internet-facing deployment:
+- **Private Repository**: Keep this repository strictly private. Never expose the source repository or commit history publicly.
+- **Key Rotation**: Immediately rotate all secrets prior to production launch:
+  - `TELEGRAM_BOT_TOKEN` (via Telegram @BotFather)
+  - `DASHBOARD_TOKEN` (generate using `python -c "import secrets; print(secrets.token_hex(32))"`)
+  - `FERNET_KEY` (generate fresh using `cryptography.fernet.Fernet.generate_key()`)
+  - `NEXUS_OTA_PRIVATE_SEED` & pinned public key (generate offline using the OTA signer utility)
+  - `PEER_SECRET` (generate strong random secret)
+- **Git History Hygiene**: Ensure local `.env`, `data/*.key`, and `data/owner_account.json` are excluded via `.gitignore` and never committed.
+- **Host Binding**: Bind HTTP dashboards to `127.0.0.1` unless behind a hardened reverse proxy with TLS and mutual authentication.

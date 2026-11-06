@@ -122,6 +122,19 @@ class TestContinuousLearning(unittest.TestCase):
         self.assertIn("layers.0.self_attn.q_proj.lora_A.weight", report["tensors"])
         self.assertIn("layers.0.self_attn.q_proj.lora_B.weight", report["tensors"])
 
+    def test_04b_torch_unavailable_raises_clean_error(self):
+        """Marhala 0 Task 2: If PyTorch is unavailable, engine strictly raises TRAINING_UNAVAILABLE (never fake report)."""
+        import sovereign_mesh.continuous_learning as cl
+        orig = cl.TORCH_AVAILABLE
+        try:
+            cl.TORCH_AVAILABLE = False
+            engine = ContinuousLoRAEngine(dim=64, rank=8)
+            with self.assertRaises(RuntimeError) as ctx:
+                engine.train_on_verified_dataset([{"prompt": "task", "solution": "sol"}])
+            self.assertIn("TRAINING_UNAVAILABLE", str(ctx.exception))
+        finally:
+            cl.TORCH_AVAILABLE = orig
+
     def test_05_adapter_benchmark_suite(self):
         """Adapter benchmark suite runs standard algorithmic, math, and schema tasks and computes pass rate."""
         suite = AdapterBenchmarkSuite()
@@ -168,6 +181,34 @@ class TestContinuousLearning(unittest.TestCase):
         self.assertEqual(res["status"], "REJECTED_REGRESSION")
         self.assertIn("regressed", res["reason"])
         self.assertFalse(self.mgr.candidate_adapter_path.exists())
+
+        tail_events = [b["data"]["task"] for b in self.ledger.tail(10)]
+        self.assertIn("lora_adapter_rollback", tail_events)
+
+    def test_07b_kachra_adapter_rejected_and_rolled_back_by_real_benchmark(self):
+        """Marhala 0 Task 3: Deliberately corrupted/kachra adapter weights cause real loss to explode and are rejected by benchmark gate."""
+        self.mgr.populate_seed_verified_dataset()
+
+        # Simulate a bad/corrupted training output (kachra adapter with blown-up weights)
+        orig_train = self.mgr.engine.train_on_verified_dataset
+        def mock_kachra_training(dataset, epochs=6, lr=0.015):
+            rep = orig_train(dataset, epochs=epochs, lr=lr)
+            # Corrupt the weights with massive adversarial values
+            rep["tensors"]["layers.0.self_attn.q_proj.lora_A.weight"] = ([8, 64], [50.0] * 512)
+            rep["tensors"]["layers.0.self_attn.q_proj.lora_B.weight"] = ([64, 8], [50.0] * 512)
+            return rep
+
+        self.mgr.engine.train_on_verified_dataset = mock_kachra_training
+
+        # Run cycle with REAL un-mocked benchmark evaluation
+        res = self.mgr.run_training_and_deploy_cycle(epochs=2)
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["action"], "ROLLED_BACK")
+        self.assertEqual(res["status"], "REJECTED_REGRESSION")
+        self.assertIn("regressed", res["reason"])
+        self.assertFalse(self.mgr.candidate_adapter_path.exists())
+        self.assertFalse(self.mgr.active_adapter_path.exists(), "Kachra adapter must NEVER be deployed to active adapter")
 
         tail_events = [b["data"]["task"] for b in self.ledger.tail(10)]
         self.assertIn("lora_adapter_rollback", tail_events)
