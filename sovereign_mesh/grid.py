@@ -108,6 +108,7 @@ class UltimateAgiSovereignGrid:
         self.continuous_learning = ContinuousSelfImprovementManager(
             self.data_dir,
             ledger=self.ledger,
+            router=self.router,
         )
 
         self.system_lockdown = False

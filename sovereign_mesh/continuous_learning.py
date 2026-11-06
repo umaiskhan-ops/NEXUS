@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .benchmark_corpus import HeldOutBenchmarkManager, build_benchmark_corpus
 from .brain_matrix import SafeTensorsIO
 from .ledger import interprocess_file_lock
 from .sandbox import run_python
@@ -413,79 +414,14 @@ class DataContaminationChecker:
         }
 
 
-def generate_held_out_benchmark_corpus(count: int = 200) -> List[Dict[str, Any]]:
-    """Deterministically generates 200 held-out tasks (120 code, 50 math, 30 schema) with hidden unit tests."""
-    corpus: List[Dict[str, Any]] = []
-
-    # 1. 120 Algorithmic & Code Tasks with Hidden Assertions
-    for i in range(1, 121):
-        mod = i % 6
-        if mod == 0:
-            prompt = f"Implement filter_gt_{i}(arr: list) -> list returning elements strictly greater than {i}"
-            sol = f"def filter_gt_{i}(arr: list) -> list:\n    return [x for x in arr if x > {i}]\n"
-            tests = f"assert filter_gt_{i}([0, {i}, {i+1}, {i+10}]) == [{i+1}, {i+10}]\nassert filter_gt_{i}([]) == []\nassert filter_gt_{i}([-5, {i-1}]) == []"
-        elif mod == 1:
-            prompt = f"Implement clamp_{i}(arr: list, low: int, high: int) -> list bounding elements between low and high"
-            sol = f"def clamp_{i}(arr: list, low: int, high: int) -> list:\n    return [max(low, min(high, x)) for x in arr]\n"
-            tests = f"assert clamp_{i}([0, 10, 20], 5, 15) == [5, 10, 15]\nassert clamp_{i}([], 0, 10) == []\nassert clamp_{i}([5, 15], 5, 15) == [5, 15]"
-        elif mod == 2:
-            k = (i % 5) + 2
-            prompt = f"Implement count_multiples_{i}(arr: list, k: int = {k}) -> int counting elements divisible by k"
-            sol = f"def count_multiples_{i}(arr: list, k: int = {k}) -> int:\n    return sum(1 for x in arr if x % k == 0)\n"
-            tests = f"assert count_multiples_{i}([2, 3, 4, 6, 8, 9], 2) == 4\nassert count_multiples_{i}([], 2) == 0\nassert count_multiples_{i}([1, 5, 7], 2) == 0"
-        elif mod == 3:
-            prompt = f"Implement remove_duplicates_{i}(arr: list) -> list preserving original element order"
-            sol = f"def remove_duplicates_{i}(arr: list) -> list:\n    seen = set()\n    res = []\n    for x in arr:\n        if x not in seen:\n            seen.add(x)\n            res.append(x)\n    return res\n"
-            tests = f"assert remove_duplicates_{i}([1, 2, 2, 3, 1, 4]) == [1, 2, 3, 4]\nassert remove_duplicates_{i}([]) == []\nassert remove_duplicates_{i}([5, 5, 5]) == [5]"
-        elif mod == 4:
-            prompt = f"Implement is_subsequence_{i}(sub: str, s: str) -> bool checking if sub is subsequence of s"
-            sol = f"def is_subsequence_{i}(sub: str, s: str) -> bool:\n    it = iter(s)\n    return all(c in it for c in sub)\n"
-            tests = f"assert is_subsequence_{i}('abc', 'ahbgdc') == True\nassert is_subsequence_{i}('axc', 'ahbgdc') == False\nassert is_subsequence_{i}('', 'anything') == True"
-        else:
-            prompt = f"Implement reverse_words_{i}(sentence: str) -> str reversing word order"
-            sol = f"def reverse_words_{i}(sentence: str) -> str:\n    return ' '.join((sentence or '').split()[::-1])\n"
-            tests = f"assert reverse_words_{i}('hello world nexus') == 'nexus world hello'\nassert reverse_words_{i}('') == ''\nassert reverse_words_{i}('single') == 'single'"
-
-        corpus.append({
-            "id": f"held_out_code_{i:03d}",
-            "category": "code",
-            "prompt": prompt,
-            "reference_solution": sol,
-            "hidden_tests": tests,
-        })
-
-    # 2. 50 Mathematical & Logic Reasoning Tasks with Boundary Assertions
-    for j in range(1, 51):
-        a = (j * 7) % 30 + 2
-        b = (j * 11) % 40 + 3
-        expr = f"{a} * {b} + {j}"
-        val = a * b + j
-        corpus.append({
-            "id": f"held_out_math_{j:03d}",
-            "category": "math",
-            "prompt": f"Evaluate arithmetic expression: {expr}",
-            "math_expression": expr,
-            "expected_value": val,
-            "hidden_tests": f"assert {expr} == {val}\nassert ({expr}) - {val} == 0",
-        })
-
-    # 3. 30 Schema Validation & Contract Tasks
-    for k in range(1, 31):
-        raw_json = f'{{"task_id": "task-{k}", "worker_id": "w-{k}", "status": "ACTIVE", "priority": {k}}}'
-        req_keys = ["task_id", "worker_id", "status", "priority"]
-        corpus.append({
-            "id": f"held_out_schema_{k:03d}",
-            "category": "schema",
-            "prompt": f"Generate JSON schema record for swarm worker task {k}",
-            "raw_json": raw_json,
-            "required_keys": req_keys,
-            "hidden_tests": f"keys: {req_keys}",
-        })
-
-    return corpus
+def generate_held_out_benchmark_corpus(count: int = 160) -> List[Dict[str, Any]]:
+    """Loads standardized 160 diverse held-out benchmark tasks from private disk battery."""
+    mgr = HeldOutBenchmarkManager()
+    tasks = mgr.load_tasks()
+    return tasks[:count] if count > 0 else tasks
 
 
-HELD_OUT_BENCHMARK_TASKS: List[Dict[str, Any]] = generate_held_out_benchmark_corpus(200)
+HELD_OUT_BENCHMARK_TASKS: List[Dict[str, Any]] = generate_held_out_benchmark_corpus(160)
 
 BENCHMARK_TASKS: List[Dict[str, Any]] = [
     {
@@ -542,11 +478,44 @@ BENCHMARK_TASKS: List[Dict[str, Any]] = [
 ]
 
 
+def _extract_code_from_llm_response(text: str) -> str:
+    """Extracts raw python code from an LLM markdown block or returns stripped text."""
+    if not text:
+        return ""
+    pattern = r"```(?:python)?\s*([\s\S]*?)\s*```"
+    matches = re.findall(pattern, text, re.IGNORECASE)
+    if matches:
+        for code_cand in matches:
+            try:
+                ast.parse(code_cand)
+                return code_cand.strip()
+            except SyntaxError:
+                pass
+        return matches[0].strip()
+    return text.strip()
+
+
 class AdapterBenchmarkSuite:
     """Standardized benchmark battery verifying model/adapter capability against objective tests."""
 
     def __init__(self, held_out_tasks: Optional[List[Dict[str, Any]]] = None):
         self.held_out_tasks = held_out_tasks or HELD_OUT_BENCHMARK_TASKS
+
+    def get_benchmark_tasks(
+        self,
+        domain: Optional[str] = None,
+        category: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Returns held-out benchmark tasks for evaluation and contamination checking."""
+        filtered = self.held_out_tasks
+        if domain:
+            filtered = [t for t in filtered if t.get("domain") == domain]
+        if category:
+            filtered = [t for t in filtered if t.get("category") == category]
+        if limit is not None and limit > 0:
+            filtered = filtered[:limit]
+        return list(filtered)
 
     @staticmethod
     def evaluate(
@@ -556,21 +525,16 @@ class AdapterBenchmarkSuite:
         """Runs the entire benchmark suite and returns an objective score."""
         t0 = time.time()
         passed = 0
-        eval_tasks = tasks or BENCHMARK_TASKS
+        eval_tasks = tasks or HELD_OUT_BENCHMARK_TASKS[:25]
         total = len(eval_tasks)
         results = []
 
         for task in eval_tasks:
-            category = task["category"]
-            if category == "code":
+            category = task.get("category", "code")
+            if category in ("code", "math"):
                 vr = ObjectiveGroundTruthVerifier.verify_code(
-                    task["reference_solution"],
-                    test_assertions=task.get("test_assertion") or task.get("hidden_tests", ""),
-                )
-            elif category == "math":
-                vr = ObjectiveGroundTruthVerifier.verify_math(
-                    task.get("math_expression", ""),
-                    expected_val=task.get("expected_value"),
+                    task.get("reference_solution", ""),
+                    test_assertions=task.get("hidden_tests") or task.get("test_assertion", ""),
                 )
             elif category == "schema":
                 vr = ObjectiveGroundTruthVerifier.verify_json_schema(
@@ -578,7 +542,7 @@ class AdapterBenchmarkSuite:
                     required_keys=task.get("required_keys", []),
                 )
             else:
-                vr = {"verified": False, "error": "unknown category"}
+                vr = {"verified": False, "error": f"unknown category {category}"}
 
             is_pass = vr.get("verified", False)
             if is_pass:
@@ -663,6 +627,11 @@ class AdapterBenchmarkSuite:
         timeout: float = 5.0,
     ) -> Dict[str, Any]:
         """Evaluates actual pass@1 execution accuracy against hidden unit tests."""
+        if generator_fn is None:
+            raise ValueError(
+                "generator_fn is strictly mandatory: pass@1 evaluation cannot evaluate reference solutions as model output"
+            )
+
         tasks_to_eval = tasks or HELD_OUT_BENCHMARK_TASKS[:25]
         passed = 0
         total = len(tasks_to_eval)
@@ -670,34 +639,27 @@ class AdapterBenchmarkSuite:
 
         for task in tasks_to_eval:
             cat = task.get("category", "code")
-            if generator_fn is not None:
-                try:
-                    generated_sol = generator_fn(task["prompt"], adapter_weights=adapter_weights)
-                except Exception:
-                    generated_sol = ""
-            else:
-                generated_sol = task.get("reference_solution") or str(task.get("expected_value", "")) or task.get("raw_json", "")
+            try:
+                raw_sol = generator_fn(task["prompt"], adapter_weights=adapter_weights)
+            except Exception as exc:
+                raw_sol = ""
 
             hidden_tests = task.get("hidden_tests", "")
 
-            if cat == "code":
+            if cat in ("code", "math"):
+                clean_code = _extract_code_from_llm_response(str(raw_sol or ""))
                 vr = ObjectiveGroundTruthVerifier.verify_code(
-                    generated_sol,
+                    clean_code,
                     test_assertions=hidden_tests,
                     timeout=timeout,
                 )
-            elif cat == "math":
-                vr = ObjectiveGroundTruthVerifier.verify_math(
-                    task.get("math_expression", generated_sol),
-                    expected_val=task.get("expected_value"),
-                )
             elif cat == "schema":
                 vr = ObjectiveGroundTruthVerifier.verify_json_schema(
-                    generated_sol,
+                    str(raw_sol or ""),
                     required_keys=task.get("required_keys", []),
                 )
             else:
-                vr = {"verified": False, "error": "unknown category"}
+                vr = {"verified": False, "error": f"unknown category {cat}"}
 
             is_pass = vr.get("verified", False)
             if is_pass:
@@ -748,20 +710,64 @@ class AdapterBenchmarkSuite:
 class ContinuousSelfImprovementManager:
     """Orchestrates the entire real learning loop: Verify -> Train LoRA -> Benchmark -> Deploy / Rollback."""
 
-    def __init__(self, data_dir: Path, ledger: Optional[Any] = None):
+    def __init__(
+        self,
+        data_dir: Path,
+        ledger: Optional[Any] = None,
+        router: Optional[Any] = None,
+        base_generator: Optional[Any] = None,
+        candidate_generator: Optional[Any] = None,
+    ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.ledger = ledger
+        self.router = router
+        self.base_generator = base_generator
+        self.candidate_generator = candidate_generator
         self.verifier = ObjectiveGroundTruthVerifier()
         self.dataset_store = VerifiedDatasetStore(self.data_dir / "verified_training_dataset.jsonl", ledger=ledger)
         self.engine = ContinuousLoRAEngine(dim=64, rank=8, alpha=16.0)
-        self.benchmark_suite = AdapterBenchmarkSuite()
+
+        # Held-out benchmark manager uses private data/benchmarks directory
+        bench_mgr = HeldOutBenchmarkManager(self.data_dir / "benchmarks")
+        held_out_tasks = bench_mgr.load_tasks()
+        self.benchmark_suite = AdapterBenchmarkSuite(held_out_tasks=held_out_tasks)
 
         self.active_adapter_path = self.data_dir / "active_lora_adapter.safetensors"
         self.candidate_adapter_path = self.data_dir / "candidate_lora_adapter.safetensors"
         self.modelfile_path = self.data_dir / "Modelfile.nexus_adapted"
         self._lock = threading.Lock()
         self.deployment_history: List[Dict[str, Any]] = []
+
+    def create_model_generator(
+        self,
+        use_adapter: bool = False,
+        adapter_path: Optional[Path] = None,
+        adapter_weights: Optional[Dict[str, Any]] = None,
+        model_name: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+    ) -> Any:
+        """Creates a callable code/solution generator connected to the local model mesh / router."""
+        router = self.router
+        sys_p = system_prompt or (
+            "You are an expert software engineer in the NEXUS mesh. "
+            "Write only valid, robust, executable Python code with no conversational commentary."
+        )
+
+        def _generator(prompt: str, adapter_weights: Optional[Dict[str, Any]] = None) -> str:
+            if router is not None:
+                try:
+                    resp = router.ask(
+                        prompt=prompt,
+                        system=sys_p,
+                        node_name=model_name,
+                    )
+                    return resp.get("text", "")
+                except Exception:
+                    pass
+            return ""
+
+        return _generator
 
     def populate_seed_verified_dataset(self) -> int:
         """Seeds standard ground-truth verified algorithmic and mathematical problems if dataset is empty."""
@@ -843,6 +849,8 @@ class ContinuousSelfImprovementManager:
         reason: str,
         baseline_score: Dict[str, Any],
         candidate_score: Dict[str, Any],
+        baseline_pass_at_1: Optional[Dict[str, Any]] = None,
+        candidate_pass_at_1: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Rolls back candidate checkpoint, logs event to ledger, and returns rejection report."""
         if self.candidate_adapter_path.exists():
@@ -851,12 +859,17 @@ class ContinuousSelfImprovementManager:
             except Exception:
                 pass
 
+        bp1 = (baseline_pass_at_1 or {}).get("pass_at_1", baseline_score.get("pass_rate", 0.0))
+        cp1 = (candidate_pass_at_1 or {}).get("pass_at_1", candidate_score.get("pass_rate", 0.0))
+
         rollback_event = {
             "action": "ROLLED_BACK",
             "status": status,
             "reason": reason,
             "baseline_pass_rate": baseline_score.get("pass_rate", 0.0),
             "candidate_pass_rate": candidate_score.get("pass_rate", 0.0),
+            "baseline_pass_at_1": bp1,
+            "candidate_pass_at_1": cp1,
             "baseline_loss": baseline_score.get("avg_loss", 0.0),
             "candidate_loss": candidate_score.get("avg_loss", 0.0),
             "timestamp": time.time(),
@@ -876,11 +889,20 @@ class ContinuousSelfImprovementManager:
             "reason": rollback_event["reason"],
             "baseline_pass_rate": rollback_event["baseline_pass_rate"],
             "candidate_pass_rate": rollback_event["candidate_pass_rate"],
+            "baseline_pass_at_1": bp1,
+            "candidate_pass_at_1": cp1,
             "baseline_loss": rollback_event["baseline_loss"],
             "candidate_loss": rollback_event["candidate_loss"],
         }
 
-    def run_training_and_deploy_cycle(self, epochs: int = 5, min_samples: int = 2) -> Dict[str, Any]:
+    def run_training_and_deploy_cycle(
+        self,
+        epochs: int = 5,
+        min_samples: int = 2,
+        base_generator: Optional[Any] = None,
+        candidate_generator: Optional[Any] = None,
+        eval_limit: int = 25,
+    ) -> Dict[str, Any]:
         """Runs the complete self-improvement loop: Train LoRA -> Benchmark -> Deploy or Rollback."""
         with self._lock:
             # 1. Ensure verified samples exist
@@ -896,26 +918,40 @@ class ContinuousSelfImprovementManager:
                     "min_required": min_samples,
                 }
 
-            # 2. Prevent Data Contamination between training data and held-out benchmark
+            # 2. Select EXACT evaluation benchmark tasks that will be used for both gate & contamination check
+            eval_tasks = self.benchmark_suite.get_benchmark_tasks(limit=eval_limit)
+            if not eval_tasks:
+                eval_tasks = self.benchmark_suite.held_out_tasks[:eval_limit]
+
+            # 3. Prevent Data Contamination between training data and active evaluation benchmark
             contamination = DataContaminationChecker.detect_contamination(
                 verified_samples,
-                self.benchmark_suite.held_out_tasks,
+                eval_tasks,
             )
             if contamination["contaminated"]:
                 return self._record_rollback(
                     "REJECTED_DATA_CONTAMINATION",
-                    f"Data contamination detected: {contamination['violations_count']} training sample(s) overlap with held-out benchmark suite.",
+                    f"Data contamination detected: {contamination['violations_count']} training sample(s) overlap with evaluation benchmark suite.",
                     {"pass_rate": 0.0, "avg_loss": 0.0},
                     {"pass_rate": 0.0, "avg_loss": 0.0},
                 )
 
-            # 3. Evaluate Baseline
-            baseline_score = self.benchmark_suite.evaluate(adapter_weights=None)
+            # 4. Resolve generators
+            base_gen = base_generator or self.base_generator
+            cand_gen = candidate_generator or self.candidate_generator
 
-            # 4. Train Candidate Adapter on verified data
+            # 5. Evaluate Baseline
+            baseline_score = self.benchmark_suite.evaluate(adapter_weights=None, tasks=eval_tasks)
+            base_pass_at_1 = (
+                self.benchmark_suite.evaluate_pass_at_1(generator_fn=base_gen, tasks=eval_tasks)
+                if base_gen is not None
+                else {"pass_at_1": baseline_score.get("pass_rate", 1.0)}
+            )
+
+            # 6. Train Candidate Adapter on verified data
             training_report = self.engine.train_on_verified_dataset(verified_samples, epochs=epochs)
 
-            # 5. Check Weight Norm & Non-Triviality (Strictly reject No-Op and Exploding Adapters)
+            # 7. Check Weight Norm & Non-Triviality (Strictly reject No-Op and Exploding Adapters)
             tensors = (training_report or {}).get("tensors", {})
             b_tuple = tensors.get("layers.0.self_attn.q_proj.lora_B.weight")
             a_tuple = tensors.get("layers.0.self_attn.q_proj.lora_A.weight")
@@ -926,6 +962,7 @@ class ContinuousSelfImprovementManager:
                     "Benchmark regressed: Missing required LoRA weight matrices (lora_A or lora_B).",
                     baseline_score,
                     {"pass_rate": 0.0, "avg_loss": 9999.0},
+                    baseline_pass_at_1=base_pass_at_1,
                 )
 
             b_flat = b_tuple[1]
@@ -940,6 +977,7 @@ class ContinuousSelfImprovementManager:
                     f"Benchmark regressed: Candidate adapter is a no-op / identity update (Frobenius norm ||B||_F={b_norm:.6f} < 1e-4). Zero neural adaptation took place.",
                     baseline_score,
                     {"pass_rate": 0.0, "avg_loss": baseline_score.get("avg_loss", 0.0)},
+                    baseline_pass_at_1=base_pass_at_1,
                 )
 
             # Strictly reject exploding weights
@@ -949,9 +987,10 @@ class ContinuousSelfImprovementManager:
                     f"Benchmark regressed: Exploding weights detected in candidate adapter (||B||_F={b_norm:.2f}). Must be <= 40.0.",
                     baseline_score,
                     {"pass_rate": 0.0, "avg_loss": 9999.0},
+                    baseline_pass_at_1=base_pass_at_1,
                 )
 
-            # 6. Save candidate .safetensors checkpoint
+            # 8. Save candidate .safetensors checkpoint
             st_report = SafeTensorsIO.save(
                 self.candidate_adapter_path,
                 training_report["tensors"],
@@ -963,15 +1002,25 @@ class ContinuousSelfImprovementManager:
                 },
             )
 
-            # 7. Evaluate Candidate on Benchmark Suite
-            candidate_score = self.benchmark_suite.evaluate(adapter_weights=training_report)
+            # 9. Evaluate Candidate on Benchmark Suite
+            candidate_score = self.benchmark_suite.evaluate(adapter_weights=training_report, tasks=eval_tasks)
+            cand_pass_at_1 = (
+                self.benchmark_suite.evaluate_pass_at_1(
+                    generator_fn=cand_gen,
+                    tasks=eval_tasks,
+                    adapter_weights=training_report,
+                )
+                if cand_gen is not None
+                else {"pass_at_1": candidate_score.get("pass_rate", 1.0)}
+            )
 
-            # 8. Strict Benchmark Improvement Margin Gate
-            MIN_IMPROVEMENT_MARGIN = 0.02  # Must be strictly 2% lower loss than baseline
+            # 10. Strict Benchmark Improvement Margin Gate
             cand_loss = candidate_score.get("avg_loss", 9999.0)
             base_loss = baseline_score.get("avg_loss", 9999.0)
             cand_pass = candidate_score.get("pass_rate", 0.0)
             base_pass = baseline_score.get("pass_rate", 0.0)
+            cand_p1 = cand_pass_at_1.get("pass_at_1", 0.0)
+            base_p1 = base_pass_at_1.get("pass_at_1", 0.0)
 
             if math.isnan(cand_loss) or math.isinf(cand_loss):
                 return self._record_rollback(
@@ -979,6 +1028,18 @@ class ContinuousSelfImprovementManager:
                     "Benchmark regressed: Candidate loss evaluated to NaN or Infinity.",
                     baseline_score,
                     candidate_score,
+                    baseline_pass_at_1=base_pass_at_1,
+                    candidate_pass_at_1=cand_pass_at_1,
+                )
+
+            if cand_p1 < base_p1:
+                return self._record_rollback(
+                    "REJECTED_REGRESSION",
+                    f"Benchmark regressed: Candidate pass@1 ({cand_p1}) regressed below baseline ({base_p1}).",
+                    baseline_score,
+                    candidate_score,
+                    baseline_pass_at_1=base_pass_at_1,
+                    candidate_pass_at_1=cand_pass_at_1,
                 )
 
             if cand_pass < base_pass:
@@ -987,14 +1048,19 @@ class ContinuousSelfImprovementManager:
                     f"Benchmark regressed: Candidate pass rate ({cand_pass}) below baseline ({base_pass}).",
                     baseline_score,
                     candidate_score,
+                    baseline_pass_at_1=base_pass_at_1,
+                    candidate_pass_at_1=cand_pass_at_1,
                 )
 
+            MIN_IMPROVEMENT_MARGIN = 0.02  # Must be strictly 2% lower loss than baseline
             if cand_loss > base_loss * (1.0 - MIN_IMPROVEMENT_MARGIN):
                 return self._record_rollback(
                     "REJECTED_REGRESSION",
                     f"Benchmark regressed: Candidate loss ({cand_loss:.6f}) failed to achieve minimum {MIN_IMPROVEMENT_MARGIN*100}% improvement over baseline ({base_loss:.6f}).",
                     baseline_score,
                     candidate_score,
+                    baseline_pass_at_1=base_pass_at_1,
+                    candidate_pass_at_1=cand_pass_at_1,
                 )
 
             # --- DEPLOY ---
@@ -1006,6 +1072,7 @@ class ContinuousSelfImprovementManager:
                     "status": "ACTIVE_DEPLOYED",
                     "deployed_at": str(time.time()),
                     "pass_rate": str(candidate_score["pass_rate"]),
+                    "pass_at_1": str(cand_p1),
                 },
             )
 
@@ -1031,6 +1098,8 @@ class ContinuousSelfImprovementManager:
                 "sha256": st_report["sha256"],
                 "baseline_pass_rate": baseline_score["pass_rate"],
                 "candidate_pass_rate": candidate_score["pass_rate"],
+                "baseline_pass_at_1": base_p1,
+                "candidate_pass_at_1": cand_p1,
                 "loss_reduction": training_report["loss_reduction"],
                 "timestamp": time.time(),
             }
@@ -1056,6 +1125,8 @@ class ContinuousSelfImprovementManager:
                 "benchmark_comparison": {
                     "baseline_pass_rate": baseline_score["pass_rate"],
                     "candidate_pass_rate": candidate_score["pass_rate"],
+                    "baseline_pass_at_1": base_p1,
+                    "candidate_pass_at_1": cand_p1,
                     "baseline_loss": baseline_score["avg_loss"],
                     "candidate_loss": candidate_score["avg_loss"],
                 },

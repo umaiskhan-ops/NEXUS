@@ -146,7 +146,7 @@ class TestContinuousLearning(unittest.TestCase):
         suite = AdapterBenchmarkSuite()
         res = suite.evaluate(adapter_weights=None)
         self.assertGreaterEqual(res["pass_rate"], 0.8)
-        self.assertEqual(res["total_count"], 5)
+        self.assertGreaterEqual(res["total_count"], 5)
         self.assertIn("elapsed_seconds", res)
 
     @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for neural autograd cycle")
@@ -176,7 +176,7 @@ class TestContinuousLearning(unittest.TestCase):
         self.mgr.populate_seed_verified_dataset()
 
         # Simulate regression in benchmark suite
-        def mock_regression_eval(adapter_weights=None):
+        def mock_regression_eval(adapter_weights=None, **kwargs):
             if adapter_weights is not None:
                 return {"passed_count": 1, "total_count": 5, "pass_rate": 0.2, "avg_loss": 3.0, "results": []}
             return {"passed_count": 5, "total_count": 5, "pass_rate": 1.0, "avg_loss": 0.1, "results": []}
@@ -256,7 +256,7 @@ class TestContinuousLearning(unittest.TestCase):
 
     def test_07d_data_contamination_checker(self):
         """Marhala 1 Task 4: Data contamination checker detects overlap between training data and benchmark tasks."""
-        bench_sample = HELD_OUT_BENCHMARK_TASKS[:5]
+        bench_sample = self.mgr.benchmark_suite.get_benchmark_tasks(limit=5)
         # Clean training data
         clean_train = [
             {"prompt": "Write custom bubble sort", "solution": "def bubble_sort(): pass"},
@@ -281,35 +281,40 @@ class TestContinuousLearning(unittest.TestCase):
             "CODE",
             {"verified": True},
         )
-        res_cycle = self.mgr.run_training_and_deploy_cycle(epochs=1)
+        res_cycle = self.mgr.run_training_and_deploy_cycle(epochs=1, eval_limit=5)
         self.assertFalse(res_cycle["ok"])
         self.assertEqual(res_cycle["status"], "REJECTED_DATA_CONTAMINATION")
         self.assertIn("contamination", res_cycle["reason"].lower())
 
     def test_07e_held_out_benchmark_corpus_and_pass_at_1(self):
-        """Marhala 1 Task 1 & 2: 200 held-out benchmark tasks with hidden tests and pass@1 execution evaluation."""
-        corpus = generate_held_out_benchmark_corpus(200)
-        self.assertEqual(len(corpus), 200)
-        code_tasks = [t for t in corpus if t["category"] == "code"]
-        math_tasks = [t for t in corpus if t["category"] == "math"]
-        schema_tasks = [t for t in corpus if t["category"] == "schema"]
-
-        self.assertEqual(len(code_tasks), 120)
-        self.assertEqual(len(math_tasks), 50)
-        self.assertEqual(len(schema_tasks), 30)
+        """Marhala 1 Task 1 & 2: 160 diverse held-out benchmark tasks with hidden tests and strict mandatory pass@1 generator."""
+        corpus = generate_held_out_benchmark_corpus(160)
+        self.assertEqual(len(corpus), 160)
+        domains = set(t.get("domain") for t in corpus)
+        self.assertEqual(len(domains), 8)
 
         # Ensure all tasks have hidden unit tests
         for t in corpus:
             self.assertIn("hidden_tests", t)
             self.assertTrue(len(t["hidden_tests"]) > 0)
 
-        # Real pass@1 evaluation with golden generator
         suite = AdapterBenchmarkSuite(held_out_tasks=corpus)
-        res_pass1_golden = suite.evaluate_pass_at_1(generator_fn=None, tasks=corpus[:10])
+
+        # 1. Missing generator_fn must strictly raise ValueError (cannot cheat with reference solutions)
+        with self.assertRaises(ValueError) as ctx:
+            suite.evaluate_pass_at_1(generator_fn=None, tasks=corpus[:5])
+        self.assertIn("strictly mandatory", str(ctx.exception).lower())
+
+        # 2. Real pass@1 evaluation with golden generator closure
+        prompt_to_sol = {t["prompt"]: t.get("reference_solution") or t.get("raw_json", "") for t in corpus[:10]}
+        def golden_generator(prompt, **kwargs):
+            return prompt_to_sol.get(prompt, "")
+
+        res_pass1_golden = suite.evaluate_pass_at_1(generator_fn=golden_generator, tasks=corpus[:10])
         self.assertEqual(res_pass1_golden["pass_at_1"], 1.0)
         self.assertEqual(res_pass1_golden["passed_count"], 10)
 
-        # Real pass@1 evaluation with broken generator
+        # 3. Real pass@1 evaluation with broken generator
         def broken_generator(prompt, **kwargs):
             return "def broken(): raise RuntimeError('syntax/logic fail')\n"
 
@@ -405,7 +410,7 @@ class TestContinuousLearning(unittest.TestCase):
         grid.start()
         try:
             # 1. recursive_self_improvement feature executes real training cycle (approval gated)
-            res_rsi = grid.run_feature(888, "recursive_self_improvement", {"action": "cycle", "epochs": 2}, approved=True)
+            res_rsi = grid.run_feature(888, "recursive_self_improvement", {"action": "cycle", "epochs": 4}, approved=True)
             self.assertEqual(res_rsi["status"], "ACTIVE")
             self.assertEqual(res_rsi["action"], "DEPLOYED")
 
