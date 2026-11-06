@@ -768,13 +768,14 @@ class TestSecurityAudit50(unittest.TestCase):
                 self.assertFalse(err_resp["ok"])
                 self.assertIn("error", err_resp)
 
-            # --- R8: GET /api/machines redacts target when unauthenticated ---
+            # --- R8: GET /api/machines redacts target and baud when unauthenticated ---
             with urllib.request.urlopen(f"{base_url}/api/machines", timeout=5) as resp_m_unauth:
                 data_m_unauth = json.loads(resp_m_unauth.read().decode("utf-8"))
                 self.assertTrue(data_m_unauth["ok"])
                 self.assertTrue(data_m_unauth.get("redacted"))
                 for m in data_m_unauth["machines"]:
                     self.assertEqual(m["target"], "[REDACTED] (auth required)")
+                    self.assertEqual(m["baud"], "[REDACTED] (auth required)")
 
             req_m_auth = urllib.request.Request(f"{base_url}/api/machines", headers={"X-Dashboard-Token": "recheck4-token-999"})
             with urllib.request.urlopen(req_m_auth, timeout=5) as resp_m_auth:

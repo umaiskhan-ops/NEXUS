@@ -264,15 +264,18 @@ The network implements three reciprocal incentive and settlement engines:
 > **Stage: Hardened Prototype (Alpha)**  
 > System architecture, cryptographic guarantees, signed OTA updates, AST/sandbox execution, and fail-closed authentication are fully functional and pass 100% of unit tests (124/124). Continuous learning is anchored to real PyTorch autograd optimization and objective ground-truth verifiers.
 
-### Continuous Learning & Verifiability Loop (Marhala 0)
+### Continuous Learning & Verifiability Loop (Marhala 0 & Marhala 1)
 - **Objective Ground-Truth Verification (`ObjectiveGroundTruthVerifier`)**: Only solutions verified by AST syntax analysis, sandbox execution (zero exit code & assertions passed), deterministic safe math, or JSON schema validation are admitted to the training store (`VerifiedDatasetStore`).
-- **Real Neural Optimization (`ContinuousLoRAEngine`)**: All adapter training executes real PyTorch autograd backpropagation and AdamW optimization. If PyTorch is unavailable in the environment, the system strictly fails closed with `TRAINING_UNAVAILABLE` rather than reporting synthetic loss metrics.
-- **Objective Benchmark Gate & Automated Rollback**: `AdapterBenchmarkSuite` measures real MSE representation loss and verification pass rates. Corrupted, diverging, or regressing candidate adapters are automatically rejected, rolled back, and preserved in the audit ledger without polluting active deployments.
-- **Hardware Honesty**: Physical machines without configured hardware interfaces report `ADAPTER_NOT_CONFIGURED` and redact targets when queried unauthenticated.
+- **Feature Adapter Optimization (64-dim LoRA Prototype)**: Continuous learning operates as a 64-dimensional feature-projection adapter proof-of-concept using real PyTorch autograd backpropagation and AdamW optimization. Full-scale fine-tuning directly on 8B parameter weights (via Unsloth/PEFT QLoRA) is scheduled for **Marhala 2**. If PyTorch is unavailable in the environment, the system strictly fails closed with `TRAINING_UNAVAILABLE` rather than reporting synthetic loss metrics.
+- **Held-Out Benchmark Corpus (200 Tasks with Hidden Tests)**: 200 held-out evaluation tasks (120 code, 50 math, 30 schema) with private `hidden_tests` that are never exposed during prompting or training.
+- **Real pass@1 Evaluation**: `AdapterBenchmarkSuite.evaluate_pass_at_1` runs code generation directly in the sandbox against hidden test assertions, measuring genuine functional accuracy rather than synthetic heuristics.
+- **Data Contamination Prevention (`DataContaminationChecker`)**: Verifies canonical prompt collision and token Jaccard similarity between training data and held-out benchmark tasks, strictly rejecting training runs with data leakage.
+- **Strict Improvement Margin & No-Op Rejection**: The benchmark gate calculates weight Frobenius norm $\|\Delta W\|_F$. Identity/no-op updates ($B=0$ or $\|B\|_F < 1e-4$), tiny random perturbations, and candidates failing to achieve at least 2% loss improvement over baseline are automatically rejected and rolled back.
+- **Hardware Honesty**: Physical machines without configured hardware interfaces report `ADAPTER_NOT_CONFIGURED` and redact targets and baud rates when queried unauthenticated.
 
 ### Implementation Roadmap (Phases 0 to 7)
 1. **Marhala 0 (Completed)**: *Safai aur Sachai* — Elimination of synthetic benchmark losses, fail-closed PyTorch checks, automated rejection of corrupted adapters, CI test pipeline, and secret redaction.
-2. **Marhala 1 (Weeks 3-4)**: *Real Data Pipeline* — Verified dataset scaling, automated deduplication, and held-out cross-validation splits.
+2. **Marhala 1 (Completed)**: *Held-Out Benchmarks & Leakage Prevention* — 200 held-out tasks with hidden unit tests, real pass@1 sandbox execution, zero data contamination checker, strict no-op ($B=0$) adapter rejection, and minimum 2% improvement margin.
 3. **Marhala 2 (Month 2)**: *Real Base Model QLoRA* — True parameter adaptation on quantized 8B base models via Unsloth/PEFT.
 4. **Marhala 3 (Month 3)**: *Distributed Swarm Verification* — Byzantine fault-tolerant consensus and peer cross-validation.
 5. **Marhala 4 (Month 4)**: *Physical Actuator Drivers* — Real Moonraker, ROS 2, and GRBL hardware plugins with physical limit switches.

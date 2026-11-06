@@ -767,6 +767,7 @@ def make_handler(grid, client):
                     for m in machines.values():
                         item = dict(m)
                         item["target"] = "[REDACTED] (auth required)"
+                        item["baud"] = "[REDACTED] (auth required)"
                         redacted.append(item)
                     return self._send(200, {"ok": True, "machines": redacted, "redacted": True})
                 return self._send(200, {"ok": True, "machines": list(machines.values())})
@@ -1102,10 +1103,15 @@ def make_handler(grid, client):
                     return self._send(200 if res.get("verified") else 400, {"ok": bool(res.get("verified")), **res})
 
                 if path == "/api/learning/train":
-                    epochs = int(body.get("epochs", 4) or 4)
-                    min_samples = int(body.get("min_samples", 2) or 2)
-                    res = grid.continuous_learning.run_training_and_deploy_cycle(epochs=epochs, min_samples=min_samples)
-                    return self._send(200 if res.get("ok") else 400, res)
+                    try:
+                        epochs = int(body.get("epochs", 4) or 4)
+                        min_samples = int(body.get("min_samples", 2) or 2)
+                        res = grid.continuous_learning.run_training_and_deploy_cycle(epochs=epochs, min_samples=min_samples)
+                        return self._send(200 if res.get("ok") else 400, res)
+                    except RuntimeError as r_err:
+                        if "TRAINING_UNAVAILABLE" in str(r_err):
+                            return self._send(503, {"ok": False, "error": str(r_err), "status": "TRAINING_UNAVAILABLE"})
+                        return self._send(500, {"ok": False, "error": str(r_err)})
 
             if path in {"/api/worker/register", "/api/worker/heartbeat", "/api/worker/submit_result", "/api/worker/enqueue_task"}:
                 import secrets

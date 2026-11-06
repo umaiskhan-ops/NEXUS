@@ -25,8 +25,12 @@ from sovereign_mesh.continuous_learning import (
     AdapterBenchmarkSuite,
     ContinuousLoRAEngine,
     ContinuousSelfImprovementManager,
+    DataContaminationChecker,
+    HELD_OUT_BENCHMARK_TASKS,
     ObjectiveGroundTruthVerifier,
+    TORCH_AVAILABLE,
     VerifiedDatasetStore,
+    generate_held_out_benchmark_corpus,
 )
 from sovereign_mesh.grid import UltimateAgiSovereignGrid
 from sovereign_mesh.ledger import HashChainLedger
@@ -105,6 +109,7 @@ class TestContinuousLearning(unittest.TestCase):
         reloaded = VerifiedDatasetStore(self.data_dir / "test_dataset.jsonl")
         self.assertEqual(reloaded.count(), 2)
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for neural autograd")
     def test_04_continuous_lora_engine_autograd_loss_reduction(self):
         """Continuous LoRA engine executes real backprop with measurable loss reduction across epochs."""
         engine = ContinuousLoRAEngine(dim=64, rank=8, alpha=16.0)
@@ -135,6 +140,7 @@ class TestContinuousLearning(unittest.TestCase):
         finally:
             cl.TORCH_AVAILABLE = orig
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for benchmark loss evaluation")
     def test_05_adapter_benchmark_suite(self):
         """Adapter benchmark suite runs standard algorithmic, math, and schema tasks and computes pass rate."""
         suite = AdapterBenchmarkSuite()
@@ -143,6 +149,7 @@ class TestContinuousLearning(unittest.TestCase):
         self.assertEqual(res["total_count"], 5)
         self.assertIn("elapsed_seconds", res)
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for neural autograd cycle")
     def test_06_self_improvement_manager_deploy_cycle(self):
         """Manager runs complete cycle, detects benchmark pass, and deploys active adapter + Modelfile."""
         self.assertEqual(self.mgr.dataset_store.count(), 0)
@@ -163,6 +170,7 @@ class TestContinuousLearning(unittest.TestCase):
         tail_events = [b["data"]["task"] for b in self.ledger.tail(10)]
         self.assertIn("lora_adapter_deployed", tail_events)
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for neural autograd")
     def test_07_self_improvement_manager_automated_rollback(self):
         """When candidate adapter regresses on benchmark, candidate is rejected and rollback is recorded."""
         self.mgr.populate_seed_verified_dataset()
@@ -185,6 +193,7 @@ class TestContinuousLearning(unittest.TestCase):
         tail_events = [b["data"]["task"] for b in self.ledger.tail(10)]
         self.assertIn("lora_adapter_rollback", tail_events)
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for real benchmark evaluation")
     def test_07b_kachra_adapter_rejected_and_rolled_back_by_real_benchmark(self):
         """Marhala 0 Task 3: Deliberately corrupted/kachra adapter weights cause real loss to explode and are rejected by benchmark gate."""
         self.mgr.populate_seed_verified_dataset()
@@ -212,6 +221,101 @@ class TestContinuousLearning(unittest.TestCase):
 
         tail_events = [b["data"]["task"] for b in self.ledger.tail(10)]
         self.assertIn("lora_adapter_rollback", tail_events)
+
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for neural autograd")
+    def test_07c_no_op_and_tiny_adapters_rejected(self):
+        """Marhala 1 Task 3: Identity/No-Op adapters (B=0) and tiny non-improving adapters are strictly rejected."""
+        self.mgr.populate_seed_verified_dataset()
+
+        # Case 1: Identity / No-Op adapter (B == 0)
+        orig_train = self.mgr.engine.train_on_verified_dataset
+        def mock_noop_training(dataset, epochs=5, lr=0.015):
+            rep = orig_train(dataset, epochs=epochs, lr=lr)
+            # Force B to all zeros (no-op update)
+            rep["tensors"]["layers.0.self_attn.q_proj.lora_B.weight"] = ([64, 8], [0.0] * 512)
+            return rep
+
+        self.mgr.engine.train_on_verified_dataset = mock_noop_training
+        res_noop = self.mgr.run_training_and_deploy_cycle(epochs=2)
+        self.assertFalse(res_noop["ok"])
+        self.assertEqual(res_noop["action"], "ROLLED_BACK")
+        self.assertIn("no-op", res_noop["reason"].lower())
+        self.assertFalse(self.mgr.active_adapter_path.exists(), "No-op adapter must never be deployed")
+
+        # Case 2: Tiny random adapter (B norm < 1e-4)
+        def mock_tiny_training(dataset, epochs=5, lr=0.015):
+            rep = orig_train(dataset, epochs=epochs, lr=lr)
+            rep["tensors"]["layers.0.self_attn.q_proj.lora_B.weight"] = ([64, 8], [1e-6] * 512)
+            return rep
+
+        self.mgr.engine.train_on_verified_dataset = mock_tiny_training
+        res_tiny = self.mgr.run_training_and_deploy_cycle(epochs=2)
+        self.assertFalse(res_tiny["ok"])
+        self.assertEqual(res_tiny["action"], "ROLLED_BACK")
+        self.assertIn("no-op", res_tiny["reason"].lower())
+
+    def test_07d_data_contamination_checker(self):
+        """Marhala 1 Task 4: Data contamination checker detects overlap between training data and benchmark tasks."""
+        bench_sample = HELD_OUT_BENCHMARK_TASKS[:5]
+        # Clean training data
+        clean_train = [
+            {"prompt": "Write custom bubble sort", "solution": "def bubble_sort(): pass"},
+            {"prompt": "Calculate factorial of 5", "solution": "120"},
+        ]
+        res_clean = DataContaminationChecker.detect_contamination(clean_train, bench_sample)
+        self.assertFalse(res_clean["contaminated"])
+        self.assertEqual(res_clean["violations_count"], 0)
+
+        # Contaminated training data (exact prompt match)
+        leaked_train = [
+            {"prompt": bench_sample[0]["prompt"], "solution": "cheated solution"},
+        ]
+        res_leaked = DataContaminationChecker.detect_contamination(leaked_train, bench_sample)
+        self.assertTrue(res_leaked["contaminated"])
+        self.assertEqual(res_leaked["violations_count"], 1)
+
+        # Contaminated training data via mgr cycle
+        self.mgr.dataset_store.record_verified(
+            bench_sample[0]["prompt"],
+            "def leak(): pass",
+            "CODE",
+            {"verified": True},
+        )
+        res_cycle = self.mgr.run_training_and_deploy_cycle(epochs=1)
+        self.assertFalse(res_cycle["ok"])
+        self.assertEqual(res_cycle["status"], "REJECTED_DATA_CONTAMINATION")
+        self.assertIn("contamination", res_cycle["reason"].lower())
+
+    def test_07e_held_out_benchmark_corpus_and_pass_at_1(self):
+        """Marhala 1 Task 1 & 2: 200 held-out benchmark tasks with hidden tests and pass@1 execution evaluation."""
+        corpus = generate_held_out_benchmark_corpus(200)
+        self.assertEqual(len(corpus), 200)
+        code_tasks = [t for t in corpus if t["category"] == "code"]
+        math_tasks = [t for t in corpus if t["category"] == "math"]
+        schema_tasks = [t for t in corpus if t["category"] == "schema"]
+
+        self.assertEqual(len(code_tasks), 120)
+        self.assertEqual(len(math_tasks), 50)
+        self.assertEqual(len(schema_tasks), 30)
+
+        # Ensure all tasks have hidden unit tests
+        for t in corpus:
+            self.assertIn("hidden_tests", t)
+            self.assertTrue(len(t["hidden_tests"]) > 0)
+
+        # Real pass@1 evaluation with golden generator
+        suite = AdapterBenchmarkSuite(held_out_tasks=corpus)
+        res_pass1_golden = suite.evaluate_pass_at_1(generator_fn=None, tasks=corpus[:10])
+        self.assertEqual(res_pass1_golden["pass_at_1"], 1.0)
+        self.assertEqual(res_pass1_golden["passed_count"], 10)
+
+        # Real pass@1 evaluation with broken generator
+        def broken_generator(prompt, **kwargs):
+            return "def broken(): raise RuntimeError('syntax/logic fail')\n"
+
+        res_pass1_broken = suite.evaluate_pass_at_1(generator_fn=broken_generator, tasks=corpus[:5])
+        self.assertEqual(res_pass1_broken["pass_at_1"], 0.0)
+        self.assertEqual(res_pass1_broken["passed_count"], 0)
 
     def test_08_server_api_learning_endpoints_and_auth(self):
         """Server exposes /api/learning/status, /verify, /train with strict authentication."""
@@ -269,20 +373,26 @@ class TestContinuousLearning(unittest.TestCase):
             # POST /api/learning/train (auth triggers self-improvement cycle)
             req_train = urllib.request.Request(
                 f"{base}/api/learning/train",
-                data=json.dumps({"epochs": 3, "min_samples": 1}).encode("utf-8"),
+                data=json.dumps({"epochs": 3, "min_samples": 2}).encode("utf-8"),
                 headers=auth_hdrs,
             )
-            with urllib.request.urlopen(req_train, timeout=10) as resp_t:
-                t_data = json.loads(resp_t.read().decode("utf-8"))
-                self.assertTrue(t_data["ok"])
-                self.assertEqual(t_data["action"], "DEPLOYED")
-                self.assertIn("training_report", t_data)
+            if TORCH_AVAILABLE:
+                with urllib.request.urlopen(req_train, timeout=10) as resp_t:
+                    t_data = json.loads(resp_t.read().decode("utf-8"))
+                    self.assertTrue(t_data["ok"])
+                    self.assertEqual(t_data["action"], "DEPLOYED")
+                    self.assertIn("training_report", t_data)
+            else:
+                with self.assertRaises(urllib.error.HTTPError) as ctx_t:
+                    urllib.request.urlopen(req_train, timeout=10)
+                self.assertEqual(ctx_t.exception.code, 503)
 
         finally:
             srv.shutdown()
             srv.server_close()
             grid.stop()
 
+    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for recursive_self_improvement cycle")
     def test_09_feature_integration_code_voting_and_recursive_improvement(self):
         """recursive_self_improvement and multi_ai_code_voting connect to continuous learning loop."""
         cfg = GridConfig(
