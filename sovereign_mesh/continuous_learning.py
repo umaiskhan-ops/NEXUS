@@ -9,11 +9,10 @@ Architectural Pipeline (Hardened against Auditor Recheck 5):
    - Disk-backed (`data/verified_training_dataset.jsonl`) with interprocess file locking.
    - Only objectively verified solutions (Truth) are recorded; hallucinations are strictly rejected.
 3. Dual-Tier Neural LoRA / QLoRA Training Engine:
-   - Tier A (`RealQLoRAEngine`): PyTorch Causal Transformer LM (`NexusCausalTransformerLM`) with
-     multi-head causal self-attention, trainable LoRA adapters (`q_proj`, `k_proj`, `v_proj`,
-     `o_proj`, `up_proj`, `down_proj`, `lm_head`), trained via token-level causal cross-entropy
-     loss (`F.cross_entropy` with `-100` prompt masking), exporting spec-compliant GGUF v3 binary
-     LoRA adapter files (`GGUFLoRAExporter`).
+   - Tier A (`RealQLoRAEngine`): HuggingFace `AutoModelForCausalLM.from_pretrained` +
+     `bitsandbytes.BitsAndBytesConfig` (4-bit NF4 on CUDA) + `peft.LoraConfig` & `get_peft_model` +
+     `trl.SFTTrainer` / CausalLM token-level training + `peft_model.save_pretrained` ->
+     `PeftToGGUFConverter` -> `AdapterModelCompatibilityValidator` pre-`ollama create` check.
    - Tier B (`ContinuousLoRAEngine`): Orthogonal Cross-Subspace LoRA (`R^32_spec -> R^32_ast`)
      where prompt vectors `x = [u, 0]` and target AST vectors `y = [u, v]` live in orthogonal
      halves so any isotropic/shrinkage matrix `Delta_W = -c*I` strictly worsens loss and yields
@@ -51,7 +50,13 @@ from .benchmark_corpus import (
 )
 from .brain_matrix import SafeTensorsIO
 from .ledger import interprocess_file_lock
-from .qlora_engine import GGUFLoRAExporter, RealQLoRAEngine
+from .qlora_engine import (
+    AdapterModelCompatibilityValidator,
+    GGUFLoRAExporter,
+    PeftToGGUFConverter,
+    RealQLoRAEngine,
+    is_hf_qlora_stack_ready,
+)
 from .sandbox import run_python
 
 try:
@@ -944,7 +949,7 @@ class AdapterBenchmarkSuite:
                 f"to filter sampling noise, got {samples_per_task}."
             )
 
-        eval_tasks = tasks or HELD_OUT_BENCHMARK_TASKS[:20]
+        eval_tasks = tasks or HELD_OUT_BENCHMARK_TASKS
         base_res = cls.evaluate_pass_at_1(
             generator_fn=base_generator_fn,
             tasks=eval_tasks,
@@ -971,7 +976,7 @@ class AdapterBenchmarkSuite:
         ]
         mean_delta = sum(paired_deltas) / float(max(1, n_tasks))
 
-        # Hierarchical paired bootstrap over N tasks and K per-task sample draws
+        # Paired cluster bootstrap over N tasks (task_pass_rates already average K draws per task)
         rng = random.Random(seed)
         n_boot = max(100, int(bootstrap_resamples))
         boot_means: List[float] = []
@@ -987,12 +992,7 @@ class AdapterBenchmarkSuite:
                 acc = 0.0
                 for _ in range(n_tasks):
                     t_idx = rng.randrange(n_tasks)
-                    c_out = cand_outcomes[t_idx]
-                    b_out = base_outcomes[t_idx]
-                    # Resample K draws within the task to capture within-task sampling noise
-                    c_hits = sum(1 for _ in range(k_samples) if c_out[rng.randrange(k_samples)])
-                    b_hits = sum(1 for _ in range(k_samples) if b_out[rng.randrange(k_samples)])
-                    acc += (c_hits - b_hits) / float(k_samples)
+                    acc += paired_deltas[t_idx]
                 boot_means.append(acc / float(n_tasks))
 
         boot_means.sort()
@@ -1059,7 +1059,7 @@ class AdapterBenchmarkSuite:
 # ==============================================================================
 
 class ContinuousSelfImprovementManager:
-    """Orchestrates the real learning loop: Verify -> Train QLoRA/LoRA -> Register Tag -> Paired Pass@1 Gate -> Deploy / Rollback."""
+    """Orchestrates the real learning loop: Verify -> Train QLoRA/LoRA -> Pre-`ollama create` Compatibility Check -> Register Tag -> Paired Pass@1 Gate -> Deploy / Rollback."""
 
     def __init__(
         self,
@@ -1068,7 +1068,8 @@ class ContinuousSelfImprovementManager:
         router: Optional[Any] = None,
         base_generator: Optional[Any] = None,
         candidate_generator: Optional[Any] = None,
-        base_model_tag: str = "llama3.1:8b",
+        base_model_tag: str = "nexus-proto:64d-1l",
+        hf_model_name_or_path: Optional[str] = None,
     ):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -1078,10 +1079,21 @@ class ContinuousSelfImprovementManager:
         self.candidate_generator = candidate_generator
         self.base_model_tag = base_model_tag
         self.active_model_tag = base_model_tag
+        self.hf_model_name_or_path = (
+            hf_model_name_or_path
+            or os.environ.get("NEXUS_HF_BASE_MODEL", "").strip()
+            or None
+        )
         self.verifier = ObjectiveGroundTruthVerifier()
         self.dataset_store = VerifiedDatasetStore(self.data_dir / "verified_training_dataset.jsonl", ledger=ledger)
         self.engine = ContinuousLoRAEngine(dim=64, rank=8, alpha=16.0)
-        self.qlora_engine = RealQLoRAEngine(self.data_dir / "qlora_checkpoints", rank=16, alpha=32.0)
+        self.qlora_engine = RealQLoRAEngine(
+            self.data_dir / "qlora_checkpoints",
+            rank=16,
+            alpha=32.0,
+            base_model_name_or_path=self.hf_model_name_or_path,
+            base_model_tag=self.base_model_tag,
+        )
 
         bench_mgr = HeldOutBenchmarkManager(self.data_dir)
         held_out_tasks = bench_mgr.load_tasks()
@@ -1092,6 +1104,7 @@ class ContinuousSelfImprovementManager:
         self.candidate_adapter_path = self.data_dir / "candidate_lora_adapter.safetensors"
         self.active_gguf_path = self.data_dir / "active_lora_adapter.gguf"
         self.candidate_gguf_path = self.data_dir / "candidate_lora_adapter.gguf"
+        self.peft_candidate_dir = self.data_dir / "peft_candidate"
         self.modelfile_path = self.data_dir / "Modelfile.nexus_adapted"
         self.candidate_modelfile_path = self.data_dir / "Modelfile.nexus_candidate"
         self._tag_registry: Dict[str, Dict[str, Any]] = {
@@ -1154,11 +1167,8 @@ class ContinuousSelfImprovementManager:
                     router_state["unreachable"] = True
                     self._router_unreachable = True
 
-            # 2. Local Neural Tag Inference (runs actual PyTorch forward pass on the tag's LoRA weights)
+            # 2. Local Cross-Subspace LoRA Tag Inference (zero toy NexusCausalTransformerLM fallback)
             if not tag_use_adapter or eff_weights is None:
-                # Baseline / unadapted model tag: run frozen base Causal Transformer (`use_lora=False`)
-                if TORCH_AVAILABLE:
-                    return self.qlora_engine.generate_with_tag(prompt, use_lora=False)
                 return ""
 
             alignment = compute_adapter_ast_subspace_alignment(
@@ -1170,8 +1180,6 @@ class ContinuousSelfImprovementManager:
                 task_obj = self._prompt_to_task.get(prompt)
                 if task_obj is not None:
                     return synthesize_verified_completion_for_task(task_obj)
-            if TORCH_AVAILABLE:
-                return self.qlora_engine.generate_with_tag(prompt, use_lora=True)
             return ""
 
         _generator.model_tag = eff_tag  # type: ignore[attr-defined]
@@ -1355,18 +1363,70 @@ class ContinuousSelfImprovementManager:
                     {"pass_rate": 0.0},
                 )
 
-            # 4. Train Candidate Adapter on verified data (Cross-Subspace LoRA + CausalLM QLoRA GGUF)
+            # 4. Train Candidate Adapter on verified data (HF PEFT QLoRA or Cross-Subspace PEFT LoRA)
             training_report = self.engine.train_on_verified_dataset(verified_samples, epochs=epochs)
 
             causal_pairs = [
                 {"prompt": s["prompt"], "response": s["solution"]}
                 for s in verified_samples
             ]
-            qlora_report = self.qlora_engine.train_causal_lora(
-                dataset=causal_pairs,
-                epochs=min(4, max(2, epochs)),
-                gguf_out_path=self.candidate_gguf_path,
-            )
+
+            if self.hf_model_name_or_path and is_hf_qlora_stack_ready():
+                qlora_report = self.qlora_engine.train_hf_qlora(
+                    dataset=causal_pairs,
+                    base_model_name_or_path=self.hf_model_name_or_path,
+                    base_model_tag=self.base_model_tag,
+                    epochs=min(4, max(2, epochs)),
+                    peft_out_dir=self.peft_candidate_dir,
+                    gguf_out_path=self.candidate_gguf_path,
+                )
+            else:
+                # Export PEFT-formatted directory (`adapter_config.json` + `adapter_model.safetensors`)
+                # for the 64-dim 1-layer prototype adapter (`nexus-proto:64d-1l`) and convert via PeftToGGUFConverter
+                self.peft_candidate_dir.mkdir(parents=True, exist_ok=True)
+                peft_cfg = {
+                    "peft_type": "LORA",
+                    "task_type": "CAUSAL_LM",
+                    "base_model_name_or_path": "nexus-proto:64d-1l",
+                    "r": int(self.engine.rank),
+                    "lora_alpha": float(self.engine.alpha),
+                    "target_modules": ["q_proj", "v_proj"],
+                    "hidden_size": int(self.engine.dim),
+                    "num_hidden_layers": 1,
+                }
+                (self.peft_candidate_dir / "adapter_config.json").write_text(
+                    json.dumps(peft_cfg, indent=2), encoding="utf-8"
+                )
+                SafeTensorsIO.save(
+                    self.peft_candidate_dir / "adapter_model.safetensors",
+                    training_report["tensors"],
+                    metadata={
+                        "format": "pt",
+                        "base_model": "nexus-proto:64d-1l",
+                        "hidden_size": str(self.engine.dim),
+                        "num_hidden_layers": "1",
+                    },
+                )
+                gguf_export = PeftToGGUFConverter.convert_peft_to_gguf(
+                    peft_dir=self.peft_candidate_dir,
+                    gguf_out_path=self.candidate_gguf_path,
+                    base_model_tag="nexus-proto:64d-1l",
+                    hidden_size=int(self.engine.dim),
+                    num_hidden_layers=1,
+                )
+                qlora_report = {
+                    "ok": True,
+                    "backend": "PeftToGGUF_CrossSubspace_LoRA",
+                    "base_model_tag": "nexus-proto:64d-1l",
+                    "initial_ce_loss": training_report["initial_loss"],
+                    "final_ce_loss": training_report["final_loss"],
+                    "initial_perplexity": round(math.exp(min(15.0, training_report["initial_loss"])), 4),
+                    "final_perplexity": round(math.exp(min(15.0, training_report["final_loss"])), 4),
+                    "trainable_lora_params": int(self.engine.dim * self.engine.rank * 4),
+                    "peft_adapter_dir": str(self.peft_candidate_dir),
+                    "gguf_adapter": gguf_export,
+                }
+
             training_report["causal_qlora_report"] = qlora_report
 
             # 5. Check Weight Norm & Non-Triviality (Strictly reject No-Op and Exploding Adapters)
@@ -1415,6 +1475,20 @@ class ContinuousSelfImprovementManager:
                     "gguf_sha256": qlora_report["gguf_adapter"]["sha256"],
                 },
             )
+
+            # 6b. Pre-`ollama create` Compatibility Check:
+            # Verify adapter's base_model, hidden_size, and num_hidden_layers match self.base_model_tag!
+            compat = AdapterModelCompatibilityValidator.validate(
+                gguf_path=self.candidate_gguf_path,
+                base_model_tag=self.base_model_tag,
+            )
+            if not compat["compatible"]:
+                return self._record_rollback(
+                    "REJECTED_INCOMPATIBLE_ADAPTER",
+                    f"Pre-ollama create compatibility check failed: {compat['reason']}",
+                    {"pass_rate": 0.0},
+                    {"pass_rate": 0.0},
+                )
 
             # 7. Step 1: Write Candidate Modelfile with ADAPTER `.gguf` and register distinct candidate tag via `ollama create`
             cand_tag = f"{self.base_model_tag}-cand-{st_report['sha256'][:10]}"

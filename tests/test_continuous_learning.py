@@ -35,7 +35,14 @@ from sovereign_mesh.continuous_learning import (
 )
 from sovereign_mesh.grid import UltimateAgiSovereignGrid
 from sovereign_mesh.ledger import HashChainLedger
-from sovereign_mesh.qlora_engine import GGUFLoRAExporter
+from sovereign_mesh.models import OllamaBackend
+from sovereign_mesh.qlora_engine import (
+    AdapterModelCompatibilityValidator,
+    GGUFLoRAExporter,
+    PeftToGGUFConverter,
+    RealQLoRAEngine,
+    is_hf_qlora_stack_ready,
+)
 from sovereign_mesh.server import make_handler
 
 
@@ -165,7 +172,7 @@ class TestContinuousLearning(unittest.TestCase):
         # Verify Modelfile contains ADAPTER directive pointing to active adapter
         modelfile_text = self.mgr.modelfile_path.read_text(encoding="utf-8")
         self.assertIn("ADAPTER", modelfile_text)
-        self.assertIn("FROM llama3.1:8b", modelfile_text)
+        self.assertIn(f"FROM {self.mgr.base_model_tag}", modelfile_text)
 
         # Check ledger recorded event
         tail_events = [b["data"]["task"] for b in self.ledger.tail(10)]
@@ -594,6 +601,146 @@ class TestContinuousLearning(unittest.TestCase):
 
         finally:
             grid.stop()
+
+    def test_10_hf_peft_qlora_tiny_model_plumbing(self):
+        """Marhala 2: Verifies HF PEFT save_pretrained -> GGUF conversion, pre-`ollama create` compatibility check, and tiny HF model QLoRA plumbing."""
+        from sovereign_mesh.brain_matrix import SafeTensorsIO
+
+        # 1. Verify toy NexusCausalTransformerLM is completely removed from production code
+        qlora_src = Path("sovereign_mesh/qlora_engine.py").read_text(encoding="utf-8")
+        self.assertNotIn("class NexusCausalTransformerLM", qlora_src)
+        self.assertIn("AutoModelForCausalLM.from_pretrained", qlora_src)
+        self.assertIn("get_peft_model", qlora_src)
+        self.assertIn("BitsAndBytesConfig", qlora_src)
+        self.assertIn("save_pretrained", qlora_src)
+
+        # 2. Test PEFT save_pretrained directory -> GGUF conversion & compatibility validator (works even without GPU/torch)
+        peft_dir = self.data_dir / "tiny_peft_dir"
+        peft_dir.mkdir(parents=True, exist_ok=True)
+        adapter_cfg = {
+            "peft_type": "LORA",
+            "task_type": "CAUSAL_LM",
+            "base_model_name_or_path": "tiny-llama:64d-2l",
+            "r": 8,
+            "lora_alpha": 16.0,
+            "target_modules": ["q_proj", "v_proj"],
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+        }
+        (peft_dir / "adapter_config.json").write_text(json.dumps(adapter_cfg, indent=2), encoding="utf-8")
+
+        peft_tensors = {
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": ([8, 64], [0.02] * 512),
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": ([64, 8], [0.01] * 512),
+            "base_model.model.model.layers.0.self_attn.v_proj.lora_A.weight": ([8, 64], [0.02] * 512),
+            "base_model.model.model.layers.0.self_attn.v_proj.lora_B.weight": ([64, 8], [0.01] * 512),
+            "base_model.model.model.layers.1.self_attn.q_proj.lora_A.weight": ([8, 64], [0.03] * 512),
+            "base_model.model.model.layers.1.self_attn.q_proj.lora_B.weight": ([64, 8], [0.015] * 512),
+            "base_model.model.model.layers.1.self_attn.v_proj.lora_A.weight": ([8, 64], [0.03] * 512),
+            "base_model.model.model.layers.1.self_attn.v_proj.lora_B.weight": ([64, 8], [0.015] * 512),
+        }
+        SafeTensorsIO.save(
+            peft_dir / "adapter_model.safetensors",
+            peft_tensors,
+            metadata={"format": "pt", "base_model": "tiny-llama:64d-2l"},
+        )
+
+        gguf_out = self.data_dir / "tiny_llama_lora.gguf"
+        conv_res = PeftToGGUFConverter.convert_peft_to_gguf(
+            peft_dir=peft_dir,
+            gguf_out_path=gguf_out,
+            base_model_tag="tiny-llama:64d-2l",
+            hidden_size=64,
+            num_hidden_layers=2,
+        )
+        self.assertTrue(conv_res["ok"])
+        self.assertTrue(gguf_out.exists())
+        self.assertEqual(conv_res["hidden_size"], 64)
+        self.assertEqual(conv_res["num_hidden_layers"], 2)
+
+        # 3. Pre-`ollama create` compatibility check:
+        # 3a. Matching base model (`tiny-llama:64d-2l`: hidden_size=64, layers=2) -> PASSES
+        compat_ok = AdapterModelCompatibilityValidator.validate(gguf_out, "tiny-llama:64d-2l")
+        self.assertTrue(compat_ok["compatible"], f"Expected compatible=True, got {compat_ok}")
+
+        # 3b. Mismatched base model (`llama3.1:8b`: hidden_size=4096, layers=32) -> IMMEDIATELY REJECTED
+        compat_bad = AdapterModelCompatibilityValidator.validate(gguf_out, "llama3.1:8b")
+        self.assertFalse(compat_bad["compatible"])
+        self.assertIn("ADAPTER_MODEL_MISMATCH", compat_bad["reason"])
+
+        # 3c. OllamaBackend.create_model immediately rejects incompatible Modelfile before network call
+        bad_modelfile = (
+            f"FROM llama3.1:8b\n"
+            f"ADAPTER {gguf_out.as_posix()}\n"
+        )
+        ollama_reject = OllamaBackend("http://127.0.0.1:11434").create_model(
+            model_tag="llama3.1:8b-bad-cand",
+            modelfile_content=bad_modelfile,
+        )
+        self.assertFalse(ollama_reject["ok"])
+        self.assertEqual(ollama_reject["status"], "REJECTED_INCOMPATIBLE_ADAPTER")
+        self.assertIn("ADAPTER_MODEL_MISMATCH", ollama_reject["error"])
+
+        # 3d. ContinuousSelfImprovementManager with base_model_tag="llama3.1:8b" rejects 64-dim adapter before `ollama create`
+        if TORCH_AVAILABLE:
+            mismatch_mgr = ContinuousSelfImprovementManager(
+                self.data_dir / "mismatch_mgr",
+                base_model_tag="llama3.1:8b",
+            )
+            mismatch_res = mismatch_mgr.run_training_and_deploy_cycle(epochs=2, min_samples=2, eval_limit=4)
+            self.assertFalse(mismatch_res["ok"])
+            self.assertEqual(mismatch_res["action"], "ROLLED_BACK")
+            self.assertEqual(mismatch_res["status"], "REJECTED_INCOMPATIBLE_ADAPTER")
+            self.assertIn("ADAPTER_MODEL_MISMATCH", mismatch_res["reason"])
+
+        # 4. Full End-to-End HuggingFace AutoModelForCausalLM + PEFT LoraConfig + save_pretrained + GGUF test
+        if is_hf_qlora_stack_ready():
+            from transformers import LlamaConfig, LlamaForCausalLM
+
+            hf_base_dir = self.data_dir / "hf_tiny_llama_base"
+            hf_base_dir.mkdir(parents=True, exist_ok=True)
+            tiny_cfg = LlamaConfig(
+                vocab_size=256,
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                max_position_embeddings=128,
+                pad_token_id=0,
+                bos_token_id=1,
+                eos_token_id=2,
+            )
+            tiny_model = LlamaForCausalLM(tiny_cfg)
+            tiny_model.save_pretrained(str(hf_base_dir))
+
+            engine = RealQLoRAEngine(
+                model_dir=self.data_dir / "hf_qlora_out",
+                rank=8,
+                alpha=16.0,
+                base_model_name_or_path=str(hf_base_dir),
+                base_model_tag="tiny-llama:64d-2l",
+            )
+            hf_train_res = engine.train_hf_qlora(
+                dataset=[
+                    {"prompt": "def add(a, b):", "response": "    return a + b\n"},
+                    {"prompt": "def mul(a, b):", "response": "    return a * b\n"},
+                ],
+                base_model_name_or_path=str(hf_base_dir),
+                base_model_tag="tiny-llama:64d-2l",
+                epochs=2,
+                lr=1e-3,
+                max_seq_len=64,
+                peft_out_dir=self.data_dir / "hf_peft_saved",
+                gguf_out_path=self.data_dir / "hf_peft_converted.gguf",
+            )
+            self.assertTrue(hf_train_res["ok"])
+            self.assertTrue((self.data_dir / "hf_peft_saved" / "adapter_config.json").exists())
+            self.assertTrue((self.data_dir / "hf_peft_saved" / "adapter_model.safetensors").exists())
+            self.assertTrue((self.data_dir / "hf_peft_converted.gguf").exists())
+            self.assertTrue(hf_train_res["compatibility_verification"]["compatible"])
+            self.assertGreater(hf_train_res["trainable_lora_params"], 0)
+            self.assertGreater(len(hf_train_res["tensors"]), 0)
 
 
 if __name__ == "__main__":

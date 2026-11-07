@@ -66,7 +66,29 @@ class OllamaBackend:
         modelfile_path: Optional[Path] = None,
         timeout: float = 1.5,
     ) -> Dict[str, Any]:
-        """Registers a distinct model tag (e.g. baseline + GGUF LoRA ADAPTER) via Ollama API or CLI."""
+        """Registers a distinct model tag (e.g. baseline + GGUF LoRA ADAPTER) via Ollama API or CLI after verifying adapter compatibility."""
+        from .qlora_engine import AdapterModelCompatibilityValidator
+
+        m_from = re.search(r"^\s*FROM\s+(\S+)", modelfile_content or "", re.MULTILINE)
+        m_adapter = re.search(r"^\s*ADAPTER\s+(.+?)\s*$", modelfile_content or "", re.MULTILINE)
+        if m_from and m_adapter:
+            base_tag = m_from.group(1).strip()
+            adapter_file = Path(m_adapter.group(1).strip())
+            compat = AdapterModelCompatibilityValidator.validate(
+                gguf_path=adapter_file,
+                base_model_tag=base_tag,
+            )
+            if not compat.get("compatible", False):
+                return {
+                    "ok": False,
+                    "compatible": False,
+                    "status": "REJECTED_INCOMPATIBLE_ADAPTER",
+                    "method": "pre_create_compatibility_check",
+                    "model_tag": model_tag,
+                    "base_model_tag": base_tag,
+                    "error": compat.get("reason", "ADAPTER_MODEL_MISMATCH"),
+                }
+
         body = json.dumps({
             "name": model_tag,
             "modelfile": modelfile_content,
