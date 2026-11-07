@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 import urllib.error
@@ -57,6 +58,87 @@ class OllamaBackend:
                 return [m["name"] for m in json.loads(resp.read()).get("models", [])]
         except (urllib.error.URLError, OSError, ValueError):
             return []
+
+    def create_model(
+        self,
+        model_tag: str,
+        modelfile_content: str,
+        modelfile_path: Optional[Path] = None,
+        timeout: float = 1.5,
+    ) -> Dict[str, Any]:
+        """Registers a distinct model tag (e.g. baseline + GGUF LoRA ADAPTER) via Ollama API or CLI."""
+        body = json.dumps({
+            "name": model_tag,
+            "modelfile": modelfile_content,
+            "stream": False,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/api/create",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read() or b"{}")
+                return {
+                    "ok": True,
+                    "method": "ollama_http_api",
+                    "model_tag": model_tag,
+                    "status": data.get("status", "success"),
+                }
+        except (urllib.error.URLError, OSError, ValueError) as api_exc:
+            # Only fall back to CLI if HTTP server responded with an HTTP error (not when daemon port is closed)
+            if isinstance(api_exc, urllib.error.HTTPError) and modelfile_path is not None and modelfile_path.exists():
+                try:
+                    proc = subprocess.run(
+                        ["ollama", "create", model_tag, "-f", str(modelfile_path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
+                    if proc.returncode == 0:
+                        return {
+                            "ok": True,
+                            "method": "ollama_cli",
+                            "model_tag": model_tag,
+                            "status": proc.stdout.strip() or "success",
+                        }
+                    return {
+                        "ok": False,
+                        "method": "ollama_cli",
+                        "model_tag": model_tag,
+                        "error": (proc.stderr or proc.stdout or str(api_exc)).strip()[:300],
+                    }
+                except (OSError, subprocess.SubprocessError) as cli_exc:
+                    return {
+                        "ok": False,
+                        "method": "ollama_cli",
+                        "model_tag": model_tag,
+                        "error": f"API ({api_exc}); CLI ({cli_exc})"[:300],
+                    }
+            return {
+                "ok": False,
+                "unreachable": True,
+                "method": "ollama_http_api",
+                "model_tag": model_tag,
+                "error": str(api_exc)[:300],
+            }
+
+    def delete_model(self, model_tag: str, timeout: float = 10.0) -> bool:
+        """Removes a temporary candidate model tag from Ollama after evaluation or rollback."""
+        body = json.dumps({"name": model_tag}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/api/delete",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="DELETE",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout):
+                return True
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
 
 
 class OpenAICompatibleBackend:
@@ -419,10 +501,67 @@ class ModelRouter:
         latency = time.monotonic() - start
         node.record_success(latency)
         self.budget.charge(self.budget.estimate(text), user_id=user_id)
-        return {"node": node.name, "model": "SUP Agentic Mesh (Powered by NEXUS)", "raw_model": node.model, "text": text, "latency_s": round(latency, 3)}
+        return {
+            "node": node.name,
+            "model": "SUP Agentic Mesh (Powered by NEXUS)",
+            "raw_model": node.model,
+            "model_tag": node.model,
+            "text": text,
+            "latency_s": round(latency, 3),
+        }
+
+    def _call_explicit_tag(self, model_tag: str, system: str, prompt: str, user_id: Optional[str] = None) -> dict:
+        """Directly invokes a specific model tag (e.g., baseline vs. candidate LoRA tag) without silent fallback."""
+        tag = (model_tag or "").strip()
+        if not tag:
+            raise ValueError("Explicit model_tag must be a non-empty string.")
+        full_system = system if "APPROVE or REJECT" in (system or "") else (
+            f"{SYSTEM_BRAND_IDENTITY}\n\n{system}".strip()
+        )
+        self.budget.charge(self.budget.estimate(full_system + prompt), user_id=user_id)
+        start = time.monotonic()
+        text = self.backend.chat(tag, full_system, prompt, self.timeout)
+        if "APPROVE or REJECT" not in (system or ""):
+            text = enforce_brand_identity(prompt, text)
+        latency = time.monotonic() - start
+        self.budget.charge(self.budget.estimate(text), user_id=user_id)
+        return {
+            "node": f"Tag:{tag}",
+            "model": "SUP Agentic Mesh (Powered by NEXUS)",
+            "raw_model": tag,
+            "model_tag": tag,
+            "text": text,
+            "latency_s": round(latency, 3),
+            "distilled_from_cache": False,
+            "cost_credits": STANDARD_TASK_CREDIT_COST,
+        }
+
+    def register_lora_candidate(
+        self,
+        candidate_tag: str,
+        modelfile_content: str,
+        modelfile_path: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """Registers a candidate LoRA adapter tag with the underlying backend (`ollama create`)."""
+        if hasattr(self.backend, "create_model"):
+            return self.backend.create_model(
+                model_tag=candidate_tag,
+                modelfile_content=modelfile_content,
+                modelfile_path=modelfile_path,
+            )
+        return {
+            "ok": False,
+            "method": "unsupported_backend",
+            "model_tag": candidate_tag,
+            "error": "Backend does not support dynamic model tag creation.",
+        }
 
     def ask(self, prompt: str, system: str = "", role: Optional[str] = None, node_name: Optional[str] = None,
-            frontier_mode: bool = False, namespace: str = "global", user_id: Optional[str] = None) -> dict:
+            frontier_mode: bool = False, namespace: str = "global", user_id: Optional[str] = None,
+            model_tag: Optional[str] = None) -> dict:
+        if model_tag is not None:
+            return self._call_explicit_tag(model_tag=model_tag, system=system, prompt=prompt, user_id=user_id)
+
         is_internal_vote_or_debate = system in {VOTE_SYSTEM, DEBATE_OPEN, DEBATE_REBUT, SYNTHESIS}
         is_frontier = frontier_mode or (not is_internal_vote_or_debate and is_frontier_complex_task(prompt))
         eff_ns = (namespace or user_id or "global").strip()

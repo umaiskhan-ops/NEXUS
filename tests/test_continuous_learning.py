@@ -20,6 +20,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from sovereign_mesh.benchmark_corpus import synthesize_verified_completion_for_task
 from sovereign_mesh.config import GridConfig
 from sovereign_mesh.continuous_learning import (
     AdapterBenchmarkSuite,
@@ -34,6 +35,7 @@ from sovereign_mesh.continuous_learning import (
 )
 from sovereign_mesh.grid import UltimateAgiSovereignGrid
 from sovereign_mesh.ledger import HashChainLedger
+from sovereign_mesh.qlora_engine import GGUFLoRAExporter
 from sovereign_mesh.server import make_handler
 
 
@@ -140,7 +142,6 @@ class TestContinuousLearning(unittest.TestCase):
         finally:
             cl.TORCH_AVAILABLE = orig
 
-    @unittest.skipUnless(TORCH_AVAILABLE, "PyTorch required for benchmark loss evaluation")
     def test_05_adapter_benchmark_suite(self):
         """Adapter benchmark suite runs standard algorithmic, math, and schema tasks and computes pass rate."""
         suite = AdapterBenchmarkSuite()
@@ -293,10 +294,11 @@ class TestContinuousLearning(unittest.TestCase):
         domains = set(t.get("domain") for t in corpus)
         self.assertEqual(len(domains), 8)
 
-        # Ensure all tasks have hidden unit tests
+        # Ensure all tasks have hidden unit tests and DO NOT leak reference_solution in task dicts
         for t in corpus:
             self.assertIn("hidden_tests", t)
             self.assertTrue(len(t["hidden_tests"]) > 0)
+            self.assertNotIn("reference_solution", t)
 
         suite = AdapterBenchmarkSuite(held_out_tasks=corpus)
 
@@ -306,7 +308,7 @@ class TestContinuousLearning(unittest.TestCase):
         self.assertIn("strictly mandatory", str(ctx.exception).lower())
 
         # 2. Real pass@1 evaluation with golden generator closure
-        prompt_to_sol = {t["prompt"]: t.get("reference_solution") or t.get("raw_json", "") for t in corpus[:10]}
+        prompt_to_sol = {t["prompt"]: synthesize_verified_completion_for_task(t) for t in corpus[:10]}
         def golden_generator(prompt, **kwargs):
             return prompt_to_sol.get(prompt, "")
 
@@ -321,6 +323,169 @@ class TestContinuousLearning(unittest.TestCase):
         res_pass1_broken = suite.evaluate_pass_at_1(generator_fn=broken_generator, tasks=corpus[:5])
         self.assertEqual(res_pass1_broken["pass_at_1"], 0.0)
         self.assertEqual(res_pass1_broken["passed_count"], 0)
+
+    def test_07f_model_tag_collision_strictly_rejected(self):
+        """Auditor Recheck Step 1: Baseline and Candidate must have strictly distinct model tags; collision raises MODEL_TAG_COLLISION."""
+        corpus = generate_held_out_benchmark_corpus(10)
+        suite = AdapterBenchmarkSuite(held_out_tasks=corpus)
+
+        def gen_a(prompt, **kwargs):
+            return "def f(): pass"
+
+        def gen_b(prompt, **kwargs):
+            return "def f(): pass"
+
+        # Same model_tag -> raises MODEL_TAG_COLLISION
+        with self.assertRaises(ValueError) as ctx1:
+            suite.evaluate_paired_pass_at_1(
+                base_generator_fn=gen_a,
+                cand_generator_fn=gen_b,
+                tasks=corpus[:5],
+                base_model_tag="llama3.1:8b",
+                cand_model_tag="llama3.1:8b",
+                samples_per_task=5,
+            )
+        self.assertIn("MODEL_TAG_COLLISION", str(ctx1.exception))
+
+        # Identical generator callable -> raises MODEL_TAG_COLLISION
+        with self.assertRaises(ValueError) as ctx2:
+            suite.evaluate_paired_pass_at_1(
+                base_generator_fn=gen_a,
+                cand_generator_fn=gen_a,
+                tasks=corpus[:5],
+                base_model_tag="llama3.1:8b",
+                cand_model_tag="llama3.1:8b-cand-1",
+                samples_per_task=5,
+            )
+        self.assertIn("MODEL_TAG_COLLISION", str(ctx2.exception))
+
+        # Insufficient samples_per_task (< 5) -> raises INSUFFICIENT_SAMPLES_PER_TASK
+        with self.assertRaises(ValueError) as ctx3:
+            suite.evaluate_paired_pass_at_1(
+                base_generator_fn=gen_a,
+                cand_generator_fn=gen_b,
+                tasks=corpus[:5],
+                base_model_tag="llama3.1:8b",
+                cand_model_tag="llama3.1:8b-cand-1",
+                samples_per_task=2,
+            )
+        self.assertIn("INSUFFICIENT_SAMPLES_PER_TASK", str(ctx3.exception))
+
+    def test_07g_shrinkage_adapter_rejected_by_paired_pass_at_1_gate(self):
+        """Auditor Recheck Step 2: Rank-8 'shrink' adapter (Delta_W = -c*I) without task knowledge worsens cross-subspace loss and is strictly rejected by the pass@1 gate."""
+        # Construct rank-8 shrinkage matrix: A reads first 8 coords, B scales them by -0.15
+        # so (alpha/r) * B @ A = -0.15 * I_8 on the first 8 coords and 0 elsewhere
+        a_mat = [[1.0 if i == j else 0.0 for j in range(64)] for i in range(8)]
+        b_mat = [[-0.075 if i == j else 0.0 for j in range(8)] for i in range(64)]
+        a_flat = [x for row in a_mat for x in row]
+        b_flat = [x for row in b_mat for x in row]
+        shrink_rep = {
+            "ok": True,
+            "epochs": 3,
+            "initial_loss": 0.015625,
+            "final_loss": 0.015977,
+            "loss_reduction": -0.000352,
+            "loss_history": [0.015625, 0.015977],
+            "tensors": {
+                "layers.0.self_attn.q_proj.lora_A.weight": ([8, 64], a_flat),
+                "layers.0.self_attn.q_proj.lora_B.weight": ([64, 8], b_flat),
+            },
+        }
+
+        # 1. Verify diagnostic cross-subspace loss is WORSENED (not improved) by shrinkage (works with or without PyTorch)
+        base_diag = self.mgr.benchmark_suite.evaluate(adapter_weights=None)
+        shrink_diag = self.mgr.benchmark_suite.evaluate(adapter_weights=shrink_rep)
+        self.assertGreaterEqual(
+            shrink_diag["avg_loss"],
+            base_diag["avg_loss"],
+            "Shrinkage adapter must NEVER reduce orthogonal cross-subspace loss",
+        )
+
+        # 2. Verify paired pass@1 with local tag generators rejects shrinkage adapter
+        base_gen = self.mgr.create_model_generator(use_adapter=False, model_tag="llama3.1:8b")
+        cand_gen = self.mgr.create_model_generator(use_adapter=True, adapter_weights=shrink_rep, model_tag="llama3.1:8b-cand-shrink")
+        paired = self.mgr.benchmark_suite.evaluate_paired_pass_at_1(
+            base_generator_fn=base_gen,
+            cand_generator_fn=cand_gen,
+            tasks=self.mgr.benchmark_suite.get_benchmark_tasks(limit=8),
+            base_model_tag="llama3.1:8b",
+            cand_model_tag="llama3.1:8b-cand-shrink",
+            adapter_weights=shrink_rep,
+            samples_per_task=5,
+        )
+        self.assertFalse(paired["gate_passed"], "Shrinkage adapter must NEVER pass the paired pass@1 bootstrap gate")
+        self.assertLessEqual(paired["ci_lower_95"], 0.0)
+
+        # 3. Verify full deploy cycle strictly rejects and rolls back the shrinkage adapter when PyTorch is available
+        if TORCH_AVAILABLE:
+            self.mgr.populate_seed_verified_dataset()
+            self.mgr.engine.train_on_verified_dataset = lambda dataset, epochs=5, lr=0.035: shrink_rep
+            res = self.mgr.run_training_and_deploy_cycle(epochs=3, eval_limit=8, samples_per_task=5)
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["action"], "ROLLED_BACK")
+            self.assertEqual(res["status"], "REJECTED_REGRESSION")
+            self.assertFalse(self.mgr.active_adapter_path.exists())
+
+    def test_07h_noisy_generator_rejected_by_paired_bootstrap_ci(self):
+        """Auditor Recheck Step 2: Candidate that only beats baseline by tiny 1-sample sampling noise fails the 95% bootstrap CI gate."""
+        corpus = generate_held_out_benchmark_corpus(8)
+        suite = AdapterBenchmarkSuite(held_out_tasks=corpus)
+        sol_0 = synthesize_verified_completion_for_task(corpus[0])
+
+        def base_noisy(prompt, sample_idx=0, **kwargs):
+            return "def fail(): return None"
+
+        def cand_noisy(prompt, sample_idx=0, **kwargs):
+            # Only passes 1 out of 5 samples on 1 out of 8 tasks by random luck (mean_delta = 0.025, but CI includes 0)
+            if prompt == corpus[0]["prompt"] and sample_idx == 4:
+                return sol_0
+            return "def fail(): return None"
+
+        paired = suite.evaluate_paired_pass_at_1(
+            base_generator_fn=base_noisy,
+            cand_generator_fn=cand_noisy,
+            tasks=corpus,
+            base_model_tag="llama3.1:8b",
+            cand_model_tag="llama3.1:8b-cand-noisy",
+            samples_per_task=5,
+            bootstrap_resamples=1000,
+        )
+        self.assertGreater(paired["mean_delta"], 0.0)
+        self.assertLessEqual(paired["ci_lower_95"], 0.0)
+        self.assertFalse(paired["gate_passed"], "Sampling noise with ci_lower_95 <= 0 must be rejected")
+
+    def test_07i_gguf_v3_lora_export_and_private_benchmark_isolation(self):
+        """Auditor Recheck Step 1, 3, 4: Verifies spec-compliant GGUF v3 binary LoRA export and zero reference_solution/LeetCode leakage in benchmark_corpus.py."""
+        gguf_test_path = self.data_dir / "test_adapter.gguf"
+        GGUFLoRAExporter.save(
+            file_path=gguf_test_path,
+            tensors={
+                "blk.0.attn_q.weight.lora_a": ([8, 64], [0.05] * 512),
+                "blk.0.attn_q.weight.lora_b": ([64, 8], [0.02] * 512),
+            },
+            alpha=16.0,
+            rank=8,
+            arch="llama",
+        )
+        gguf_info = GGUFLoRAExporter.verify_gguf_header(gguf_test_path)
+        self.assertTrue(gguf_info["valid"])
+        self.assertEqual(gguf_info["magic"], "GGUF")
+        self.assertEqual(gguf_info["version"], 3)
+        self.assertEqual(gguf_info["metadata"]["general.type"], "adapter")
+        self.assertEqual(gguf_info["metadata"]["adapter.type"], "lora")
+        self.assertEqual(gguf_info["n_tensors"], 2)
+
+        # Verify benchmark_corpus.py contains zero reference_solution dicts or standard LeetCode tasks
+        corpus_src = Path("sovereign_mesh/benchmark_corpus.py").read_text(encoding="utf-8")
+        self.assertNotIn('"reference_solution":', corpus_src)
+        for leetcode_name in ("def two_sum", "def coin_change", "def roman_to_int", "def fizz_buzz"):
+            self.assertNotIn(leetcode_name, corpus_src)
+
+        if TORCH_AVAILABLE:
+            res = self.mgr.run_training_and_deploy_cycle(epochs=3, eval_limit=6, samples_per_task=5)
+            self.assertTrue(res["ok"])
+            self.assertTrue(self.mgr.active_gguf_path.exists())
+            self.assertNotEqual(res["base_model_tag"], res["deployed_model_tag"])
 
     def test_08_server_api_learning_endpoints_and_auth(self):
         """Server exposes /api/learning/status, /verify, /train with strict authentication."""
