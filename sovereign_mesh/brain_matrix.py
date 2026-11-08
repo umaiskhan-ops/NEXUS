@@ -113,17 +113,148 @@ class SafeTensorsIO:
 
     Format specification:
     - Bytes [0..8): 64-bit unsigned little-endian integer `N` (size of JSON header in bytes)
-    - Bytes [8..8+N): UTF-8 JSON header mapping tensor keys -> {"dtype": "F32", "shape": [...], "data_offsets": [begin, end]}
-    - Bytes [8+N..EOF): Contiguous IEEE-754 little-endian float32 (`<f`) binary tensor buffers.
+    - Bytes [8..8+N): UTF-8 JSON header mapping tensor keys -> {"dtype": "F32"|"F16"|"BF16"|"F64", "shape": [...], "data_offsets": [begin, end]}
+    - Bytes [8+N..EOF): Contiguous binary tensor buffers.
+
+    Supports F32, F16 (IEEE-754 half), BF16 (BFloat16), and F64 dtypes, and provides
+    `load_f32_buffers` for zero-list contiguous `<f4` byte buffers (using `numpy` when
+    available) to avoid Python float list memory overhead on large LoRA adapters.
     """
+
+    @staticmethod
+    def _encode_f32_values_to_dtype_bytes(
+        flat_vals: Any,
+        expected_len: int,
+        dtype: str = "F32",
+    ) -> bytes:
+        dt = str(dtype or "F32").upper()
+        try:
+            import numpy as np  # type: ignore[import-untyped]
+            has_np = True
+        except ImportError:
+            np = None  # type: ignore[assignment]
+            has_np = False
+
+        if isinstance(flat_vals, (bytes, bytearray, memoryview)):
+            raw_b = bytes(flat_vals)
+            if dt == "F32" and len(raw_b) == expected_len * 4:
+                return raw_b
+            f32_bytes = SafeTensorsIO.decode_tensor_to_f32_bytes(raw_b, "F32", expected_len)
+        elif has_np and isinstance(flat_vals, np.ndarray):
+            arr = flat_vals.reshape(-1)
+            if arr.size < expected_len:
+                arr = np.pad(arr, (0, expected_len - arr.size))
+            elif arr.size > expected_len:
+                arr = arr[:expected_len]
+            f32_bytes = arr.astype("<f4", copy=False).tobytes()
+        elif has_np:
+            arr = np.asarray(flat_vals, dtype="<f4").reshape(-1)
+            if arr.size < expected_len:
+                arr = np.pad(arr, (0, expected_len - arr.size))
+            elif arr.size > expected_len:
+                arr = arr[:expected_len]
+            f32_bytes = arr.tobytes()
+        else:
+            vals = list(flat_vals)[:expected_len]
+            if len(vals) < expected_len:
+                vals.extend([0.0] * (expected_len - len(vals)))
+            f32_bytes = struct.pack(f"<{expected_len}f", *vals)
+
+        if dt == "F32":
+            return f32_bytes
+        if dt == "F16":
+            if has_np:
+                return np.frombuffer(f32_bytes, dtype="<f4").astype("<f2").tobytes()
+            floats = struct.unpack(f"<{expected_len}f", f32_bytes)
+            return struct.pack(f"<{expected_len}e", *floats)
+        if dt == "BF16":
+            if has_np:
+                u32 = np.frombuffer(f32_bytes, dtype="<u4")
+                # Round-to-nearest-even conversion from IEEE-754 float32 to bfloat16
+                rounding_bias = 0x00007FFF + ((u32 >> 16) & 1)
+                bf16_u16 = ((u32 + rounding_bias) >> 16).astype("<u2")
+                return bf16_u16.tobytes()
+            u32_tuple = struct.unpack(f"<{expected_len}I", f32_bytes)
+            return struct.pack(
+                f"<{expected_len}H",
+                *(((u + 0x00007FFF + ((u >> 16) & 1)) >> 16) & 0xFFFF for u in u32_tuple),
+            )
+        if dt == "F64":
+            if has_np:
+                return np.frombuffer(f32_bytes, dtype="<f4").astype("<f8").tobytes()
+            floats = struct.unpack(f"<{expected_len}f", f32_bytes)
+            return struct.pack(f"<{expected_len}d", *floats)
+        raise ValueError(f"Unsupported .safetensors save dtype: {dtype!r}")
+
+    @staticmethod
+    def decode_tensor_to_f32_bytes(
+        raw_slice: bytes | memoryview,
+        dtype: str,
+        expected_elems: int,
+        tensor_name: str = "",
+    ) -> bytes:
+        """Decodes a `.safetensors` tensor buffer of dtype F32, F16, BF16, or F64 into contiguous `<f4` bytes."""
+        dt = str(dtype or "F32").upper()
+        n_bytes = len(raw_slice)
+        try:
+            import numpy as np  # type: ignore[import-untyped]
+            has_np = True
+        except ImportError:
+            np = None  # type: ignore[assignment]
+            has_np = False
+
+        if dt == "F32":
+            if n_bytes != expected_elems * 4:
+                raise ValueError(
+                    f"SafeTensors F32 buffer size mismatch for {tensor_name!r}: expected {expected_elems * 4} bytes ({expected_elems} elems), got {n_bytes}"
+                )
+            return bytes(raw_slice)
+
+        if dt == "F16":
+            if n_bytes != expected_elems * 2:
+                raise ValueError(
+                    f"SafeTensors F16 buffer size mismatch for {tensor_name!r}: expected {expected_elems * 2} bytes ({expected_elems} elems), got {n_bytes}"
+                )
+            if has_np:
+                return np.frombuffer(raw_slice, dtype="<f2").astype("<f4").tobytes()
+            floats = struct.unpack(f"<{expected_elems}e", raw_slice)
+            return struct.pack(f"<{expected_elems}f", *floats)
+
+        if dt == "BF16":
+            if n_bytes != expected_elems * 2:
+                raise ValueError(
+                    f"SafeTensors BF16 buffer size mismatch for {tensor_name!r}: expected {expected_elems * 2} bytes ({expected_elems} elems), got {n_bytes}"
+                )
+            if has_np:
+                u16 = np.frombuffer(raw_slice, dtype="<u2")
+                u32 = u16.astype("<u4") << 16
+                return u32.view("<f4").tobytes()
+            u16_tuple = struct.unpack(f"<{expected_elems}H", raw_slice)
+            return struct.pack(f"<{expected_elems}I", *(u << 16 for u in u16_tuple))
+
+        if dt == "F64":
+            if n_bytes != expected_elems * 8:
+                raise ValueError(
+                    f"SafeTensors F64 buffer size mismatch for {tensor_name!r}: expected {expected_elems * 8} bytes ({expected_elems} elems), got {n_bytes}"
+                )
+            if has_np:
+                return np.frombuffer(raw_slice, dtype="<f8").astype("<f4").tobytes()
+            floats = struct.unpack(f"<{expected_elems}d", raw_slice)
+            return struct.pack(f"<{expected_elems}f", *floats)
+
+        raise ValueError(
+            f"Unsupported .safetensors dtype {dtype!r} for tensor {tensor_name!r} (supported: F32, F16, BF16, F64)"
+        )
 
     @staticmethod
     def save(
         file_path: Path,
-        tensors: Dict[str, Tuple[List[int], List[float]]],
+        tensors: Dict[str, Tuple[List[int], Any]],
         metadata: Optional[Dict[str, str]] = None,
+        dtype: str = "F32",
     ) -> Dict[str, Any]:
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        dt = str(dtype or "F32").upper()
         header_obj: Dict[str, Any] = {}
         if metadata:
             header_obj["__metadata__"] = {str(k): str(v) for k, v in metadata.items()}
@@ -137,14 +268,11 @@ class SafeTensorsIO:
             expected_len = 1
             for dim in shape:
                 expected_len *= int(dim)
-            vals = list(flat_vals)[:expected_len]
-            if len(vals) < expected_len:
-                vals.extend([0.0] * (expected_len - len(vals)))
-            buf = struct.pack(f"<{expected_len}f", *vals)
+            buf = SafeTensorsIO._encode_f32_values_to_dtype_bytes(flat_vals, expected_len, dtype=dt)
             start = current_offset
             end = start + len(buf)
             header_obj[name] = {
-                "dtype": "F32",
+                "dtype": dt,
                 "shape": [int(d) for d in shape],
                 "data_offsets": [start, end],
             }
@@ -176,6 +304,7 @@ class SafeTensorsIO:
         return {
             "path": str(file_path),
             "filename": file_path.name,
+            "dtype": dt,
             "size_bytes": len(payload),
             "size_kb": round(len(payload) / 1024.0, 2),
             "sha256": sha256_hex,
@@ -184,7 +313,29 @@ class SafeTensorsIO:
         }
 
     @staticmethod
-    def load(file_path: Path) -> Tuple[Dict[str, Tuple[List[int], List[float]]], Dict[str, str]]:
+    def read_metadata(file_path: Path) -> Dict[str, str]:
+        """Reads only the `.safetensors` JSON header metadata without loading binary tensor buffers."""
+        with file_path.open("rb") as fh:
+            prefix = fh.read(8)
+            if len(prefix) < 8:
+                raise ValueError("Invalid .safetensors file: header prefix truncated")
+            (header_len,) = struct.unpack("<Q", prefix)
+            header_raw = fh.read(header_len)
+            if len(header_raw) < header_len:
+                raise ValueError("Invalid .safetensors file: JSON header truncated")
+        header = json.loads(header_raw.decode("utf-8").strip())
+        if isinstance(header, dict):
+            meta = header.get("__metadata__", {})
+            return {str(k): str(v) for k, v in meta.items()} if isinstance(meta, dict) else {}
+        return {}
+
+    @staticmethod
+    def load_f32_buffers(file_path: Path) -> Tuple[Dict[str, Tuple[List[int], bytes]], Dict[str, str]]:
+        """Loads `.safetensors` (F32, F16, BF16, F64) directly into contiguous `<f4` byte buffers.
+
+        Avoids allocating Python `float` lists, reducing peak RAM by ~10x on multi-million
+        parameter LoRA adapters.
+        """
         raw = file_path.read_bytes()
         if len(raw) < 8:
             raise ValueError("Invalid .safetensors file: header prefix truncated")
@@ -193,17 +344,35 @@ class SafeTensorsIO:
         if len(raw) < header_end:
             raise ValueError("Invalid .safetensors file: JSON header truncated")
         header = json.loads(raw[8:header_end].decode("utf-8").strip())
-        data_region = raw[header_end:]
+        data_view = memoryview(raw)[header_end:]
         metadata = header.pop("__metadata__", {}) if isinstance(header, dict) else {}
 
-        tensors: Dict[str, Tuple[List[int], List[float]]] = {}
+        tensors: Dict[str, Tuple[List[int], bytes]] = {}
         for name, info in header.items():
             if not isinstance(info, dict):
                 continue
             shape = [int(d) for d in info.get("shape", [])]
+            dtype = str(info.get("dtype", "F32")).upper()
             start, end = info.get("data_offsets", [0, 0])
-            count = (end - start) // 4
-            vals = list(struct.unpack(f"<{count}f", data_region[start:end]))
+            expected_elems = 1
+            for d in shape:
+                expected_elems *= int(d)
+            f32_bytes = SafeTensorsIO.decode_tensor_to_f32_bytes(
+                data_view[start:end],
+                dtype=dtype,
+                expected_elems=expected_elems,
+                tensor_name=name,
+            )
+            tensors[name] = (shape, f32_bytes)
+        return tensors, metadata
+
+    @staticmethod
+    def load(file_path: Path) -> Tuple[Dict[str, Tuple[List[int], List[float]]], Dict[str, str]]:
+        buf_tensors, metadata = SafeTensorsIO.load_f32_buffers(file_path)
+        tensors: Dict[str, Tuple[List[int], List[float]]] = {}
+        for name, (shape, f32_bytes) in buf_tensors.items():
+            count = len(f32_bytes) // 4
+            vals = list(struct.unpack(f"<{count}f", f32_bytes))
             tensors[name] = (shape, vals)
         return tensors, metadata
 

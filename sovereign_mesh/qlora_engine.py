@@ -168,10 +168,50 @@ class GGUFLoRAExporter:
         return buf
 
     @classmethod
+    def _coerce_tensor_to_f32_bytes(
+        cls,
+        name: str,
+        shape: List[int],
+        flat_vals: Any,
+    ) -> bytes:
+        expected_numel = 1
+        for d in shape:
+            expected_numel *= int(d)
+        expected_bytes = expected_numel * 4
+
+        if isinstance(flat_vals, (bytes, bytearray, memoryview)):
+            raw_b = bytes(flat_vals)
+            if len(raw_b) != expected_bytes:
+                raise ValueError(
+                    f"GGUF tensor '{name}' shape {shape} expects {expected_bytes} bytes ({expected_numel} F32 elems), got {len(raw_b)} bytes"
+                )
+            return raw_b
+
+        try:
+            import numpy as np  # type: ignore[import-untyped]
+            if isinstance(flat_vals, np.ndarray):
+                if int(flat_vals.size) != expected_numel:
+                    raise ValueError(
+                        f"GGUF tensor '{name}' shape {shape} expects {expected_numel} floats, got {int(flat_vals.size)}"
+                    )
+                return flat_vals.astype("<f4", copy=False).tobytes()
+            if len(flat_vals) != expected_numel:
+                raise ValueError(
+                    f"GGUF tensor '{name}' shape {shape} expects {expected_numel} floats, got {len(flat_vals)}"
+                )
+            return np.asarray(flat_vals, dtype="<f4").tobytes()
+        except ImportError:
+            if len(flat_vals) != expected_numel:
+                raise ValueError(
+                    f"GGUF tensor '{name}' shape {shape} expects {expected_numel} floats, got {len(flat_vals)}"
+                )
+            return struct.pack(f"<{expected_numel}f", *flat_vals)
+
+    @classmethod
     def save(
         cls,
         file_path: Path,
-        tensors: Dict[str, Tuple[List[int], List[float]]],
+        tensors: Dict[str, Tuple[List[int], Any]],
         alpha: float = 16.0,
         rank: int = 8,
         arch: str = "llama",
@@ -181,6 +221,7 @@ class GGUFLoRAExporter:
     ) -> Dict[str, Any]:
         """Serializes LoRA A/B tensors into a GGUF v3 binary adapter file with architectural metadata."""
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        arch_clean = infer_gguf_arch(base_model, explicit_arch=arch)
 
         # Infer hidden_size and num_hidden_layers from tensor table if not explicitly provided
         inferred_hidden = hidden_size
@@ -196,13 +237,13 @@ class GGUFLoRAExporter:
         eff_layers = int(num_hidden_layers) if num_hidden_layers is not None else max(1, len(layer_indices))
 
         kv_entries: List[Tuple[str, int, Any]] = [
-            ("general.architecture", GGUF_TYPE_STRING, arch),
+            ("general.architecture", GGUF_TYPE_STRING, arch_clean),
             ("general.type", GGUF_TYPE_STRING, "adapter"),
             ("adapter.type", GGUF_TYPE_STRING, "lora"),
             ("adapter.lora.alpha", GGUF_TYPE_FLOAT32, float(alpha)),
             ("adapter.lora.rank", GGUF_TYPE_UINT32, int(rank)),
-            (f"{arch}.embedding_length", GGUF_TYPE_UINT32, eff_hidden),
-            (f"{arch}.block_count", GGUF_TYPE_UINT32, eff_layers),
+            (f"{arch_clean}.embedding_length", GGUF_TYPE_UINT32, eff_hidden),
+            (f"{arch_clean}.block_count", GGUF_TYPE_UINT32, eff_layers),
             ("adapter.base.hidden_size", GGUF_TYPE_UINT32, eff_hidden),
             ("adapter.base.num_hidden_layers", GGUF_TYPE_UINT32, eff_layers),
         ]
@@ -223,13 +264,7 @@ class GGUFLoRAExporter:
         current_offset = 0
 
         for name, (shape, flat_vals) in tensors.items():
-            expected_numel = 1
-            for d in shape:
-                expected_numel *= int(d)
-            if len(flat_vals) != expected_numel:
-                raise ValueError(
-                    f"GGUF tensor '{name}' shape {shape} expects {expected_numel} floats, got {len(flat_vals)}"
-                )
+            raw_bytes = cls._coerce_tensor_to_f32_bytes(name, shape, flat_vals)
 
             tensor_infos += cls._pack_string(name)
             tensor_infos += struct.pack("<I", len(shape))
@@ -238,27 +273,38 @@ class GGUFLoRAExporter:
             tensor_infos += struct.pack("<I", GGML_TYPE_F32)
             tensor_infos += struct.pack("<Q", current_offset)
 
-            raw_bytes = struct.pack(f"<{len(flat_vals)}f", *flat_vals)
             pad_len = (GGUF_DEFAULT_ALIGNMENT - (len(raw_bytes) % GGUF_DEFAULT_ALIGNMENT)) % GGUF_DEFAULT_ALIGNMENT
-            aligned_bytes = raw_bytes + (b"\x00" * pad_len)
+            aligned_bytes = raw_bytes if pad_len == 0 else (raw_bytes + (b"\x00" * pad_len))
             data_blobs.append(aligned_bytes)
             current_offset += len(aligned_bytes)
 
         pre_data = bytes(header) + bytes(tensor_infos)
         header_pad = (GGUF_DEFAULT_ALIGNMENT - (len(pre_data) % GGUF_DEFAULT_ALIGNMENT)) % GGUF_DEFAULT_ALIGNMENT
-        full_binary = pre_data + (b"\x00" * header_pad) + b"".join(data_blobs)
+        pad_bytes = b"\x00" * header_pad
 
-        file_path.write_bytes(full_binary)
-        sha256_hex = hashlib.sha256(full_binary).hexdigest()
+        hasher = hashlib.sha256()
+        total_bytes = len(pre_data) + len(pad_bytes)
+        with file_path.open("wb") as fh:
+            fh.write(pre_data)
+            hasher.update(pre_data)
+            if pad_bytes:
+                fh.write(pad_bytes)
+                hasher.update(pad_bytes)
+            for chunk in data_blobs:
+                fh.write(chunk)
+                hasher.update(chunk)
+                total_bytes += len(chunk)
+
+        sha256_hex = hasher.hexdigest()
         return {
             "path": str(file_path),
-            "size_bytes": len(full_binary),
+            "size_bytes": total_bytes,
             "sha256": sha256_hex,
             "version": GGUF_VERSION,
             "tensor_count": len(tensors),
             "alpha": alpha,
             "rank": rank,
-            "arch": arch,
+            "arch": arch_clean,
             "base_model": base_model,
             "hidden_size": eff_hidden,
             "num_hidden_layers": eff_layers,
@@ -440,6 +486,54 @@ KNOWN_BASE_MODEL_SPECS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+_MODEL_FAMILY_TO_GGUF_ARCH: List[Tuple[str, str]] = [
+    ("qwen3", "qwen3"),
+    ("qwen2", "qwen2"),
+    ("qwen", "qwen2"),
+    ("gemma2", "gemma2"),
+    ("gemma", "gemma"),
+    ("phi3", "phi3"),
+    ("phi-3", "phi3"),
+    ("phi2", "phi2"),
+    ("phi-2", "phi2"),
+    ("deepseek_v2", "deepseek2"),
+    ("deepseek2", "deepseek2"),
+    ("deepseek", "deepseek2"),
+    ("starcoder2", "starcoder2"),
+    ("command-r", "command-r"),
+    ("command_r", "command-r"),
+    ("cohere", "command-r"),
+    ("falcon", "falcon"),
+    ("mistral", "llama"),
+    ("mixtral", "llama"),
+    ("llama", "llama"),
+    ("yi", "llama"),
+]
+
+
+def infer_gguf_arch(model_name_or_tag: str = "", explicit_arch: Optional[str] = None) -> str:
+    """Infers canonical GGUF `general.architecture` from explicit arch, KNOWN_BASE_MODEL_SPECS, or model family name."""
+    if explicit_arch and str(explicit_arch).strip():
+        exp_clean = str(explicit_arch).strip().lower()
+        for prefix, canonical in _MODEL_FAMILY_TO_GGUF_ARCH:
+            if exp_clean == prefix or exp_clean.startswith(prefix):
+                return canonical
+        return exp_clean
+
+    tag_clean = str(model_name_or_tag or "").strip()
+    if tag_clean:
+        if tag_clean in KNOWN_BASE_MODEL_SPECS:
+            return str(KNOWN_BASE_MODEL_SPECS[tag_clean].get("arch", "llama"))
+        tag_lower = tag_clean.lower()
+        for spec in KNOWN_BASE_MODEL_SPECS.values():
+            hf_list = [str(m).lower() for m in spec.get("hf_base_models", [])]
+            if tag_lower in hf_list:
+                return str(spec.get("arch", "llama"))
+        for prefix, canonical in _MODEL_FAMILY_TO_GGUF_ARCH:
+            if prefix in tag_lower:
+                return canonical
+    return "llama"
+
 
 class AdapterModelCompatibilityValidator:
     """Verifies before `ollama create` that a GGUF LoRA adapter matches `base_model_tag`'s base, hidden_size, and layers."""
@@ -558,8 +652,22 @@ class AdapterModelCompatibilityValidator:
                 ),
             }
 
+        # 1b. Architecture check (e.g. 'qwen2' vs 'llama')
+        exp_arch = infer_gguf_arch(tag, explicit_arch=spec.get("arch"))
+        arch = str(meta.get("general.architecture", "llama")).strip().lower()
+        if arch != exp_arch:
+            return {
+                "compatible": False,
+                "base_model_tag": tag,
+                "adapter_arch": arch,
+                "expected_arch": exp_arch,
+                "reason": (
+                    f"ADAPTER_MODEL_MISMATCH: GGUF adapter architecture '{arch}' does not match "
+                    f"base_model_tag '{tag}' architecture '{exp_arch}'."
+                ),
+            }
+
         # 2. Hidden size check (both metadata AND actual tensor dimensions)
-        arch = str(meta.get("general.architecture", "llama"))
         meta_hidden = int(
             meta.get(f"{arch}.embedding_length")
             or meta.get("llama.embedding_length")
@@ -704,8 +812,15 @@ class PeftToGGUFConverter:
         base_model_path: Optional[Path] = None,
         hidden_size: Optional[int] = None,
         num_hidden_layers: Optional[int] = None,
+        arch: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Converts a `save_pretrained` PEFT adapter folder into a base-model-matched GGUF v3 binary."""
+        """Converts a `save_pretrained` PEFT adapter folder into a base-model-matched GGUF v3 binary.
+
+        Uses `SafeTensorsIO.load_f32_buffers` to stream contiguous `<f4` byte buffers
+        (supporting F32, F16, BF16, and F64 `.safetensors`) without allocating Python
+        float lists, and dynamically resolves `general.architecture` (`llama`, `qwen2`,
+        `gemma2`, `phi3`, etc.) from `base_model_config`, `config.json`, or `base_model_tag`.
+        """
         adapter_cfg_path = peft_dir / "adapter_config.json"
         safetensors_path = peft_dir / "adapter_model.safetensors"
 
@@ -752,18 +867,17 @@ class PeftToGGUFConverter:
             except Exception:
                 pass
 
-        # 2. Native PEFT `.safetensors` -> GGUF v3 conversion
-        loaded_st = SafeTensorsIO.load(safetensors_path)
-        raw_tensors = loaded_st[0] if isinstance(loaded_st, tuple) else loaded_st
-        gguf_tensors: Dict[str, Tuple[List[int], List[float]]] = {}
+        # 2. Native PEFT `.safetensors` (F32 / F16 / BF16 / F64) -> GGUF v3 conversion using contiguous `<f4` buffers
+        raw_tensors, st_meta = SafeTensorsIO.load_f32_buffers(safetensors_path)
+        gguf_tensors: Dict[str, Tuple[List[int], bytes]] = {}
         layer_indices: Set[int] = set()
         inferred_hidden: Optional[int] = None
 
-        for hf_key, (shape, flat_vals) in raw_tensors.items():
+        for hf_key, (shape, f32_bytes) in raw_tensors.items():
             gguf_name = cls.map_peft_tensor_name_to_gguf(hf_key)
             if gguf_name is None:
                 continue
-            gguf_tensors[gguf_name] = (list(shape), list(flat_vals))
+            gguf_tensors[gguf_name] = (list(shape), f32_bytes)
             m = re.match(r"^blk\.(\d+)\.", gguf_name)
             if m:
                 layer_indices.add(int(m.group(1)))
@@ -773,23 +887,38 @@ class PeftToGGUFConverter:
         if not gguf_tensors:
             raise ValueError(f"No valid LoRA A/B tensors found in {safetensors_path}")
 
-        # Resolve architectural dimensions from explicit args, adapter_cfg, base_model_config, or config.json
-        arch = "llama"
+        # Resolve architectural dimensions & model family (`llama`, `qwen2`, `gemma2`, `phi3`, etc.)
+        cfg_arch = (
+            arch
+            or adapter_cfg.get("arch")
+            or adapter_cfg.get("model_type")
+            or (st_meta or {}).get("arch")
+        )
+        eff_arch = infer_gguf_arch(base_model_tag or base_name, explicit_arch=cfg_arch)
         eff_hidden_size = int(hidden_size or adapter_cfg.get("hidden_size") or inferred_hidden or 64)
         eff_num_layers = int(num_hidden_layers or adapter_cfg.get("num_hidden_layers") or len(layer_indices) or 1)
 
         if base_model_config is not None:
             if isinstance(base_model_config, dict):
-                arch = str(base_model_config.get("model_type") or "llama")
+                eff_arch = infer_gguf_arch(
+                    base_model_tag or base_name,
+                    explicit_arch=base_model_config.get("model_type") or cfg_arch,
+                )
                 eff_hidden_size = int(base_model_config.get("hidden_size") or base_model_config.get("n_embd") or eff_hidden_size)
                 eff_num_layers = int(base_model_config.get("num_hidden_layers") or base_model_config.get("n_layer") or eff_num_layers)
             else:
-                arch = str(getattr(base_model_config, "model_type", "llama") or "llama")
+                eff_arch = infer_gguf_arch(
+                    base_model_tag or base_name,
+                    explicit_arch=getattr(base_model_config, "model_type", None) or cfg_arch,
+                )
                 eff_hidden_size = int(getattr(base_model_config, "hidden_size", getattr(base_model_config, "n_embd", eff_hidden_size)) or eff_hidden_size)
                 eff_num_layers = int(getattr(base_model_config, "num_hidden_layers", getattr(base_model_config, "n_layer", eff_num_layers)) or eff_num_layers)
         elif base_model_path is not None and (Path(base_model_path) / "config.json").exists():
             cfg_data = json.loads((Path(base_model_path) / "config.json").read_text(encoding="utf-8"))
-            arch = str(cfg_data.get("model_type") or "llama")
+            eff_arch = infer_gguf_arch(
+                base_model_tag or base_name,
+                explicit_arch=cfg_data.get("model_type") or cfg_arch,
+            )
             eff_hidden_size = int(cfg_data.get("hidden_size") or cfg_data.get("n_embd") or eff_hidden_size)
             eff_num_layers = int(cfg_data.get("num_hidden_layers") or cfg_data.get("n_layer") or eff_num_layers)
 
@@ -798,7 +927,7 @@ class PeftToGGUFConverter:
             tensors=gguf_tensors,
             alpha=alpha,
             rank=rank,
-            arch=arch,
+            arch=eff_arch,
             base_model=base_model_tag or base_name,
             hidden_size=eff_hidden_size,
             num_hidden_layers=eff_num_layers,
@@ -810,6 +939,7 @@ class PeftToGGUFConverter:
             "gguf_path": str(gguf_out_path),
             "sha256": save_meta["sha256"],
             "n_tensors": save_meta["tensor_count"],
+            "arch": eff_arch,
             "hidden_size": eff_hidden_size,
             "num_hidden_layers": eff_num_layers,
             "base_model": base_model_tag or base_name,
@@ -1100,7 +1230,7 @@ class RealQLoRAEngine:
             gguf_path=gguf_dest,
             base_model_tag=eff_tag,
         )
-        loaded_saved = SafeTensorsIO.load(peft_save_dir / "adapter_model.safetensors")
+        loaded_saved = SafeTensorsIO.load_f32_buffers(peft_save_dir / "adapter_model.safetensors")
         saved_tensors = loaded_saved[0] if isinstance(loaded_saved, tuple) else loaded_saved
 
         elapsed_s = round(time.monotonic() - t0, 4)

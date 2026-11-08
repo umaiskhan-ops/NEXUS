@@ -681,6 +681,65 @@ class TestContinuousLearning(unittest.TestCase):
         self.assertEqual(ollama_reject["status"], "REJECTED_INCOMPATIBLE_ADAPTER")
         self.assertIn("ADAPTER_MODEL_MISMATCH", ollama_reject["error"])
 
+        # 3e. Verify F16 (fp16) and BF16 (bf16) `.safetensors` adapters (32,768 elems = [8, 4096]) convert cleanly
+        for dt_name in ("F16", "BF16"):
+            dt_dir = self.data_dir / f"peft_{dt_name}"
+            dt_dir.mkdir(parents=True, exist_ok=True)
+            (dt_dir / "adapter_config.json").write_text(
+                json.dumps({"peft_type": "LORA", "r": 8, "lora_alpha": 16.0, "base_model_name_or_path": "llama3.1:8b"}),
+                encoding="utf-8",
+            )
+            SafeTensorsIO.save(
+                dt_dir / "adapter_model.safetensors",
+                {
+                    "base_model.model.layers.0.self_attn.q_proj.lora_A.weight": ([8, 4096], [0.025] * (8 * 4096)),
+                    "base_model.model.layers.0.self_attn.q_proj.lora_B.weight": ([4096, 8], [0.015] * (4096 * 8)),
+                },
+                dtype=dt_name,
+            )
+            buf_map, _ = SafeTensorsIO.load_f32_buffers(dt_dir / "adapter_model.safetensors")
+            self.assertIsInstance(buf_map["base_model.model.layers.0.self_attn.q_proj.lora_A.weight"][1], bytes)
+            self.assertEqual(len(buf_map["base_model.model.layers.0.self_attn.q_proj.lora_A.weight"][1]), 8 * 4096 * 4)
+
+            dt_gguf = self.data_dir / f"lora_{dt_name}.gguf"
+            dt_conv = PeftToGGUFConverter.convert_peft_to_gguf(
+                peft_dir=dt_dir,
+                gguf_out_path=dt_gguf,
+                base_model_tag="llama3.1:8b",
+                hidden_size=4096,
+                num_hidden_layers=1,
+            )
+            self.assertTrue(dt_conv["ok"])
+            self.assertEqual(dt_conv["n_tensors"], 2)
+
+        # 3f. Verify dynamic non-Llama architecture resolution (`qwen2.5:7b` -> `qwen2`) and arch mismatch rejection
+        qwen_dir = self.data_dir / "peft_qwen2"
+        qwen_dir.mkdir(parents=True, exist_ok=True)
+        (qwen_dir / "adapter_config.json").write_text(
+            json.dumps({"peft_type": "LORA", "r": 8, "lora_alpha": 16.0, "base_model_name_or_path": "Qwen/Qwen2.5-7B-Instruct"}),
+            encoding="utf-8",
+        )
+        qwen_tensors = {}
+        for l_idx in range(28):
+            qwen_tensors[f"base_model.model.layers.{l_idx}.self_attn.q_proj.lora_A.weight"] = ([8, 3584], b"\x00" * (8 * 3584 * 4))
+            qwen_tensors[f"base_model.model.layers.{l_idx}.self_attn.q_proj.lora_B.weight"] = ([3584, 8], b"\x00" * (3584 * 8 * 4))
+        SafeTensorsIO.save(qwen_dir / "adapter_model.safetensors", qwen_tensors, dtype="F16")
+        qwen_gguf = self.data_dir / "qwen2_lora.gguf"
+        qwen_conv = PeftToGGUFConverter.convert_peft_to_gguf(qwen_dir, qwen_gguf, "qwen2.5:7b")
+        self.assertEqual(qwen_conv["arch"], "qwen2")
+        qwen_hdr = GGUFLoRAExporter.verify_gguf_header(qwen_gguf)
+        self.assertEqual(qwen_hdr["metadata"]["general.architecture"], "qwen2")
+        self.assertEqual(qwen_hdr["metadata"]["qwen2.embedding_length"], 3584)
+        self.assertEqual(qwen_hdr["metadata"]["qwen2.block_count"], 28)
+        self.assertTrue(AdapterModelCompatibilityValidator.validate(qwen_gguf, "qwen2.5:7b")["compatible"])
+
+        # If a 'llama' architecture header is written on a Qwen-sized adapter, validator rejects arch mismatch
+        bad_arch_gguf = self.data_dir / "qwen_wrong_arch.gguf"
+        PeftToGGUFConverter.convert_peft_to_gguf(qwen_dir, bad_arch_gguf, "qwen2.5:7b", arch="llama")
+        arch_check = AdapterModelCompatibilityValidator.validate(bad_arch_gguf, "qwen2.5:7b")
+        self.assertFalse(arch_check["compatible"])
+        self.assertIn("architecture 'llama' does not match", arch_check["reason"])
+
         # 3d. ContinuousSelfImprovementManager with base_model_tag="llama3.1:8b" rejects 64-dim adapter before `ollama create`
         if TORCH_AVAILABLE:
             mismatch_mgr = ContinuousSelfImprovementManager(

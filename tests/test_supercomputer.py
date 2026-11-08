@@ -391,7 +391,8 @@ class TestSupercomputerGridAndTelegram(unittest.TestCase):
                 self.assertTrue(data["ok"])
                 self.assertEqual(data["status"], "TERMINATED")
 
-            # 5. Test GET /api/ide/files
+            # 5. Test GET /api/ide/files (isolated inside self.data_dir so repo root stays clean)
+            self.grid.active_project = str(self.data_dir)
             with urllib.request.urlopen(f"{base}/api/ide/files", timeout=5) as resp:
                 self.assertEqual(resp.status, 200)
                 data = json.loads(resp.read().decode("utf-8"))
@@ -484,13 +485,18 @@ class TestSupercomputerGridAndTelegram(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
-            for tmp_f in ["test_saved_file.py", "agent_test_algo.py"]:
-                p = Path(getattr(self.grid.config, "workspace_dir", "e:/NEXUS")) / tmp_f
-                if p.exists():
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
+            for base_dir in (
+                self.data_dir,
+                Path.cwd(),
+                Path(getattr(self.grid.config, "workspace_dir", "e:/NEXUS")),
+            ):
+                for tmp_f in ("test_saved_file.py", "agent_test_algo.py"):
+                    p = Path(base_dir) / tmp_f
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
 
 
 if __name__ == "__main__":
