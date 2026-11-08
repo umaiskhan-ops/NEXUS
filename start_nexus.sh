@@ -14,4 +14,20 @@ else
     exit 1
 fi
 
+echo "[+] Using Python: $PY_CMD"
+
+# Auto-detect NVIDIA GPU for Zero-Touch Background QLoRA Training
+if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    echo "[+] NVIDIA GPU Detected! Enabling Autonomous GPU QLoRA Training..."
+    export NEXUS_AUTO_GPU_TRAINING=1
+    if ! "$PY_CMD" -c "import torch, transformers, peft" &> /dev/null; then
+        if [ -f "requirements-gpu.txt" ]; then
+            echo "[*] Installing GPU QLoRA Training Stack (requirements-gpu.txt)..."
+            "$PY_CMD" -m pip install -q -r requirements-gpu.txt || true
+        fi
+    fi
+else
+    echo "[*] Standard CPU Mode Detected (1-Click Lightweight Launch - No GPU Required)."
+fi
+
 "$PY_CMD" -m sovereign_mesh start

@@ -55,6 +55,7 @@ from .qlora_engine import (
     GGUFLoRAExporter,
     PeftToGGUFConverter,
     RealQLoRAEngine,
+    detect_local_gpu_capability,
     is_hf_qlora_stack_ready,
 )
 from .sandbox import run_python
@@ -1113,6 +1114,15 @@ class ContinuousSelfImprovementManager:
         self._router_unreachable: bool = False
         self._lock = threading.Lock()
         self.deployment_history: List[Dict[str, Any]] = []
+        self._auto_gpu_stop = threading.Event()
+        self._auto_gpu_thread: Optional[threading.Thread] = None
+        self._last_trained_sample_count: int = 0
+        self._auto_gpu_state: Dict[str, Any] = {
+            "enabled": False,
+            "cycles_completed": 0,
+            "last_cycle_at": None,
+            "last_cycle_status": None,
+        }
 
     def create_model_generator(
         self,
@@ -1683,6 +1693,65 @@ class ContinuousSelfImprovementManager:
                 "modelfile_generated": str(self.modelfile_path),
             }
 
+    def start_auto_gpu_training_daemon(
+        self,
+        interval_seconds: float = 300.0,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """Automatically starts a background QLoRA/LoRA training loop when a GPU is detected on the PC."""
+        gpu_cap = detect_local_gpu_capability()
+        auto_env = os.environ.get("NEXUS_AUTO_GPU_TRAINING", "").strip() in {"1", "true", "yes"}
+        if os.environ.get("NEXUS_DISABLE_AUTO_GPU_TRAIN", "").strip() in {"1", "true", "yes"} and not force:
+            return {"started": False, "reason": "disabled_by_env", "gpu": gpu_cap}
+
+        if not (force or auto_env or gpu_cap["gpu_detected"]):
+            return {"started": False, "reason": "no_gpu_detected", "gpu": gpu_cap}
+
+        if not TORCH_AVAILABLE:
+            return {"started": False, "reason": "pytorch_unavailable", "gpu": gpu_cap}
+
+        if self._auto_gpu_thread is not None and self._auto_gpu_thread.is_alive():
+            return {"ok": True, "started": True, "auto_training_enabled": True, "already_running": True, "gpu": gpu_cap}
+
+        self._auto_gpu_stop.clear()
+        self._auto_gpu_state["enabled"] = True
+        self._auto_gpu_state["gpu"] = gpu_cap
+
+        def _daemon_loop() -> None:
+            # Wait briefly after node startup so web studio & HTTP routes come online immediately
+            if self._auto_gpu_stop.wait(timeout=min(2.0, max(0.05, interval_seconds * 0.1))):
+                return
+            while not self._auto_gpu_stop.is_set():
+                try:
+                    curr_count = self.dataset_store.count()
+                    if curr_count == 0 or curr_count > self._last_trained_sample_count or not self.active_adapter_path.exists():
+                        res = self.run_training_and_deploy_cycle(
+                            epochs=3,
+                            min_samples=2,
+                            eval_limit=8,
+                            samples_per_task=5,
+                        )
+                        self._last_trained_sample_count = self.dataset_store.count()
+                        self._auto_gpu_state["cycles_completed"] = int(self._auto_gpu_state.get("cycles_completed", 0)) + 1
+                        self._auto_gpu_state["last_cycle_at"] = time.time()
+                        self._auto_gpu_state["last_cycle_status"] = res.get("status") or res.get("action")
+                except Exception as exc:
+                    self._auto_gpu_state["last_cycle_status"] = f"ERROR: {exc}"
+                if self._auto_gpu_stop.wait(timeout=max(1.0, float(interval_seconds))):
+                    break
+
+        self._auto_gpu_thread = threading.Thread(
+            target=_daemon_loop,
+            name="auto-gpu-qlora-trainer",
+            daemon=True,
+        )
+        self._auto_gpu_thread.start()
+        return {"ok": True, "started": True, "auto_training_enabled": True, "gpu": gpu_cap}
+
+    def stop_auto_gpu_training_daemon(self) -> None:
+        self._auto_gpu_stop.set()
+        self._auto_gpu_state["enabled"] = False
+
     def status(self) -> Dict[str, Any]:
         """Returns the current state of the continuous self-improvement loop."""
         has_active = self.active_adapter_path.exists()
@@ -1700,6 +1769,8 @@ class ContinuousSelfImprovementManager:
             "active_adapter_metadata": active_meta,
             "modelfile_exists": self.modelfile_path.exists(),
             "pytorch_backend_active": TORCH_AVAILABLE,
+            "gpu_capability": detect_local_gpu_capability(),
+            "auto_gpu_training": dict(self._auto_gpu_state),
             "deployments_count": len([d for d in self.deployment_history if d["action"] == "DEPLOYED"]),
             "rollbacks_count": len([d for d in self.deployment_history if d["action"] == "ROLLED_BACK"]),
             "latest_event": self.deployment_history[-1] if self.deployment_history else None,

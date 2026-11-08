@@ -605,6 +605,21 @@ class TestContinuousLearning(unittest.TestCase):
     def test_10_hf_peft_qlora_tiny_model_plumbing(self):
         """Marhala 2: Verifies HF PEFT save_pretrained -> GGUF conversion, pre-`ollama create` compatibility check, and tiny HF model QLoRA plumbing."""
         from sovereign_mesh.brain_matrix import SafeTensorsIO
+        from sovereign_mesh.qlora_engine import detect_local_gpu_capability
+
+        # 0. Verify automatic GPU capability detection & background auto-training daemon lifecycle
+        gpu_cap = detect_local_gpu_capability()
+        self.assertIn("gpu_detected", gpu_cap)
+        self.assertIn("qlora_capable", gpu_cap)
+        daemon_res = self.mgr.start_auto_gpu_training_daemon(interval_seconds=0.5, force=True)
+        if TORCH_AVAILABLE:
+            self.assertTrue(daemon_res["started"])
+            self.assertTrue(self.mgr.status()["auto_gpu_training"]["enabled"])
+            self.mgr.stop_auto_gpu_training_daemon()
+            self.assertFalse(self.mgr.status()["auto_gpu_training"]["enabled"])
+        else:
+            self.assertFalse(daemon_res["started"])
+            self.assertEqual(daemon_res["reason"], "pytorch_unavailable")
 
         # 1. Verify toy NexusCausalTransformerLM is completely removed from production code
         qlora_src = Path("sovereign_mesh/qlora_engine.py").read_text(encoding="utf-8")

@@ -125,6 +125,56 @@ def is_hf_qlora_stack_ready() -> bool:
         return False
 
 
+def detect_local_gpu_capability() -> Dict[str, Any]:
+    """Detects whether the local PC has a CUDA/NVIDIA GPU and reports VRAM & QLoRA readiness."""
+    gpu_detected = False
+    gpu_name = ""
+    vram_mb = 0
+
+    if TORCH_AVAILABLE and torch is not None:
+        try:
+            if torch.cuda.is_available():
+                gpu_detected = True
+                gpu_name = str(torch.cuda.get_device_name(0) or "CUDA GPU").strip()
+                props = torch.cuda.get_device_properties(0)
+                vram_mb = int(getattr(props, "total_memory", 0) // (1024 * 1024))
+        except Exception:
+            pass
+
+    if not gpu_detected:
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi:
+            try:
+                proc = subprocess.run(
+                    [nvidia_smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.5,
+                    check=False,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    first_line = proc.stdout.strip().splitlines()[0]
+                    parts = [p.strip() for p in first_line.split(",")]
+                    if parts and parts[0]:
+                        gpu_detected = True
+                        gpu_name = parts[0]
+                        if len(parts) > 1 and parts[1].isdigit():
+                            vram_mb = int(parts[1])
+            except Exception:
+                pass
+
+    vram_gb = round(vram_mb / 1024.0, 2) if vram_mb > 0 else 0.0
+    return {
+        "gpu_detected": gpu_detected,
+        "gpu_name": gpu_name,
+        "vram_mb": vram_mb,
+        "vram_gb": vram_gb,
+        "qlora_capable": bool(gpu_detected and (vram_mb >= 4000 or vram_mb == 0)),
+        "pytorch_ready": TORCH_AVAILABLE,
+        "hf_qlora_stack_ready": is_hf_qlora_stack_ready(),
+    }
+
+
 # =====================================================================
 # 1. SPEC-COMPLIANT GGUF v3 LORA BINARY EXPORTER & PARSER
 # =====================================================================

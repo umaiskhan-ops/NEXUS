@@ -196,6 +196,13 @@ exit /b 1
 
 :run_worker
 echo [+] Python detected: %PY_CMD%
+nvidia-smi >nul 2>&1
+if not errorlevel 1 (
+    echo [+] NVIDIA GPU Detected! Autonomous GPU LoRA Training: ENABLED
+    set NEXUS_WORKER_GPU_AUTO=1
+) else (
+    echo [*] Standard CPU Mode Detected ^(Lightweight 1-Click Mode^).
+)
 echo [*] Starting SUP Agentic Mesh Worker Node (Powered by NEXUS)...
 echo [*] Native Zero-Setup Sandbox & Host Shield: ACTIVE
 echo.
@@ -244,6 +251,12 @@ if [ -z "$PY_CMD" ]; then
 fi
 
 echo "[+] Using $PY_CMD"
+if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    echo "[+] NVIDIA GPU Detected! Autonomous GPU LoRA Training: ENABLED"
+    export NEXUS_WORKER_GPU_AUTO=1
+else
+    echo "[*] Standard CPU Mode Detected (Lightweight 1-Click Mode)."
+fi
 export NEXUS_OTA_LOOP=1
 while true; do
     "$PY_CMD" -u nexus_worker_launcher.py
@@ -513,11 +526,33 @@ def detect_hardware_uuid() -> str:
     raw = f"{{uuid.getnode()}}:{{socket.gethostname()}}:{{platform.machine()}}"
     return "hw-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
+def detect_gpu_spec() -> tuple:
+    try:
+        import subprocess
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            first_line = proc.stdout.strip().splitlines()[0]
+            parts = [p.strip() for p in first_line.split(",")]
+            gpu_name = parts[0] if parts else "NVIDIA GPU"
+            vram_mb = int(float(parts[1])) if len(parts) > 1 else 0
+            return gpu_name, vram_mb
+    except Exception:
+        pass
+    return "", 0
+
 def detect_hardware_spec() -> str:
     cpu = (platform.processor() or platform.machine() or "Multi-Core CPU").strip()
     if len(cpu) > 36:
         cpu = cpu[:36].strip()
     cores = os.cpu_count() or 4
+    gpu_name, vram_mb = detect_gpu_spec()
+    if gpu_name:
+        return f"{{cpu}} ({{cores}} Cores) + {{gpu_name}} ({{vram_mb}} MB VRAM)"
     return f"{{cpu}} ({{cores}} Cores)"
 
 def solve_pow_challenge(worker_id: str, challenge: str, difficulty_prefix: str = "0000") -> str:
@@ -635,8 +670,11 @@ class WorkerState:
         self.total_earned = 0.0
         self.jobs_completed = 0
         self.hardware_uuid = detect_hardware_uuid()
+        self.gpu_name, self.gpu_vram_mb = detect_gpu_spec()
+        self.gpu_detected = bool(self.gpu_name)
+        self.auto_gpu_training_enabled = bool(self.gpu_detected or os.environ.get("NEXUS_WORKER_GPU_AUTO") == "1")
         self.hardware_spec = detect_hardware_spec()
-        self.brain_shard = "CODE_DEBUG_EXEC" if (os.cpu_count() or 4) >= 8 else "DATA_MEMORY_SYNTHESIS"
+        self.brain_shard = "CODE_DEBUG_EXEC" if (self.gpu_detected or (os.cpu_count() or 4) >= 8) else "DATA_MEMORY_SYNTHESIS"
         self.replica_shards = ["MATH_PROOF_LOGIC", "SECURITY_AUDIT_REDTEAM"]
         self.synced_deltas_count = 0
         self.pow_challenge = ""
@@ -1221,6 +1259,54 @@ class WorkerState:
                 self.consecutive_net_failures += 1
                 if self.consecutive_net_failures >= 3:
                     self.check_and_auto_heal_hub_url()
+
+    def auto_gpu_training_loop(self):
+        """Autonomous background LoRA training loop when an NVIDIA GPU is detected on the Worker PC."""
+        step_idx = 0
+        while True:
+            time.sleep(60)
+            if not self.worker_key or not self.auto_gpu_training_enabled or getattr(self, "is_duplicate_blocked", False):
+                continue
+            step_idx += 1
+            try:
+                seed_prompt = f"auto_gpu_lora:{{self.brain_shard}}:step_{{step_idx}}:{{int(time.time() // 60)}}"
+                lora_grads = compute_local_lora_gradients(seed_prompt, self.brain_shard)
+                task_id = f"auto-gpu-{{self.worker_id}}-{{step_idx}}"
+                result = {{
+                    "status": "OK",
+                    "inferred_by_worker": self.worker_id,
+                    "brain_shard": self.brain_shard,
+                    "hardware": self.hardware_spec,
+                    "auto_gpu_trained": True,
+                    "lora_gradients": lora_grads,
+                }}
+                proof_body = {{
+                    "task_id": task_id,
+                    "worker_id": self.worker_id,
+                    "feature": "lora_backprop_train",
+                    "nonce": str(step_idx),
+                    "result": result,
+                }}
+                proof = compute_hmac(self.worker_key, proof_body)
+                sub_url = f"{{self.hub_url.rstrip('/')}}/api/worker/submit_result"
+                req = urllib.request.Request(
+                    sub_url,
+                    data=canonical({{
+                        "task_id": task_id,
+                        "worker_id": self.worker_id,
+                        "feature": "lora_backprop_train",
+                        "result": result,
+                        "worker_proof": proof,
+                    }}),
+                    headers={{"Content-Type": "application/json"}},
+                )
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    s_data = json.loads(resp.read().decode("utf-8"))
+                    if s_data.get("ok"):
+                        self.credits = s_data.get("worker_credits", self.credits)
+                        print(f"[+] [Auto-GPU-LoRA] Trained & synced shard '{{self.brain_shard}}' delta (loss {{lora_grads['initial_loss']}} -> {{lora_grads['final_loss']}}) | Balance: {{self.credits}} UMAIS")
+            except Exception:
+                pass
 
 state = WorkerState()
 
@@ -1835,6 +1921,11 @@ def main():
 
     # Launch background heartbeat
     threading.Thread(target=state.heartbeat, daemon=True).start()
+    if getattr(state, "auto_gpu_training_enabled", False):
+        print(f"[+] Auto-GPU Training:  ACTIVE ({{state.gpu_name or 'CUDA Acceleration'}})")
+        threading.Thread(target=state.auto_gpu_training_loop, daemon=True).start()
+    else:
+        print(f"[*] Compute Mode:       Standard CPU Mode (1-Click Lightweight)")
 
     # Open user browser automatically
     try:
