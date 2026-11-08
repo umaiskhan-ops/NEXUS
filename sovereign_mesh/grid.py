@@ -149,9 +149,11 @@ class UltimateAgiSovereignGrid:
         self.scheduler.start()
         self.set_worker_count(self._desired_workers)
         threading.Thread(target=self._monitor_loop, name="monitor", daemon=True).start()
-        if os.environ.get("NEXUS_AUTO_GPU_TRAINING", "").strip().lower() in {"1", "true", "yes"}:
+        if os.environ.get("NEXUS_GPU_TRAINING_LEVEL", "").strip() in {"2", "3"}:
             try:
-                self.continuous_learning.start_auto_gpu_training_daemon()
+                self.continuous_learning.start_auto_gpu_training_daemon(
+                    level=int(os.environ.get("NEXUS_GPU_TRAINING_LEVEL", "2"))
+                )
             except Exception:
                 pass
 

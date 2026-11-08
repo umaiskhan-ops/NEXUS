@@ -516,6 +516,41 @@ print(f"ISOLATED:{isolated}")
             self.assertEqual(g_run1["final_loss"], g_run2["final_loss"])
             self.assertGreater(g_run1["initial_loss"], g_run1["final_loss"])
 
+            # 4. Verify Worker Package does NOT contain self-generated auto_gpu_training_loop
+            self.assertNotIn("auto_gpu_training_loop", launcher_code)
+
+            # 5. Verify Economy Anti-Minting & Fabricated Answer Rejection
+            from sovereign_mesh.hub_spoke import MasterHubCoordinator, compute_hmac
+            from sovereign_mesh.ledger import HashChainLedger
+            ledger = HashChainLedger(tpath / "ledger.jsonl")
+            hub = MasterHubCoordinator(ledger, state_path=tpath / "hub.json")
+
+            # Self-dealing task funding is strictly blocked
+            w_self = hub.register_worker("self-dealer", initial_credits=100, hardware_uuid="hw-self-1")
+            with self.assertRaises(PermissionError):
+                hub.enqueue_nat_task("self-dealer", "brain_inference", {"prompt": "test"}, funded_by="self-dealer")
+
+            # Fabricated answer without valid LoRA gradients or deterministic verification is strictly REJECTED (0 credits minted)
+            t_fab = hub.enqueue_nat_task("self-dealer", "brain_inference", {"prompt": "solve hard problem"})
+            fab_result = {"answer": "fabricated answer"}
+            fab_proof = compute_hmac(w_self.key, {
+                "task_id": t_fab["task_id"],
+                "worker_id": "self-dealer",
+                "feature": "brain_inference",
+                "nonce": t_fab["nonce"],
+                "result": fab_result,
+            })
+            fab_settled = hub.verify_and_settle({
+                "task_id": t_fab["task_id"],
+                "worker_id": "self-dealer",
+                "feature": "brain_inference",
+                "result": fab_result,
+                "worker_proof": fab_proof,
+            })
+            self.assertFalse(fab_settled["ok"])
+            self.assertEqual(fab_settled["status"], "REJECTED")
+            self.assertEqual(w_self.credits, 100)
+
 
 if __name__ == "__main__":
     unittest.main()

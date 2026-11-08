@@ -16,15 +16,19 @@ fi
 
 echo "[+] Using Python: $PY_CMD"
 
-# Auto-detect NVIDIA GPU for Zero-Touch Background QLoRA Training
+# Level 1 (Default): Detect & Report GPU/VRAM Only (Never auto-installs or auto-starts training without opt-in)
 if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
-    echo "[+] NVIDIA GPU Detected! Enabling Autonomous GPU QLoRA Training..."
-    export NEXUS_AUTO_GPU_TRAINING=1
-    if ! "$PY_CMD" -c "import torch, transformers, peft" &> /dev/null; then
-        if [ -f "requirements-gpu.txt" ]; then
-            echo "[*] Installing GPU QLoRA Training Stack (requirements-gpu.txt)..."
-            "$PY_CMD" -m pip install -q -r requirements-gpu.txt || true
+    GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -n 1)
+    echo "[+] GPU Detected: ${GPU_INFO:-NVIDIA CUDA GPU} [Level 1: Detect & Report Only - Pass --gpu-candidate to opt-in]"
+    if [ "${1:-}" = "--install-gpu" ]; then
+        echo "[!] GPU QLoRA Training Stack (torch, transformers, peft, trl, bitsandbytes) requires ~2.5 GB download."
+        read -r -p "Install GPU QLoRA stack from requirements-gpu.txt? (y/n): " CONFIRM_GPU
+        if [ "$CONFIRM_GPU" = "y" ] || [ "$CONFIRM_GPU" = "Y" ]; then
+            "$PY_CMD" -m pip install -r requirements-gpu.txt
         fi
+    elif [ "${1:-}" = "--gpu-candidate" ]; then
+        echo "[+] Opt-In Level 2 Enabled: Background Candidate Training (Staged Only - Human Approval Required)"
+        export NEXUS_GPU_TRAINING_LEVEL=2
     fi
 else
     echo "[*] Standard CPU Mode Detected (1-Click Lightweight Launch - No GPU Required)."

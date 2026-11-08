@@ -198,8 +198,7 @@ exit /b 1
 echo [+] Python detected: %PY_CMD%
 nvidia-smi >nul 2>&1
 if not errorlevel 1 (
-    echo [+] NVIDIA GPU Detected! Autonomous GPU LoRA Training: ENABLED
-    set NEXUS_WORKER_GPU_AUTO=1
+    echo [+] NVIDIA GPU Detected ^(Reported to Hub for Signed Compute Tasks^).
 ) else (
     echo [*] Standard CPU Mode Detected ^(Lightweight 1-Click Mode^).
 )
@@ -252,8 +251,7 @@ fi
 
 echo "[+] Using $PY_CMD"
 if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
-    echo "[+] NVIDIA GPU Detected! Autonomous GPU LoRA Training: ENABLED"
-    export NEXUS_WORKER_GPU_AUTO=1
+    echo "[+] NVIDIA GPU Detected (Reported to Hub for Signed Compute Tasks)."
 else
     echo "[*] Standard CPU Mode Detected (Lightweight 1-Click Mode)."
 fi
@@ -672,7 +670,6 @@ class WorkerState:
         self.hardware_uuid = detect_hardware_uuid()
         self.gpu_name, self.gpu_vram_mb = detect_gpu_spec()
         self.gpu_detected = bool(self.gpu_name)
-        self.auto_gpu_training_enabled = bool(self.gpu_detected or os.environ.get("NEXUS_WORKER_GPU_AUTO") == "1")
         self.hardware_spec = detect_hardware_spec()
         self.brain_shard = "CODE_DEBUG_EXEC" if (self.gpu_detected or (os.cpu_count() or 4) >= 8) else "DATA_MEMORY_SYNTHESIS"
         self.replica_shards = ["MATH_PROOF_LOGIC", "SECURITY_AUDIT_REDTEAM"]
@@ -1259,54 +1256,6 @@ class WorkerState:
                 self.consecutive_net_failures += 1
                 if self.consecutive_net_failures >= 3:
                     self.check_and_auto_heal_hub_url()
-
-    def auto_gpu_training_loop(self):
-        """Autonomous background LoRA training loop when an NVIDIA GPU is detected on the Worker PC."""
-        step_idx = 0
-        while True:
-            time.sleep(60)
-            if not self.worker_key or not self.auto_gpu_training_enabled or getattr(self, "is_duplicate_blocked", False):
-                continue
-            step_idx += 1
-            try:
-                seed_prompt = f"auto_gpu_lora:{{self.brain_shard}}:step_{{step_idx}}:{{int(time.time() // 60)}}"
-                lora_grads = compute_local_lora_gradients(seed_prompt, self.brain_shard)
-                task_id = f"auto-gpu-{{self.worker_id}}-{{step_idx}}"
-                result = {{
-                    "status": "OK",
-                    "inferred_by_worker": self.worker_id,
-                    "brain_shard": self.brain_shard,
-                    "hardware": self.hardware_spec,
-                    "auto_gpu_trained": True,
-                    "lora_gradients": lora_grads,
-                }}
-                proof_body = {{
-                    "task_id": task_id,
-                    "worker_id": self.worker_id,
-                    "feature": "lora_backprop_train",
-                    "nonce": str(step_idx),
-                    "result": result,
-                }}
-                proof = compute_hmac(self.worker_key, proof_body)
-                sub_url = f"{{self.hub_url.rstrip('/')}}/api/worker/submit_result"
-                req = urllib.request.Request(
-                    sub_url,
-                    data=canonical({{
-                        "task_id": task_id,
-                        "worker_id": self.worker_id,
-                        "feature": "lora_backprop_train",
-                        "result": result,
-                        "worker_proof": proof,
-                    }}),
-                    headers={{"Content-Type": "application/json"}},
-                )
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    s_data = json.loads(resp.read().decode("utf-8"))
-                    if s_data.get("ok"):
-                        self.credits = s_data.get("worker_credits", self.credits)
-                        print(f"[+] [Auto-GPU-LoRA] Trained & synced shard '{{self.brain_shard}}' delta (loss {{lora_grads['initial_loss']}} -> {{lora_grads['final_loss']}}) | Balance: {{self.credits}} UMAIS")
-            except Exception:
-                pass
 
 state = WorkerState()
 
@@ -1919,11 +1868,10 @@ def main():
         print(f"[+] Status: ONLINE & MINING UMAIS (1 Credit = 1 UMAIS)")
     print("-" * 60)
 
-    # Launch background heartbeat
+    # Launch background heartbeat (only executes Hub-signed tasks; never self-generates task IDs)
     threading.Thread(target=state.heartbeat, daemon=True).start()
-    if getattr(state, "auto_gpu_training_enabled", False):
-        print(f"[+] Auto-GPU Training:  ACTIVE ({{state.gpu_name or 'CUDA Acceleration'}})")
-        threading.Thread(target=state.auto_gpu_training_loop, daemon=True).start()
+    if getattr(state, "gpu_detected", False):
+        print(f"[+] Hardware Reported:  {{state.gpu_name}} ({{state.gpu_vram_mb}} MB VRAM) — Ready for Hub-Signed Jobs")
     else:
         print(f"[*] Compute Mode:       Standard CPU Mode (1-Click Lightweight)")
 

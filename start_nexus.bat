@@ -52,17 +52,22 @@ exit /b 1
 :launch
 echo [+] Using Python: %PY_CMD%
 
-:: Auto-detect NVIDIA GPU for Zero-Touch Background QLoRA Training
+:: Level 1 (Default): Detect & Report GPU/VRAM Only (Never auto-installs or auto-starts training without opt-in)
 nvidia-smi >nul 2>&1
 if not errorlevel 1 (
-    echo [+] NVIDIA GPU Detected! Enabling Autonomous GPU QLoRA Training...
-    set NEXUS_AUTO_GPU_TRAINING=1
-    %PY_CMD% -c "import torch, transformers, peft" >nul 2>&1
-    if errorlevel 1 (
-        if exist "requirements-gpu.txt" (
-            echo [*] Installing GPU QLoRA Training Stack ^(requirements-gpu.txt^)...
-            %PY_CMD% -m pip install -q -r requirements-gpu.txt
+    for /f "tokens=*" %%g in ('nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2^>nul') do (
+        echo [+] GPU Detected: %%g [Level 1: Detect ^& Report Only - Pass --gpu-candidate to opt-in to training]
+    )
+    if "%~1"=="--install-gpu" (
+        echo [!] GPU QLoRA Training Stack ^(torch, transformers, peft, trl, bitsandbytes^) requires ~2.5 GB download.
+        set /p CONFIRM_GPU="Install GPU QLoRA stack from requirements-gpu.txt? (y/n): "
+        if /i "%CONFIRM_GPU%"=="y" (
+            %PY_CMD% -m pip install -r requirements-gpu.txt
         )
+    )
+    if "%~1"=="--gpu-candidate" (
+        echo [+] Opt-In Level 2 Enabled: Background Candidate Training ^(Staged Only - Human Approval Required^)
+        set NEXUS_GPU_TRAINING_LEVEL=2
     )
 ) else (
     echo [*] Standard CPU Mode Detected ^(1-Click Lightweight Launch - No GPU Required^).

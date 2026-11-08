@@ -528,6 +528,29 @@ class TestContinuousLearning(unittest.TestCase):
                 urllib.request.urlopen(req_unauth, timeout=5)
             self.assertEqual(ctx.exception.code, 401)
 
+            # POST /api/worker/enqueue_task (unauth rejected with 401 — closes free credit minting exploit)
+            grid.hub.register_worker("test-worker-1", url="local", initial_credits=20)
+            req_enq_unauth = urllib.request.Request(
+                f"{base}/api/worker/enqueue_task",
+                data=json.dumps({"worker_id": "test-worker-1", "feature_key": "brain_inference", "prompt": "hi"}).encode("utf-8"),
+                headers=unauth_hdrs,
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_enq:
+                urllib.request.urlopen(req_enq_unauth, timeout=5)
+            self.assertEqual(ctx_enq.exception.code, 401)
+
+            # POST /api/worker/enqueue_task with Owner auth succeeds and NEVER leaks nonce or hub_signature
+            req_enq_auth = urllib.request.Request(
+                f"{base}/api/worker/enqueue_task",
+                data=json.dumps({"worker_id": "test-worker-1", "feature_key": "brain_inference", "prompt": "hi"}).encode("utf-8"),
+                headers=auth_hdrs,
+            )
+            with urllib.request.urlopen(req_enq_auth, timeout=5) as resp_enq:
+                enq_data = json.loads(resp_enq.read().decode("utf-8"))
+                self.assertTrue(enq_data["ok"])
+                self.assertNotIn("nonce", enq_data["queued_packet"])
+                self.assertNotIn("hub_signature", enq_data["queued_packet"])
+
             # POST /api/learning/verify (auth succeeds with proof and saves to dataset)
             req_verify = urllib.request.Request(
                 f"{base}/api/learning/verify",
@@ -605,13 +628,50 @@ class TestContinuousLearning(unittest.TestCase):
     def test_10_hf_peft_qlora_tiny_model_plumbing(self):
         """Marhala 2: Verifies HF PEFT save_pretrained -> GGUF conversion, pre-`ollama create` compatibility check, and tiny HF model QLoRA plumbing."""
         from sovereign_mesh.brain_matrix import SafeTensorsIO
-        from sovereign_mesh.qlora_engine import detect_local_gpu_capability
+        from sovereign_mesh.qlora_engine import (
+            detect_local_gpu_capability,
+            recommend_model_for_vram,
+            verify_base_model_requirements,
+        )
 
-        # 0. Verify automatic GPU capability detection & background auto-training daemon lifecycle
+        # 0. Verify 3-Tier GPU Auto-Training Architecture (Default = Level 1 Detect-Only), VRAM Tiers, Kill Switch & Human Approval
         gpu_cap = detect_local_gpu_capability()
         self.assertIn("gpu_detected", gpu_cap)
         self.assertIn("qlora_capable", gpu_cap)
-        daemon_res = self.mgr.start_auto_gpu_training_daemon(interval_seconds=0.5, force=True)
+        self.assertIn("vram_tier", gpu_cap)
+        self.assertEqual(gpu_cap["estimated_stack_download_gb"], 2.5)
+
+        # VRAM Tier Mapping checks
+        self.assertFalse(detect_local_gpu_capability(vram_override_mb=2048)["qlora_capable"])
+        self.assertEqual(recommend_model_for_vram(4500)["vram_tier"], "TINY_1B")
+        self.assertFalse(recommend_model_for_vram(4500)["qlora_8b_capable"])
+        self.assertEqual(recommend_model_for_vram(8192)["vram_tier"], "SMALL_3B")
+        self.assertFalse(recommend_model_for_vram(8192)["qlora_8b_capable"])
+        self.assertEqual(recommend_model_for_vram(16384)["vram_tier"], "MEDIUM_7B_8B_GRAD_CKPT")
+        self.assertTrue(recommend_model_for_vram(16384)["qlora_8b_capable"])
+        self.assertTrue(recommend_model_for_vram(16384)["requires_gradient_checkpointing"])
+        self.assertEqual(recommend_model_for_vram(24576)["vram_tier"], "FULL_8B_14B")
+        self.assertFalse(recommend_model_for_vram(24576)["requires_gradient_checkpointing"])
+
+        # Base model license & gated HF token check
+        qwen_req = verify_base_model_requirements("Qwen/Qwen2.5-Coder-7B-Instruct")
+        self.assertTrue(qwen_req["ok"])
+        self.assertEqual(qwen_req["license"], "Apache-2.0")
+
+        # Level 1 (Default) MUST NOT start background training automatically
+        lvl1_res = self.mgr.start_auto_gpu_training_daemon()
+        self.assertFalse(lvl1_res["started"])
+        self.assertEqual(lvl1_res["level"], 1)
+        self.assertEqual(lvl1_res["mode"], "detect_only")
+        self.assertFalse(self.mgr.status()["auto_gpu_training"]["enabled"])
+
+        # Level 2 (Opt-In Candidate Staging) configures 140 tasks, K>=5, min_samples=100, and requires human approval
+        daemon_res = self.mgr.start_auto_gpu_training_daemon(interval_seconds=0.5, force=True, level=2)
+        st_auto = self.mgr.status()["auto_gpu_training"]
+        self.assertEqual(st_auto["eval_limit"], 140)
+        self.assertEqual(st_auto["min_samples_required"], 100)
+        self.assertEqual(st_auto["samples_per_task"], 5)
+        self.assertTrue(st_auto["require_human_approval"])
         if TORCH_AVAILABLE:
             self.assertTrue(daemon_res["started"])
             self.assertTrue(self.mgr.status()["auto_gpu_training"]["enabled"])
@@ -620,6 +680,39 @@ class TestContinuousLearning(unittest.TestCase):
         else:
             self.assertFalse(daemon_res["started"])
             self.assertEqual(daemon_res["reason"], "pytorch_unavailable")
+
+        # Kill switch & Inference-active guard
+        ks_res = self.mgr.engage_kill_switch("Audit test kill switch")
+        self.assertTrue(ks_res["kill_switch_engaged"])
+        blocked_cycle = self.mgr.run_training_and_deploy_cycle(epochs=1)
+        self.assertEqual(blocked_cycle["status"], "KILL_SWITCH_ENGAGED")
+        self.mgr.release_kill_switch()
+
+        self.mgr._inference_in_flight = 1
+        try:
+            deferred_cycle = self.mgr.run_training_and_deploy_cycle(epochs=1)
+            self.assertEqual(deferred_cycle["status"], "DEFERRED_INFERENCE_ACTIVE")
+        finally:
+            self.mgr._inference_in_flight = 0
+
+        # Level 2 Candidate Staging + Human Approval promotion test
+        if TORCH_AVAILABLE:
+            stage_res = self.mgr.run_training_and_deploy_cycle(
+                epochs=2,
+                min_samples=2,
+                eval_limit=6,
+                samples_per_task=5,
+                require_human_approval=True,
+                secondary_holdout_check=True,
+            )
+            self.assertTrue(stage_res["ok"])
+            self.assertEqual(stage_res["status"], "STAGED_PENDING_APPROVAL")
+            self.assertTrue(stage_res["pending_human_approval"])
+            self.assertFalse(self.mgr.active_adapter_path.exists(), "Level 2 must not overwrite live active adapter before human approval")
+            approve_res = self.mgr.approve_staged_candidate(approved_by="owner-audit")
+            self.assertTrue(approve_res["ok"])
+            self.assertEqual(approve_res["action"], "DEPLOYED")
+            self.assertTrue(self.mgr.active_adapter_path.exists())
 
         # 1. Verify toy NexusCausalTransformerLM is completely removed from production code
         qlora_src = Path("sovereign_mesh/qlora_engine.py").read_text(encoding="utf-8")

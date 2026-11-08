@@ -37,6 +37,8 @@ import os
 import random
 import re
 import struct
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -57,6 +59,8 @@ from .qlora_engine import (
     RealQLoRAEngine,
     detect_local_gpu_capability,
     is_hf_qlora_stack_ready,
+    recommend_model_for_vram,
+    verify_base_model_requirements,
 )
 from .sandbox import run_python
 
@@ -1114,14 +1118,33 @@ class ContinuousSelfImprovementManager:
         self._router_unreachable: bool = False
         self._lock = threading.Lock()
         self.deployment_history: List[Dict[str, Any]] = []
+        self.checkpoint_path = self.data_dir / "training_checkpoint.json"
+        self.staged_candidate: Optional[Dict[str, Any]] = None
+        self._kill_switch_engaged: bool = False
+        self._kill_switch_reason: str = ""
+        self._inference_in_flight: int = 0
+        self._active_subproc: Optional[subprocess.Popen] = None
         self._auto_gpu_stop = threading.Event()
         self._auto_gpu_thread: Optional[threading.Thread] = None
         self._last_trained_sample_count: int = 0
         self._auto_gpu_state: Dict[str, Any] = {
+            "level": 1,
+            "mode": "detect_only",
             "enabled": False,
+            "require_human_approval": True,
+            "min_samples_required": 100,
+            "eval_limit": 140,
+            "samples_per_task": 5,
+            "cooldown_seconds": 43200.0,
+            "max_cycles_per_day": 2,
             "cycles_completed": 0,
+            "cycles_today": 0,
+            "day_window_start": 0.0,
             "last_cycle_at": None,
             "last_cycle_status": None,
+            "subprocess_isolated": True,
+            "pause_during_inference": True,
+            "kill_switch_engaged": False,
         }
 
     def create_model_generator(
@@ -1328,6 +1351,131 @@ class ContinuousSelfImprovementManager:
             "paired_bootstrap_gate": paired_gate_report,
         }
 
+    def is_inference_active(self) -> bool:
+        """Returns True if live user inference is currently running on the shared GPU/Ollama router."""
+        if self._inference_in_flight > 0:
+            return True
+        if self.router is not None and int(getattr(self.router, "_in_flight_requests", 0) or 0) > 0:
+            return True
+        return False
+
+    def save_checkpoint(self, stage: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Persists training/evaluation progress so interrupted cycles can be inspected or resumed."""
+        payload = {
+            "stage": stage,
+            "timestamp": time.time(),
+            "verified_samples_count": self.dataset_store.count(),
+            "base_model_tag": self.base_model_tag,
+            "active_model_tag": self.active_model_tag,
+            **(extra or {}),
+        }
+        try:
+            self.checkpoint_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return payload
+
+    def load_checkpoint(self) -> Optional[Dict[str, Any]]:
+        if not self.checkpoint_path.exists():
+            return None
+        try:
+            return json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def engage_kill_switch(self, reason: str = "Manual kill switch engaged by Owner") -> Dict[str, Any]:
+        """Immediately stops background auto-training and terminates any active training subprocess."""
+        self._kill_switch_engaged = True
+        self._kill_switch_reason = str(reason or "Manual kill switch engaged")
+        self._auto_gpu_state["kill_switch_engaged"] = True
+        self.stop_auto_gpu_training_daemon()
+        if self._active_subproc is not None:
+            try:
+                self._active_subproc.terminate()
+            except Exception:
+                pass
+            self._active_subproc = None
+        if self.ledger is not None:
+            try:
+                self.ledger.append("learning_kill_switch_engaged", {"reason": self._kill_switch_reason, "timestamp": time.time()})
+            except Exception:
+                pass
+        return {"ok": True, "kill_switch_engaged": True, "reason": self._kill_switch_reason}
+
+    def release_kill_switch(self) -> Dict[str, Any]:
+        self._kill_switch_engaged = False
+        self._kill_switch_reason = ""
+        self._auto_gpu_state["kill_switch_engaged"] = False
+        return {"ok": True, "kill_switch_engaged": False}
+
+    def approve_staged_candidate(self, approved_by: str = "owner") -> Dict[str, Any]:
+        """Promotes a staged Level-2 candidate adapter to the live active adapter after Human Approval."""
+        with self._lock:
+            if not self.staged_candidate:
+                return {"ok": False, "status": "NO_STAGED_CANDIDATE", "reason": "No staged candidate adapter is awaiting approval."}
+            if not self.candidate_adapter_path.exists():
+                return {"ok": False, "status": "CANDIDATE_FILE_MISSING", "reason": "Staged candidate .safetensors file is missing."}
+
+            cand_info = dict(self.staged_candidate)
+            cand_tag = cand_info["candidate_model_tag"]
+            tensors, meta = SafeTensorsIO.load(self.candidate_adapter_path)
+            SafeTensorsIO.save(
+                self.active_adapter_path,
+                tensors,
+                metadata={
+                    **meta,
+                    "status": "ACTIVE_DEPLOYED",
+                    "approved_by": str(approved_by),
+                    "deployed_at": str(time.time()),
+                    "model_tag": cand_tag,
+                },
+            )
+            if self.candidate_gguf_path.exists():
+                self.active_gguf_path.write_bytes(self.candidate_gguf_path.read_bytes())
+            if self.candidate_modelfile_path.exists():
+                self.modelfile_path.write_text(
+                    self.candidate_modelfile_path.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            self.active_model_tag = cand_tag
+            deploy_event = {
+                "action": "DEPLOYED",
+                "status": "ACTIVE",
+                "approved_by": str(approved_by),
+                "active_adapter": str(self.active_adapter_path),
+                "active_gguf_adapter": str(self.active_gguf_path),
+                "base_model_tag": cand_info["base_model_tag"],
+                "deployed_model_tag": cand_tag,
+                "baseline_pass_at_1": cand_info["baseline_pass_at_1"],
+                "candidate_pass_at_1": cand_info["candidate_pass_at_1"],
+                "mean_pass_at_1_delta": cand_info["mean_delta"],
+                "ci_lower_95": cand_info["ci_lower_95"],
+                "secondary_holdout": cand_info.get("secondary_holdout"),
+                "timestamp": time.time(),
+            }
+            self.deployment_history.append(deploy_event)
+            self.staged_candidate = None
+            if self.ledger is not None:
+                try:
+                    self.ledger.append("lora_adapter_deployed", deploy_event)
+                except Exception:
+                    pass
+            return {"ok": True, **deploy_event}
+
+    def reject_staged_candidate(self, reason: str = "Rejected by Owner") -> Dict[str, Any]:
+        """Discards a staged candidate adapter without modifying the live model."""
+        with self._lock:
+            if not self.staged_candidate:
+                return {"ok": False, "status": "NO_STAGED_CANDIDATE"}
+            cand_info = dict(self.staged_candidate)
+            self.staged_candidate = None
+            return self._record_rollback(
+                "REJECTED_BY_HUMAN_REVIEW",
+                reason,
+                {"pass_rate": cand_info.get("baseline_pass_at_1", 0.0)},
+                {"pass_rate": cand_info.get("candidate_pass_at_1", 0.0)},
+            )
+
     def run_training_and_deploy_cycle(
         self,
         epochs: int = 5,
@@ -1336,17 +1484,48 @@ class ContinuousSelfImprovementManager:
         candidate_generator: Optional[Any] = None,
         eval_limit: int = 12,
         samples_per_task: int = 5,
+        require_human_approval: bool = False,
+        seed_if_empty: bool = True,
+        secondary_holdout_check: bool = False,
+        compare_against_active_adapter: bool = False,
     ) -> Dict[str, Any]:
         """Runs the complete self-improvement loop:
         Verify -> Contamination Check -> Train QLoRA/LoRA -> Export GGUF & Register Candidate Tag (`ollama create`)
-        -> Multi-Sample Paired Pass@1 Bootstrap Gate (`samples_per_task >= 5`) -> Deploy or Rollback.
+        -> Multi-Sample Paired Pass@1 Bootstrap Gate (`samples_per_task >= 5`) -> Secondary Holdout Check
+        -> Stage for Human Approval (Level 2) or Deploy (Level 3 / Direct).
         """
+        if self._kill_switch_engaged:
+            return {
+                "ok": False,
+                "action": "ABORTED",
+                "status": "KILL_SWITCH_ENGAGED",
+                "reason": self._kill_switch_reason or "Training halted by kill switch.",
+            }
+        if self.is_inference_active():
+            return {
+                "ok": False,
+                "action": "DEFERRED",
+                "status": "DEFERRED_INFERENCE_ACTIVE",
+                "reason": "Shared GPU/Ollama inference is currently active; training deferred.",
+            }
+
         with self._lock:
-            # 1. Ensure verified samples exist
-            if self.dataset_store.count() < min_samples:
+            if self.hf_model_name_or_path:
+                req_check = verify_base_model_requirements(self.hf_model_name_or_path)
+                if not req_check["ok"]:
+                    return {
+                        "ok": False,
+                        "action": "ABORTED",
+                        "status": "BASE_MODEL_REQUIREMENTS_FAILED",
+                        "reason": req_check["reason"],
+                        "requirements": req_check,
+                    }
+
+            # 1. Ensure verified samples exist (daemon sets seed_if_empty=False and min_samples=100)
+            if seed_if_empty and self.dataset_store.count() < min_samples:
                 self.populate_seed_verified_dataset()
 
-            verified_samples = self.dataset_store.list_verified(limit=200)
+            verified_samples = self.dataset_store.list_verified(limit=max(200, min_samples))
             if len(verified_samples) < min_samples:
                 return {
                     "ok": False,
@@ -1355,15 +1534,18 @@ class ContinuousSelfImprovementManager:
                     "min_required": min_samples,
                 }
 
+            self.save_checkpoint("starting_cycle", {"samples_count": len(verified_samples), "epochs": epochs})
+
             # 2. Select EXACT evaluation benchmark tasks used for both gate & contamination check
             eval_tasks = self.benchmark_suite.get_benchmark_tasks(limit=eval_limit)
             if not eval_tasks:
                 eval_tasks = self.benchmark_suite.held_out_tasks[:eval_limit]
 
-            # 3. Prevent Data Contamination between training data and active evaluation benchmark
+            # Check contamination against the ENTIRE 160-task corpus so training data never overlaps primary or secondary holdout splits
+            all_holdout_tasks = self.benchmark_suite.held_out_tasks or eval_tasks
             contamination = DataContaminationChecker.detect_contamination(
                 verified_samples,
-                eval_tasks,
+                all_holdout_tasks,
             )
             if contamination["contaminated"]:
                 return self._record_rollback(
@@ -1531,9 +1713,19 @@ class ContinuousSelfImprovementManager:
             base_gen = base_generator or self.base_generator
             cand_gen = candidate_generator or self.candidate_generator
 
+            active_baseline_weights: Optional[Dict[str, Any]] = None
+            if compare_against_active_adapter and self.active_adapter_path.exists():
+                try:
+                    act_tensors, _ = SafeTensorsIO.load(self.active_adapter_path)
+                    active_baseline_weights = {"tensors": act_tensors}
+                except Exception:
+                    active_baseline_weights = None
+
             if base_gen is None:
                 base_gen = self.create_model_generator(
-                    use_adapter=False,
+                    use_adapter=bool(active_baseline_weights is not None),
+                    adapter_path=self.active_gguf_path if active_baseline_weights is not None else None,
+                    adapter_weights=active_baseline_weights,
                     model_tag=base_tag,
                 )
             elif not getattr(base_gen, "model_tag", None):
@@ -1550,7 +1742,7 @@ class ContinuousSelfImprovementManager:
                 cand_gen.model_tag = cand_tag  # type: ignore[attr-defined]
 
             # Check if a caller monkey-patched `self.benchmark_suite.evaluate` to simulate regression
-            baseline_diag = self.benchmark_suite.evaluate(adapter_weights=None, tasks=eval_tasks)
+            baseline_diag = self.benchmark_suite.evaluate(adapter_weights=active_baseline_weights, tasks=eval_tasks)
             candidate_diag = self.benchmark_suite.evaluate(adapter_weights=training_report, tasks=eval_tasks)
             if candidate_diag.get("pass_rate", 1.0) < baseline_diag.get("pass_rate", 1.0):
                 return self._record_rollback(
@@ -1565,7 +1757,7 @@ class ContinuousSelfImprovementManager:
                 base_generator_fn=base_gen,
                 cand_generator_fn=cand_gen,
                 tasks=eval_tasks,
-                base_model_tag= getattr(base_gen, "model_tag", base_tag),
+                base_model_tag=getattr(base_gen, "model_tag", base_tag),
                 cand_model_tag=getattr(cand_gen, "model_tag", cand_tag),
                 adapter_weights=training_report,
                 samples_per_task=max(5, int(samples_per_task)),
@@ -1595,7 +1787,105 @@ class ContinuousSelfImprovementManager:
                     paired_gate_report=paired_gate,
                 )
 
-            # --- 10. DEPLOY ACTIVE ADAPTER (.safetensors + .gguf + Modelfile) ---
+            # 9b. Secondary Holdout Split Verification (Multiple-Hypothesis / Repeated-Cycle Protection)
+            secondary_report: Optional[Dict[str, Any]] = None
+            if secondary_holdout_check:
+                eval_prompts = {t.get("prompt") for t in eval_tasks}
+                sec_tasks = [t for t in self.benchmark_suite.held_out_tasks if t.get("prompt") not in eval_prompts][:20]
+                if not sec_tasks:
+                    sec_tasks = self.benchmark_suite.held_out_tasks[-20:]
+                sec_gate = self.benchmark_suite.evaluate_paired_pass_at_1(
+                    base_generator_fn=base_gen,
+                    cand_generator_fn=cand_gen,
+                    tasks=sec_tasks,
+                    base_model_tag=getattr(base_gen, "model_tag", base_tag),
+                    cand_model_tag=getattr(cand_gen, "model_tag", cand_tag),
+                    adapter_weights=training_report,
+                    samples_per_task=max(5, int(samples_per_task)),
+                    bootstrap_resamples=500,
+                    confidence_level=0.95,
+                    min_improvement_margin=0.0,
+                )
+                secondary_report = {
+                    "tasks_count": len(sec_tasks),
+                    "baseline_pass_at_1": sec_gate["baseline_pass_at_1"],
+                    "candidate_pass_at_1": sec_gate["candidate_pass_at_1"],
+                    "mean_delta": sec_gate["mean_delta"],
+                }
+                if sec_gate["candidate_pass_at_1"] < sec_gate["baseline_pass_at_1"]:
+                    return self._record_rollback(
+                        "REJECTED_SECONDARY_HOLDOUT_REGRESSION",
+                        (
+                            f"Candidate failed secondary holdout split verification: "
+                            f"secondary cand_pass@1={sec_gate['candidate_pass_at_1']:.4f} < "
+                            f"base_pass@1={sec_gate['baseline_pass_at_1']:.4f}."
+                        ),
+                        {"pass_rate": sec_gate["baseline_pass_at_1"]},
+                        {"pass_rate": sec_gate["candidate_pass_at_1"]},
+                        paired_gate_report=sec_gate,
+                    )
+
+            self.save_checkpoint(
+                "gate_passed",
+                {
+                    "candidate_model_tag": cand_tag,
+                    "baseline_pass_at_1": base_p1,
+                    "candidate_pass_at_1": cand_p1,
+                    "mean_delta": mean_delta,
+                    "ci_lower_95": ci_low,
+                    "require_human_approval": require_human_approval,
+                },
+            )
+
+            # --- 10a. LEVEL 2 CANDIDATE STAGING (Human Approval Required before live deployment) ---
+            if require_human_approval:
+                self.staged_candidate = {
+                    "action": "STAGED_FOR_APPROVAL",
+                    "status": "STAGED_PENDING_APPROVAL",
+                    "pending_human_approval": True,
+                    "candidate_adapter": str(self.candidate_adapter_path),
+                    "candidate_gguf_adapter": str(self.candidate_gguf_path),
+                    "candidate_modelfile": str(self.candidate_modelfile_path),
+                    "base_model_tag": paired_gate["base_model_tag"],
+                    "candidate_model_tag": cand_tag,
+                    "sha256": st_report["sha256"],
+                    "gguf_sha256": qlora_report["gguf_adapter"]["sha256"],
+                    "baseline_pass_at_1": base_p1,
+                    "candidate_pass_at_1": cand_p1,
+                    "mean_delta": mean_delta,
+                    "ci_lower_95": ci_low,
+                    "ci_upper_95": paired_gate["ci_upper_95"],
+                    "samples_per_task": paired_gate["samples_per_task"],
+                    "secondary_holdout": secondary_report,
+                    "staged_at": time.time(),
+                }
+                if self.ledger is not None:
+                    try:
+                        self.ledger.append("lora_candidate_staged", self.staged_candidate)
+                    except Exception:
+                        pass
+                return {
+                    "ok": True,
+                    "action": "STAGED_FOR_APPROVAL",
+                    "status": "STAGED_PENDING_APPROVAL",
+                    "pending_human_approval": True,
+                    "base_model_tag": paired_gate["base_model_tag"],
+                    "candidate_model_tag": cand_tag,
+                    "staged_candidate": dict(self.staged_candidate),
+                    "benchmark_comparison": {
+                        "baseline_pass_rate": base_p1,
+                        "candidate_pass_rate": cand_p1,
+                        "baseline_pass_at_1": base_p1,
+                        "candidate_pass_at_1": cand_p1,
+                        "mean_delta": mean_delta,
+                        "ci_lower_95": ci_low,
+                        "ci_upper_95": paired_gate["ci_upper_95"],
+                        "samples_per_task": paired_gate["samples_per_task"],
+                        "secondary_holdout": secondary_report,
+                    },
+                }
+
+            # --- 10b. DEPLOY ACTIVE ADAPTER (.safetensors + .gguf + Modelfile) ---
             SafeTensorsIO.save(
                 self.active_adapter_path,
                 training_report["tensors"],
@@ -1624,6 +1914,7 @@ class ContinuousSelfImprovementManager:
                 f"\"\"\"\n"
             )
             self.modelfile_path.write_text(modelfile_content, encoding="utf-8")
+            self.active_model_tag = cand_tag
 
             deploy_event = {
                 "action": "DEPLOYED",
@@ -1643,6 +1934,7 @@ class ContinuousSelfImprovementManager:
                 "ci_lower_95": ci_low,
                 "ci_upper_95": paired_gate["ci_upper_95"],
                 "samples_per_task": paired_gate["samples_per_task"],
+                "secondary_holdout": secondary_report,
                 "loss_reduction": training_report["loss_reduction"],
                 "causal_ce_loss_final": qlora_report["final_ce_loss"],
                 "timestamp": time.time(),
@@ -1687,52 +1979,229 @@ class ContinuousSelfImprovementManager:
                     "ci_upper_95": paired_gate["ci_upper_95"],
                     "samples_per_task": paired_gate["samples_per_task"],
                     "bootstrap_resamples": paired_gate["bootstrap_resamples"],
+                    "secondary_holdout": secondary_report,
                 },
                 "safetensors_file": st_report,
                 "gguf_file": qlora_report["gguf_adapter"],
                 "modelfile_generated": str(self.modelfile_path),
             }
 
+    def run_training_in_subprocess(
+        self,
+        epochs: int = 3,
+        min_samples: int = 100,
+        eval_limit: int = 140,
+        samples_per_task: int = 5,
+        require_human_approval: bool = True,
+        timeout_s: float = 1800.0,
+    ) -> Dict[str, Any]:
+        """Executes the QLoRA/LoRA training & full 140-task gate in an isolated child process so GPU OOMs never affect the API server."""
+        if self._kill_switch_engaged:
+            return {"ok": False, "status": "KILL_SWITCH_ENGAGED", "reason": self._kill_switch_reason}
+        if self.is_inference_active():
+            return {"ok": False, "status": "DEFERRED_INFERENCE_ACTIVE", "reason": "Shared GPU inference is active"}
+
+        out_json_path = self.data_dir / "subproc_training_result.json"
+        if out_json_path.exists():
+            try:
+                out_json_path.unlink()
+            except Exception:
+                pass
+
+        inline_code = (
+            "import json, pathlib, sys\n"
+            "from sovereign_mesh.continuous_learning import ContinuousSelfImprovementManager\n"
+            f"mgr = ContinuousSelfImprovementManager(pathlib.Path({str(self.data_dir)!r}), base_model_tag={self.base_model_tag!r})\n"
+            f"res = mgr.run_training_and_deploy_cycle("
+            f"epochs={int(epochs)}, min_samples={int(min_samples)}, eval_limit={int(eval_limit)}, "
+            f"samples_per_task={int(samples_per_task)}, require_human_approval={bool(require_human_approval)}, "
+            f"seed_if_empty=False, secondary_holdout_check=True, compare_against_active_adapter=True)\n"
+            f"pathlib.Path({str(out_json_path)!r}).write_text(json.dumps(res, default=str), encoding='utf-8')\n"
+        )
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", inline_code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self._active_subproc = proc
+            stdout, stderr = proc.communicate(timeout=timeout_s)
+            self._active_subproc = None
+            if out_json_path.exists():
+                res_data = json.loads(out_json_path.read_text(encoding="utf-8"))
+                if res_data.get("staged_candidate"):
+                    self.staged_candidate = res_data["staged_candidate"]
+                return res_data
+            return {
+                "ok": False,
+                "status": "SUBPROCESS_FAILED",
+                "returncode": proc.returncode,
+                "stderr": (stderr or "")[-500:],
+            }
+        except subprocess.TimeoutExpired:
+            if self._active_subproc is not None:
+                try:
+                    self._active_subproc.kill()
+                except Exception:
+                    pass
+                self._active_subproc = None
+            return {"ok": False, "status": "SUBPROCESS_TIMEOUT"}
+        except Exception as exc:
+            self._active_subproc = None
+            return {"ok": False, "status": "SUBPROCESS_ERROR", "error": str(exc)}
+
     def start_auto_gpu_training_daemon(
         self,
         interval_seconds: float = 300.0,
         force: bool = False,
+        level: Optional[int] = None,
+        min_samples: int = 100,
+        eval_limit: int = 140,
+        samples_per_task: int = 5,
+        cooldown_seconds: float = 43200.0,
+        max_cycles_per_day: int = 2,
+        use_subprocess: bool = True,
     ) -> Dict[str, Any]:
-        """Automatically starts a background QLoRA/LoRA training loop when a GPU is detected on the PC."""
+        """3-Tier GPU Auto-Training Manager:
+        - Level 1 (default): Detect + Report Only (`"detect_only"`). Never installs or starts training automatically.
+        - Level 2 (opt-in): Background Candidate Staging (`"candidate_only"`). Trains in subprocess, runs full 140-task K=5 gate + secondary holdout, stages candidate for Human Approval.
+        - Level 3 (explicit opt-in): Auto-Promote (`"auto_promote"`) after passing 140-task K=5 gate + secondary holdout + active-adapter comparison.
+        """
         gpu_cap = detect_local_gpu_capability()
-        auto_env = os.environ.get("NEXUS_AUTO_GPU_TRAINING", "").strip() in {"1", "true", "yes"}
-        if os.environ.get("NEXUS_DISABLE_AUTO_GPU_TRAIN", "").strip() in {"1", "true", "yes"} and not force:
-            return {"started": False, "reason": "disabled_by_env", "gpu": gpu_cap}
+        if self._kill_switch_engaged:
+            return {"ok": False, "started": False, "reason": "kill_switch_engaged", "gpu": gpu_cap}
 
-        if not (force or auto_env or gpu_cap["gpu_detected"]):
-            return {"started": False, "reason": "no_gpu_detected", "gpu": gpu_cap}
+        if os.environ.get("NEXUS_DISABLE_AUTO_GPU_TRAIN", "").strip().lower() in {"1", "true", "yes"} and not force:
+            return {"ok": False, "started": False, "reason": "disabled_by_env", "gpu": gpu_cap}
+
+        if level is None:
+            env_lvl = os.environ.get("NEXUS_GPU_TRAINING_LEVEL", "").strip()
+            if env_lvl in {"1", "2", "3"}:
+                eff_level = int(env_lvl)
+            elif force:
+                eff_level = 2
+            else:
+                eff_level = 1
+        else:
+            eff_level = max(1, min(3, int(level)))
+
+        mode_map = {1: "detect_only", 2: "candidate_only", 3: "auto_promote"}
+        eff_mode = mode_map.get(eff_level, "detect_only")
+        require_human_approval = (eff_level < 3)
+
+        self._auto_gpu_state.update({
+            "level": eff_level,
+            "mode": eff_mode,
+            "require_human_approval": require_human_approval,
+            "min_samples_required": max(1, int(min_samples)),
+            "eval_limit": max(1, int(eval_limit)),
+            "samples_per_task": max(5, int(samples_per_task)),
+            "cooldown_seconds": float(cooldown_seconds),
+            "max_cycles_per_day": max(1, int(max_cycles_per_day)),
+            "subprocess_isolated": bool(use_subprocess),
+            "gpu": gpu_cap,
+        })
+
+        # Level 1 (Default): Detect & Report Only — never auto-starts background training
+        if eff_level <= 1 and not force:
+            self._auto_gpu_state["enabled"] = False
+            return {
+                "ok": True,
+                "started": False,
+                "auto_training_enabled": False,
+                "level": 1,
+                "mode": "detect_only",
+                "reason": "level_1_detect_only_default",
+                "gpu": gpu_cap,
+            }
+
+        if not (force or gpu_cap["qlora_capable"]):
+            self._auto_gpu_state["enabled"] = False
+            return {
+                "ok": False,
+                "started": False,
+                "level": eff_level,
+                "mode": eff_mode,
+                "reason": "no_capable_gpu_detected",
+                "gpu": gpu_cap,
+            }
 
         if not TORCH_AVAILABLE:
-            return {"started": False, "reason": "pytorch_unavailable", "gpu": gpu_cap}
+            self._auto_gpu_state["enabled"] = False
+            return {
+                "ok": False,
+                "started": False,
+                "level": eff_level,
+                "mode": eff_mode,
+                "reason": "pytorch_unavailable",
+                "gpu": gpu_cap,
+            }
 
         if self._auto_gpu_thread is not None and self._auto_gpu_thread.is_alive():
-            return {"ok": True, "started": True, "auto_training_enabled": True, "already_running": True, "gpu": gpu_cap}
+            return {
+                "ok": True,
+                "started": True,
+                "auto_training_enabled": True,
+                "already_running": True,
+                "level": eff_level,
+                "mode": eff_mode,
+                "gpu": gpu_cap,
+            }
 
         self._auto_gpu_stop.clear()
         self._auto_gpu_state["enabled"] = True
-        self._auto_gpu_state["gpu"] = gpu_cap
 
         def _daemon_loop() -> None:
-            # Wait briefly after node startup so web studio & HTTP routes come online immediately
             if self._auto_gpu_stop.wait(timeout=min(2.0, max(0.05, interval_seconds * 0.1))):
                 return
             while not self._auto_gpu_stop.is_set():
+                if self._kill_switch_engaged:
+                    break
                 try:
+                    now_ts = time.time()
+                    # Reset 24-hour cycle counter
+                    if (now_ts - float(self._auto_gpu_state.get("day_window_start", 0.0) or 0.0)) >= 86400.0:
+                        self._auto_gpu_state["day_window_start"] = now_ts
+                        self._auto_gpu_state["cycles_today"] = 0
+
+                    last_at = self._auto_gpu_state.get("last_cycle_at")
+                    in_cooldown = bool(last_at is not None and (now_ts - float(last_at)) < float(cooldown_seconds))
+                    daily_cap_hit = int(self._auto_gpu_state.get("cycles_today", 0)) >= int(max_cycles_per_day)
                     curr_count = self.dataset_store.count()
-                    if curr_count == 0 or curr_count > self._last_trained_sample_count or not self.active_adapter_path.exists():
-                        res = self.run_training_and_deploy_cycle(
-                            epochs=3,
-                            min_samples=2,
-                            eval_limit=8,
-                            samples_per_task=5,
-                        )
-                        self._last_trained_sample_count = self.dataset_store.count()
+                    enough_data = curr_count >= int(min_samples) and curr_count > self._last_trained_sample_count
+
+                    if self.is_inference_active():
+                        self._auto_gpu_state["last_cycle_status"] = "PAUSED_INFERENCE_ACTIVE"
+                    elif daily_cap_hit:
+                        self._auto_gpu_state["last_cycle_status"] = "DAILY_CYCLE_LIMIT_REACHED"
+                    elif in_cooldown:
+                        self._auto_gpu_state["last_cycle_status"] = "COOLDOWN_ACTIVE"
+                    elif not enough_data:
+                        self._auto_gpu_state["last_cycle_status"] = f"WAITING_FOR_DATA ({curr_count}/{min_samples})"
+                    else:
+                        if use_subprocess:
+                            res = self.run_training_in_subprocess(
+                                epochs=3,
+                                min_samples=int(min_samples),
+                                eval_limit=int(eval_limit),
+                                samples_per_task=max(5, int(samples_per_task)),
+                                require_human_approval=require_human_approval,
+                            )
+                        else:
+                            res = self.run_training_and_deploy_cycle(
+                                epochs=3,
+                                min_samples=int(min_samples),
+                                eval_limit=int(eval_limit),
+                                samples_per_task=max(5, int(samples_per_task)),
+                                require_human_approval=require_human_approval,
+                                seed_if_empty=False,
+                                secondary_holdout_check=True,
+                                compare_against_active_adapter=True,
+                            )
+                        self._last_trained_sample_count = curr_count
                         self._auto_gpu_state["cycles_completed"] = int(self._auto_gpu_state.get("cycles_completed", 0)) + 1
+                        self._auto_gpu_state["cycles_today"] = int(self._auto_gpu_state.get("cycles_today", 0)) + 1
                         self._auto_gpu_state["last_cycle_at"] = time.time()
                         self._auto_gpu_state["last_cycle_status"] = res.get("status") or res.get("action")
                 except Exception as exc:
@@ -1746,7 +2215,15 @@ class ContinuousSelfImprovementManager:
             daemon=True,
         )
         self._auto_gpu_thread.start()
-        return {"ok": True, "started": True, "auto_training_enabled": True, "gpu": gpu_cap}
+        return {
+            "ok": True,
+            "started": True,
+            "auto_training_enabled": True,
+            "level": eff_level,
+            "mode": eff_mode,
+            "require_human_approval": require_human_approval,
+            "gpu": gpu_cap,
+        }
 
     def stop_auto_gpu_training_daemon(self) -> None:
         self._auto_gpu_stop.set()
@@ -1771,6 +2248,9 @@ class ContinuousSelfImprovementManager:
             "pytorch_backend_active": TORCH_AVAILABLE,
             "gpu_capability": detect_local_gpu_capability(),
             "auto_gpu_training": dict(self._auto_gpu_state),
+            "staged_candidate": dict(self.staged_candidate) if self.staged_candidate else None,
+            "checkpoint": self.load_checkpoint(),
+            "kill_switch_engaged": self._kill_switch_engaged,
             "deployments_count": len([d for d in self.deployment_history if d["action"] == "DEPLOYED"]),
             "rollbacks_count": len([d for d in self.deployment_history if d["action"] == "ROLLED_BACK"]),
             "latest_event": self.deployment_history[-1] if self.deployment_history else None,

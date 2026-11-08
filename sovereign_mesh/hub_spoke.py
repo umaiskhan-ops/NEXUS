@@ -195,6 +195,8 @@ class WorkerNodeRecord:
     puf_seal: str = ""
     quantum_vault_pub: Dict[str, Any] = field(default_factory=dict)
     ratchet_step: int = 0
+    daily_task_credits_earned: int = 0
+    daily_task_window_start: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.referral_code:
@@ -225,15 +227,16 @@ class MasterHubCoordinator:
     """Runs only on the owner's Hub: issues signed tasks, verifies proofs, spot-checks, rewards and slashes."""
 
     def __init__(self, ledger: HashChainLedger, grid: Any = None, state_path: Optional[Path] = None,
-                 reward_per_task: int = 25, spot_check_rate: float = 1.0, gradient_spot_check_rate: float = 0.05):
+                 reward_per_task: int = 25, spot_check_rate: float = 1.0, gradient_spot_check_rate: float = 1.0):
         self.ledger = ledger
         self.grid = grid  # used for spot-check re-execution
         self.reward_per_task = reward_per_task
         self.spot_check_rate = spot_check_rate
         self.gradient_spot_check_rate = gradient_spot_check_rate
-        self.force_gradient_spot_check = False
+        self.force_gradient_spot_check = True
         self.max_referral_cap = 500
         self.max_workers_per_ip = 3
+        self.max_daily_task_credits = 250
         self._path = state_path
         self._workers: Dict[str, WorkerNodeRecord] = {}
         self._pending: Dict[str, dict] = {}
@@ -779,7 +782,14 @@ class MasterHubCoordinator:
             }
 
     # -- tasks & NAT-Traversal Outbound Pull Queue
-    def create_signed_task(self, worker_id: str, feature_key: str, payload: dict) -> dict:
+    def create_signed_task(
+        self,
+        worker_id: str,
+        feature_key: str,
+        payload: dict,
+        funded_by: str = "",
+        funded_credits: Optional[int] = None,
+    ) -> dict:
         with self._lock:
             worker = self.get_worker(worker_id)
             if not worker:
@@ -788,16 +798,52 @@ class MasterHubCoordinator:
                 raise PermissionError(f"Worker {worker.worker_id!r} is SLASHED and blocked")
             if feature_key in HUB_ONLY_FEATURES:
                 raise PermissionError(f"Feature {feature_key!r} is a Hub-only power and cannot be delegated")
+
+            escrow_credits: Optional[int] = funded_credits
+            funder_id = (funded_by or "").strip()
+            if funder_id and funder_id not in {"owner_hub", "hub_internal"}:
+                funder = self._resolve_worker_or_key(funder_id)
+                if not funder:
+                    raise PermissionError(f"Unknown funder account {funder_id!r} for task escrow")
+                if funder.worker_id == worker.worker_id or (
+                    funder.hardware_uuid and worker.hardware_uuid and funder.hardware_uuid == worker.hardware_uuid
+                ):
+                    raise PermissionError("Self-dealing blocked: Worker cannot fund or enqueue tasks for itself")
+                req_amt = int(escrow_credits) if escrow_credits is not None else self.halving_epoch_info()["active_task_reward_credits"]
+                spend_res = self.spend_credits(funder.worker_id, req_amt, reason=f"task_escrow:{feature_key}:{worker.worker_id}")
+                if spend_res.get("status") != "SPENT":
+                    raise PermissionError(spend_res.get("error") or "Insufficient credits to fund task escrow")
+                escrow_credits = req_amt
+                funder_id = funder.worker_id
+
             envelope = {"task_id": secrets.token_hex(8), "worker_id": worker.worker_id, "feature": feature_key,
                         "payload": payload, "issued_at": time.time(), "nonce": secrets.token_hex(8)}
             packet = {**envelope, "hub_signature": compute_hmac(worker.key, envelope)}
-            self._pending[envelope["task_id"]] = packet
-            return packet
+            stored_task = dict(packet)
+            if funder_id:
+                stored_task["funded_by"] = funder_id
+            if escrow_credits is not None:
+                stored_task["funded_credits"] = int(escrow_credits)
+            self._pending[envelope["task_id"]] = stored_task
+            return stored_task
 
-    def enqueue_nat_task(self, worker_id: str, feature_key: str, payload: dict) -> dict:
+    def enqueue_nat_task(
+        self,
+        worker_id: str,
+        feature_key: str,
+        payload: dict,
+        funded_by: str = "",
+        funded_credits: Optional[int] = None,
+    ) -> dict:
         """Queues a signed task for a worker behind NAT/Firewall/CGNAT to pull via outbound polling."""
         with self._lock:
-            packet = self.create_signed_task(worker_id, feature_key, payload)
+            packet = self.create_signed_task(
+                worker_id,
+                feature_key,
+                payload,
+                funded_by=funded_by,
+                funded_credits=funded_credits,
+            )
             w_id = packet["worker_id"]
             queue = self._nat_outbound_queue.setdefault(w_id, [])
             queue.append(packet)
@@ -876,7 +922,11 @@ class MasterHubCoordinator:
                 return self._reject(worker, "empty_or_failed_task_result")
             self._pending.pop(task_id, None)  # proof is authentic -> task consumed (replay-safe)
 
-        verified = bool(quantum_verified)
+        verified = False
+        clean_res, res_flags = sanitize_payload(result)
+        if "prompt_injection_suspected" in res_flags:
+            return self._reject(worker, "tainted_or_injected_worker_output")
+
         if self.grid is not None and _spot_checkable(task["feature"], task["payload"]) \
                 and secrets.randbelow(10_000) < int(self.spot_check_rate * 10_000):
             expected = self.grid.registry.get(task["feature"]).handler(self.grid, sanitize_payload(task["payload"])[0])
@@ -884,54 +934,73 @@ class MasterHubCoordinator:
                 with self._lock:
                     return self._slash(worker, f"spot_check_mismatch on {task['feature']} (task {task_id})")
             verified = True
-        elif isinstance(result, dict) and not isinstance(result.get("lora_gradients"), dict):
-            # N11 Fix: Validate non-empty content and constitutional safety before marking verified=True
-            clean_res, res_flags = sanitize_payload(result)
-            if "prompt_injection_suspected" in res_flags:
-                return self._reject(worker, "tainted_or_injected_worker_output")
-            has_meaningful_content = any(
-                v is not None and str(v).strip() != ""
-                for k, v in result.items()
-                if k not in {"status"}
-            )
-            verified = bool(has_meaningful_content)
+        elif task["feature"] in SPOT_CHECKABLE:
+            # Standalone Hub verification of deterministic features (rejects fabricated answers)
+            t_payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+            if task["feature"] == "data_analysis":
+                raw_nums = t_payload.get("series") or t_payload.get("data") or t_payload.get("numbers")
+                if isinstance(result.get("mean"), (int, float)) and not isinstance(result.get("mean"), bool):
+                    if isinstance(raw_nums, (list, tuple)) and len(raw_nums) > 0:
+                        nums = [float(x) for x in raw_nums if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                        if nums and abs(float(result["mean"]) - (sum(nums) / len(nums))) <= 0.05:
+                            verified = True
+                    else:
+                        verified = True
+            elif task["feature"] == "trend_forecasting":
+                if any(k in result for k in ("trend", "slope", "projected")) and result.get("trend") in {"UP", "DOWN", "FLAT", "UPWARD", "DOWNWARD", None}:
+                    verified = True
+            else:
+                if "status" in result and any(k not in {"status", "answer", "output"} for k in result.keys()):
+                    verified = True
 
-        # Problem #3 Defense: Cryptographic Proof-of-Neural-Work Cosine Similarity Spot-Check on LoRA Gradients
+        # Cryptographic Proof-of-Neural-Work Cosine Similarity Verification on LoRA Gradients
         if isinstance(result, dict) and isinstance(result.get("lora_gradients"), dict):
             lg = result["lora_gradients"]
             dA = lg.get("delta_A")
             dB = lg.get("delta_B")
-            if isinstance(dA, list) and isinstance(dB, list) and len(dA) > 0 and len(dB) > 0:
-                verified = True
             should_spot_check_grad = (
-                getattr(self, "force_gradient_spot_check", False)
-                or (secrets.randbelow(100) < int(getattr(self, "gradient_spot_check_rate", 0.05) * 100))
+                getattr(self, "force_gradient_spot_check", True)
+                or (secrets.randbelow(100) < int(getattr(self, "gradient_spot_check_rate", 1.0) * 100))
             )
-            if should_spot_check_grad and dA and dB:
-                try:
-                    from .brain_matrix import compute_local_lora_gradients
-                    p_text = str((task.get("payload") or {}).get("prompt") or (task.get("payload") or {}).get("text") or task.get("feature") or "sovereign_mesh_train")
-                    shard_name = lg.get("domain_shard") or worker.brain_shard
-                    ref_grads = compute_local_lora_gradients(p_text, shard_name)
-                    worker_vec = list(dA or []) + list(dB or [])
-                    ref_vec = list(ref_grads["delta_A"]) + list(ref_grads["delta_B"])
-                    cos_sim = compute_cosine_similarity(worker_vec, ref_vec)
-                    # If Cosine Similarity is below 0.98, the worker submitted fake/random/fabricated gradients!
-                    if cos_sim < 0.98:
-                        with self._lock:
-                            return self._slash(
-                                worker,
-                                f"Byzantine Fake Gradient Attack detected on {shard_name}: Cosine similarity {cos_sim:.4f} < 0.98 (task {task_id})"
-                            )
+            if isinstance(dA, list) and isinstance(dB, list) and len(dA) > 0 and len(dB) > 0:
+                if should_spot_check_grad:
+                    try:
+                        from .brain_matrix import compute_local_lora_gradients
+                        p_text = str((task.get("payload") or {}).get("prompt") or (task.get("payload") or {}).get("text") or task.get("feature") or "sovereign_mesh_train")
+                        shard_name = lg.get("domain_shard") or worker.brain_shard
+                        ref_grads = compute_local_lora_gradients(p_text, shard_name)
+                        worker_vec = list(dA or []) + list(dB or [])
+                        ref_vec = list(ref_grads["delta_A"]) + list(ref_grads["delta_B"])
+                        cos_sim = compute_cosine_similarity(worker_vec, ref_vec)
+                        if cos_sim < 0.98:
+                            with self._lock:
+                                return self._slash(
+                                    worker,
+                                    f"Byzantine Fake Gradient Attack detected on {shard_name}: Cosine similarity {cos_sim:.4f} < 0.98 (task {task_id})"
+                                )
+                        verified = True
+                    except Exception:
+                        verified = False
+                else:
                     verified = True
-                except Exception:
-                    pass
 
         if not verified:
-            return self._reject(worker, "unverified_task_result (N11 enforcement)")
+            return self._reject(worker, "unverified_or_fabricated_task_result (objective verification failed)")
 
         with self._lock:
+            now_ts = time.time()
+            max_daily = int(getattr(self, "max_daily_task_credits", 250))
+            if (now_ts - float(getattr(worker, "daily_task_window_start", 0.0) or 0.0)) >= 86400.0:
+                worker.daily_task_window_start = now_ts
+                worker.daily_task_credits_earned = 0
+            if worker.daily_task_credits_earned >= max_daily:
+                return self._reject(worker, f"daily_reward_cap_exceeded ({max_daily} credits/day max)")
+
             effective_reward = self.halving_epoch_info()["active_task_reward_credits"]
+            if task.get("funded_credits") is not None:
+                effective_reward = min(effective_reward, max(0, int(task["funded_credits"])))
+            effective_reward = min(effective_reward, max(0, max_daily - worker.daily_task_credits_earned))
+            worker.daily_task_credits_earned += effective_reward
             worker.credits += effective_reward
             worker.tasks_completed += 1
             worker.tasks_verified += int(verified)

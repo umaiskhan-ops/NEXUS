@@ -1062,7 +1062,14 @@ def make_handler(grid, client):
                     prompt = str(body.get("prompt") or "").strip()
                     return self._send(200, {"ok": True, "route": grid.brain_matrix.route_attention(prompt)})
 
-            if path in {"/api/learning/verify", "/api/learning/train"}:
+            if path in {
+                "/api/learning/verify",
+                "/api/learning/train",
+                "/api/learning/approve_candidate",
+                "/api/learning/reject_candidate",
+                "/api/learning/kill_switch",
+                "/api/learning/auto_gpu",
+            }:
                 if not self._auth_ok():
                     return self._send(401, {"ok": False, "error": "unauthorized"})
                 body = self._read_json_body(allow_empty=True)
@@ -1070,6 +1077,41 @@ def make_handler(grid, client):
                     return
                 if not getattr(grid, "continuous_learning", None):
                     return self._send(500, {"ok": False, "error": "continuous_learning not initialized"})
+
+                if path == "/api/learning/approve_candidate":
+                    res = grid.continuous_learning.approve_staged_candidate(
+                        approved_by=str(body.get("approved_by", "owner"))
+                    )
+                    return self._send(200 if res.get("ok") else 400, res)
+
+                if path == "/api/learning/reject_candidate":
+                    res = grid.continuous_learning.reject_staged_candidate(
+                        reason=str(body.get("reason", "Rejected by Owner"))
+                    )
+                    return self._send(200 if res.get("ok") else 400, res)
+
+                if path == "/api/learning/kill_switch":
+                    engage = bool(body.get("engage", True))
+                    if engage:
+                        res = grid.continuous_learning.engage_kill_switch(
+                            reason=str(body.get("reason", "Manual kill switch engaged via API"))
+                        )
+                    else:
+                        res = grid.continuous_learning.release_kill_switch()
+                    return self._send(200, res)
+
+                if path == "/api/learning/auto_gpu":
+                    lvl = int(body.get("level", 1) or 1)
+                    if lvl <= 1:
+                        grid.continuous_learning.stop_auto_gpu_training_daemon()
+                        return self._send(200, grid.continuous_learning.start_auto_gpu_training_daemon(level=1))
+                    res = grid.continuous_learning.start_auto_gpu_training_daemon(
+                        level=lvl,
+                        min_samples=int(body.get("min_samples", 100) or 100),
+                        eval_limit=int(body.get("eval_limit", 140) or 140),
+                        samples_per_task=max(5, int(body.get("samples_per_task", 5) or 5)),
+                    )
+                    return self._send(200 if res.get("ok") else 400, res)
 
                 if path == "/api/learning/verify":
                     task_type = str(body.get("type", "code")).strip().lower()
@@ -1124,14 +1166,52 @@ def make_handler(grid, client):
                     return self._send(200 if settled.get("ok") else 400, settled)
 
                 if path == "/api/worker/enqueue_task":
+                    # Security & Economy Fix: enqueue_task requires Hub Owner auth OR a funded requester account key
+                    is_owner = self._auth_ok()
+                    funded_by_key = str(
+                        body.get("funded_by_key")
+                        or body.get("requester_key")
+                        or self.headers.get("X-Worker-Key", "")
+                    ).strip()
+                    if not is_owner and not funded_by_key:
+                        return self._send(401, {
+                            "ok": False,
+                            "error": "unauthorized: /api/worker/enqueue_task requires Hub Owner Bearer token or funded requester key",
+                        })
                     wid = str(body.get("worker_id") or "").strip()
                     fkey = str(body.get("feature_key") or "brain_inference").strip()
                     payload_data = body.get("payload") if isinstance(body.get("payload"), dict) else {"prompt": str(body.get("prompt") or "")}
                     if not wid:
                         return self._send(400, {"ok": False, "error": "worker_id is required"})
+                    funded_by_id = "owner_hub"
+                    if not is_owner:
+                        try:
+                            req_worker = grid.hub.authenticate_worker_key(funded_by_key)
+                        except PermissionError as p_err:
+                            return self._send(401, {"ok": False, "error": str(p_err)})
+                        if req_worker.worker_id == wid:
+                            return self._send(403, {
+                                "ok": False,
+                                "error": "self_enqueued_task_forbidden: workers cannot enqueue or fund tasks for themselves",
+                            })
+                        funded_by_id = req_worker.worker_id
+                    elif body.get("funded_by"):
+                        funded_by_id = str(body.get("funded_by")).strip()
                     try:
-                        pkt = grid.hub.enqueue_nat_task(wid, fkey, payload_data)
-                        return self._send(200, {"ok": True, "queued_packet": pkt})
+                        pkt = grid.hub.enqueue_nat_task(wid, fkey, payload_data, funded_by=funded_by_id)
+                        # Never leak nonce or hub_signature in enqueue_task HTTP response
+                        safe_summary = {
+                            "task_id": pkt["task_id"],
+                            "worker_id": pkt["worker_id"],
+                            "feature": pkt["feature"],
+                            "issued_at": pkt["issued_at"],
+                            "funded_by": pkt.get("funded_by", funded_by_id),
+                            "funded_credits": pkt.get("funded_credits", 0),
+                            "status": "QUEUED",
+                        }
+                        return self._send(200, {"ok": True, "queued_packet": safe_summary})
+                    except PermissionError as p_err:
+                        return self._send(403, {"ok": False, "error": str(p_err)})
                     except Exception as exc:
                         return self._send(400, {"ok": False, "error": str(exc)})
 

@@ -125,13 +125,137 @@ def is_hf_qlora_stack_ready() -> bool:
         return False
 
 
-def detect_local_gpu_capability() -> Dict[str, Any]:
-    """Detects whether the local PC has a CUDA/NVIDIA GPU and reports VRAM & QLoRA readiness."""
+def recommend_model_for_vram(vram_mb: int) -> Dict[str, Any]:
+    """Maps detected GPU VRAM (in MB) to realistic QLoRA model size limits and training hyperparameters."""
+    vram = max(0, int(vram_mb or 0))
+    if vram < 4000:
+        return {
+            "vram_tier": "INSUFFICIENT_VRAM",
+            "max_params_b": 0.0,
+            "qlora_1b_capable": False,
+            "qlora_3b_capable": False,
+            "qlora_8b_capable": False,
+            "recommended_base_model": "",
+            "recommended_ollama_tag": "",
+            "requires_gradient_checkpointing": True,
+            "recommended_max_seq_len": 0,
+        }
+    if vram < 6000:
+        return {
+            "vram_tier": "TINY_1B",
+            "max_params_b": 1.5,
+            "qlora_1b_capable": True,
+            "qlora_3b_capable": False,
+            "qlora_8b_capable": False,
+            "recommended_base_model": "Qwen/Qwen2.5-1.5B-Instruct",
+            "recommended_ollama_tag": "qwen2.5:1.5b",
+            "requires_gradient_checkpointing": True,
+            "recommended_max_seq_len": 512,
+        }
+    if vram < 12000:
+        return {
+            "vram_tier": "SMALL_3B",
+            "max_params_b": 3.0,
+            "qlora_1b_capable": True,
+            "qlora_3b_capable": True,
+            "qlora_8b_capable": False,
+            "recommended_base_model": "Qwen/Qwen2.5-Coder-3B-Instruct",
+            "recommended_ollama_tag": "qwen2.5-coder:3b",
+            "requires_gradient_checkpointing": True,
+            "recommended_max_seq_len": 512,
+        }
+    if vram < 24000:
+        return {
+            "vram_tier": "MEDIUM_7B_8B_GRAD_CKPT",
+            "max_params_b": 8.0,
+            "qlora_1b_capable": True,
+            "qlora_3b_capable": True,
+            "qlora_8b_capable": True,
+            "recommended_base_model": "Qwen/Qwen2.5-Coder-7B-Instruct",
+            "recommended_ollama_tag": "qwen2.5-coder:7b",
+            "requires_gradient_checkpointing": True,
+            "recommended_max_seq_len": 512,
+        }
+    return {
+        "vram_tier": "FULL_8B_14B",
+        "max_params_b": 14.0,
+        "qlora_1b_capable": True,
+        "qlora_3b_capable": True,
+        "qlora_8b_capable": True,
+        "recommended_base_model": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "recommended_ollama_tag": "llama3.1:8b",
+        "requires_gradient_checkpointing": False,
+        "recommended_max_seq_len": 1024,
+    }
+
+
+def verify_base_model_requirements(base_model_name_or_path: str, expected_sha256: str = "") -> Dict[str, Any]:
+    """Verifies base model license, gated HF token requirement, and optional local weight SHA-256 hash."""
+    raw = str(base_model_name_or_path or "").strip()
+    if not raw:
+        return {"ok": False, "reason": "base_model_name_or_path is empty"}
+
+    lower = raw.lower()
+    is_local = Path(raw).exists()
+    requires_hf_token = (not is_local) and any(
+        g in lower for g in ("meta-llama/", "google/gemma", "mistralai/mistral-large")
+    )
+    hf_token_present = bool(
+        os.environ.get("HF_TOKEN", "").strip()
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN", "").strip()
+    )
+    if requires_hf_token and not hf_token_present:
+        return {
+            "ok": False,
+            "requires_hf_token": True,
+            "hf_token_present": False,
+            "reason": f"Model '{raw}' is gated on HuggingFace and requires HF_TOKEN environment variable.",
+        }
+
+    license_id = "Apache-2.0"
+    if "llama-3.1" in lower or "llama3.1" in lower:
+        license_id = "Llama-3.1-Community-License"
+    elif "llama-3.2" in lower or "llama3.2" in lower:
+        license_id = "Llama-3.2-Community-License"
+    elif "gemma" in lower:
+        license_id = "Gemma-Terms-of-Use"
+
+    computed_sha256 = ""
+    if is_local and expected_sha256:
+        p = Path(raw)
+        target_file = p / "config.json" if p.is_dir() else p
+        if target_file.exists() and target_file.is_file():
+            computed_sha256 = hashlib.sha256(target_file.read_bytes()).hexdigest()
+            if computed_sha256.lower() != expected_sha256.strip().lower():
+                return {
+                    "ok": False,
+                    "license": license_id,
+                    "computed_sha256": computed_sha256,
+                    "reason": f"SHA-256 mismatch for '{target_file}': expected {expected_sha256}, got {computed_sha256}",
+                }
+
+    return {
+        "ok": True,
+        "model": raw,
+        "is_local": is_local,
+        "license": license_id,
+        "requires_hf_token": requires_hf_token,
+        "hf_token_present": hf_token_present,
+        "computed_sha256": computed_sha256,
+    }
+
+
+def detect_local_gpu_capability(vram_override_mb: Optional[int] = None) -> Dict[str, Any]:
+    """Detects whether the local PC has a CUDA/NVIDIA GPU and reports VRAM tier & QLoRA readiness (Level 1)."""
     gpu_detected = False
     gpu_name = ""
     vram_mb = 0
 
-    if TORCH_AVAILABLE and torch is not None:
+    if vram_override_mb is not None:
+        gpu_detected = vram_override_mb > 0
+        gpu_name = "Simulated GPU" if gpu_detected else ""
+        vram_mb = max(0, int(vram_override_mb))
+    elif TORCH_AVAILABLE and torch is not None:
         try:
             if torch.cuda.is_available():
                 gpu_detected = True
@@ -141,7 +265,7 @@ def detect_local_gpu_capability() -> Dict[str, Any]:
         except Exception:
             pass
 
-    if not gpu_detected:
+    if not gpu_detected and vram_override_mb is None:
         nvidia_smi = shutil.which("nvidia-smi")
         if nvidia_smi:
             try:
@@ -164,14 +288,36 @@ def detect_local_gpu_capability() -> Dict[str, Any]:
                 pass
 
     vram_gb = round(vram_mb / 1024.0, 2) if vram_mb > 0 else 0.0
+    vram_profile = recommend_model_for_vram(vram_mb if gpu_detected else 0)
+    stack_ready = is_hf_qlora_stack_ready()
+    if gpu_detected and vram_mb >= 4000:
+        status_summary = (
+            f"GPU mila: {gpu_name}, {vram_gb} GB VRAM ({vram_profile['vram_tier']}), "
+            f"recommended model: {vram_profile['recommended_ollama_tag']} — "
+            f"{'training ke liye tayyar' if stack_ready else 'requirements-gpu.txt (~2.5 GB) install درکار'}"
+        )
+    elif gpu_detected:
+        status_summary = f"GPU mila: {gpu_name} ({vram_gb} GB VRAM) — QLoRA ke liye kam az kam 4 GB VRAM chahiye"
+    else:
+        status_summary = "No CUDA GPU detected (Standard 1-Click CPU Mode)"
+
     return {
         "gpu_detected": gpu_detected,
         "gpu_name": gpu_name,
         "vram_mb": vram_mb,
         "vram_gb": vram_gb,
-        "qlora_capable": bool(gpu_detected and (vram_mb >= 4000 or vram_mb == 0)),
+        "qlora_capable": bool(gpu_detected and vram_mb >= 4000),
+        "qlora_8b_capable": bool(gpu_detected and vram_mb >= 12000),
+        "vram_tier": vram_profile["vram_tier"],
+        "max_params_b": vram_profile["max_params_b"],
+        "recommended_base_model": vram_profile["recommended_base_model"],
+        "recommended_ollama_tag": vram_profile["recommended_ollama_tag"],
+        "requires_gradient_checkpointing": vram_profile["requires_gradient_checkpointing"],
+        "recommended_max_seq_len": vram_profile["recommended_max_seq_len"],
+        "estimated_stack_download_gb": 2.5,
         "pytorch_ready": TORCH_AVAILABLE,
-        "hf_qlora_stack_ready": is_hf_qlora_stack_ready(),
+        "hf_qlora_stack_ready": stack_ready,
+        "status_summary": status_summary,
     }
 
 

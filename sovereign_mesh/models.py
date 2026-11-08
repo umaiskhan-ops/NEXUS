@@ -485,6 +485,7 @@ class ModelRouter:
         self.eco_mode = False
         self.distillation_cache = distillation_cache if distillation_cache is not None else DistillationCache()
         self.brain_matrix = brain_matrix
+        self._in_flight_requests: int = 0
 
     def distillation_stats(self) -> dict:
         return self.distillation_cache.stats()
@@ -513,11 +514,14 @@ class ModelRouter:
         )
         self.budget.charge(self.budget.estimate(full_system + prompt), user_id=user_id)
         start = time.monotonic()
+        self._in_flight_requests += 1
         try:
             text = self.backend.chat(node.model, full_system, prompt, self.timeout)
         except BackendUnavailable:
             node.record_failure()
             raise
+        finally:
+            self._in_flight_requests = max(0, self._in_flight_requests - 1)
         if "APPROVE or REJECT" not in (system or ""):
             text = enforce_brand_identity(prompt, text)
         latency = time.monotonic() - start
