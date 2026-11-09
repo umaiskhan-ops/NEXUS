@@ -85,8 +85,10 @@ class ObjectiveGroundTruthVerifier:
     """Verifies solutions against objective truth (execution, compiler, logic) rather than model opinions."""
 
     @staticmethod
-    def verify_code(code_str: str, test_assertions: str = "", timeout: float = 10.0) -> Dict[str, Any]:
-        """Runs the code in the sandbox. Verifies zero syntax errors, exit_code 0, and passed assertions."""
+    def verify_code(code_str: str, test_assertions: str = "", timeout: float = 2.0) -> Dict[str, Any]:
+        """Runs the code in the sandbox. Verifies zero syntax errors, exit_code 0, and passed assertions.
+        Uses a strict 2.0s timeout to prevent malicious/infinite-loop compute waste on the Hub.
+        """
         clean_code = (code_str or "").strip()
         if not clean_code:
             return {"verified": False, "error": "empty code payload"}
@@ -114,7 +116,7 @@ class ObjectiveGroundTruthVerifier:
             out["timestamp"] = time.time()
             return out
 
-        # 3. Sandbox execution check
+        # 3. Sandbox execution check (strict 2.0s timeout)
         res = run_python(exec_payload, enabled=True, timeout=timeout)
         if not res.get("ok"):
             fail_out = {
@@ -122,6 +124,7 @@ class ObjectiveGroundTruthVerifier:
                 "verification_type": "CODE_EXECUTION_FAILED",
                 "error": res.get("stderr") or res.get("error") or "Execution failed",
                 "exit_code": res.get("exit_code", -1),
+                "timeout": bool(res.get("timeout")),
             }
             with _CODE_VERIFY_LOCK:
                 if len(_CODE_VERIFY_CACHE) < 2048:
@@ -179,8 +182,12 @@ class ObjectiveGroundTruthVerifier:
         }
 
     @staticmethod
-    def verify_json_schema(raw_text: str, required_keys: List[str]) -> Dict[str, Any]:
-        """Verifies that raw_text is valid JSON containing all required schema keys."""
+    def verify_json_schema(
+        raw_text: str,
+        required_keys: Union[List[str], Dict[str, Any]],
+        rules: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Verifies that raw_text is valid JSON containing all required schema keys and valid values."""
         try:
             m = re.search(r"(\{.*\})", raw_text, re.DOTALL)
             json_blob = m.group(1) if m else raw_text
@@ -190,9 +197,67 @@ class ObjectiveGroundTruthVerifier:
         except Exception as exc:
             return {"verified": False, "error": f"JSON parsing failed: {exc}"}
 
-        missing = [k for k in required_keys if k not in parsed]
+        # Parse key specs (supports ["name:str", "age:int>=0"] or ["name", "age"] or dict rules)
+        active_rules = dict(rules or {})
+        parsed_keys = []
+        raw_key_list = list(required_keys.keys()) if isinstance(required_keys, dict) else list(required_keys)
+        if isinstance(required_keys, dict):
+            active_rules.update(required_keys)
+
+        for k in raw_key_list:
+            if ":" in k and not isinstance(required_keys, dict):
+                k_name, k_rule = k.split(":", 1)
+                parsed_keys.append(k_name.strip())
+                active_rules[k_name.strip()] = k_rule.strip()
+            else:
+                parsed_keys.append(k)
+
+        missing = [k for k in parsed_keys if k not in parsed]
         if missing:
             return {"verified": False, "error": f"Missing required schema keys: {missing}"}
+
+        # Value constraints validation
+        for key in parsed_keys:
+            val = parsed[key]
+            # Semantic default guard for common fields (e.g. age must not be negative)
+            if key.lower() == "age" and key not in active_rules:
+                if isinstance(val, (int, float)) and val < 0:
+                    return {"verified": False, "error": f"Key '{key}' cannot be negative, got {val}"}
+
+            rule = active_rules.get(key)
+            if not rule:
+                continue
+
+            if isinstance(rule, str):
+                r = rule.strip().lower()
+                if r.startswith("int"):
+                    if not isinstance(val, int) or isinstance(val, bool):
+                        return {"verified": False, "error": f"Key '{key}' must be int, got {type(val).__name__}"}
+                    if ">=0" in r and val < 0:
+                        return {"verified": False, "error": f"Key '{key}' must be non-negative (>= 0), got {val}"}
+                    elif ">0" in r and val <= 0:
+                        return {"verified": False, "error": f"Key '{key}' must be positive (> 0), got {val}"}
+                elif r.startswith("float") or r.startswith("num"):
+                    if not isinstance(val, (int, float)) or isinstance(val, bool):
+                        return {"verified": False, "error": f"Key '{key}' must be numeric, got {type(val).__name__}"}
+                    if ">=0" in r and val < 0:
+                        return {"verified": False, "error": f"Key '{key}' must be non-negative, got {val}"}
+                elif r == "str":
+                    if not isinstance(val, str) or not val.strip():
+                        return {"verified": False, "error": f"Key '{key}' must be non-empty string"}
+                elif r == "bool":
+                    if not isinstance(val, bool):
+                        return {"verified": False, "error": f"Key '{key}' must be boolean"}
+            elif isinstance(rule, dict):
+                r_type = rule.get("type")
+                if r_type == "int" and (not isinstance(val, int) or isinstance(val, bool)):
+                    return {"verified": False, "error": f"Key '{key}' must be int"}
+                if r_type == "str" and not isinstance(val, str):
+                    return {"verified": False, "error": f"Key '{key}' must be string"}
+                if "min" in rule and float(val) < float(rule["min"]):
+                    return {"verified": False, "error": f"Key '{key}' value {val} < min {rule['min']}"}
+                if "max" in rule and float(val) > float(rule["max"]):
+                    return {"verified": False, "error": f"Key '{key}' value {val} > max {rule['max']}"}
 
         proof_hash = hashlib.sha256(f"SCHEMA:{sorted(parsed.keys())}".encode("utf-8")).hexdigest()
         return {

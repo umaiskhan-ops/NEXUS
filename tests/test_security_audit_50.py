@@ -868,6 +868,209 @@ class TestSecurityAudit50(unittest.TestCase):
             self.assertFalse(settle_trend["ok"])
             self.assertIn(settle_trend["status"], ("REJECTED", "SLASHED"))
 
+            # --- Phase A: B1 Visibility Timeout Recovery ---
+            w_eval = hub.register_worker("eval-worker-1", url="local", initial_credits=100)
+            hub.enqueue_nat_task("eval-worker-1", "data_analysis", {"series": [1, 2, 3]})
+            pulled_first = hub.pull_pending_tasks("eval-worker-1", max_tasks=1, visibility_timeout_s=0.2)
+            self.assertEqual(len(pulled_first), 1)
+            # While in-flight, immediately pulling again yields 0 tasks
+            pulled_empty = hub.pull_pending_tasks("eval-worker-1", max_tasks=1, visibility_timeout_s=0.2)
+            self.assertEqual(len(pulled_empty), 0)
+            # After timeout expires (unacknowledged/lost task), pulling again recovers the task
+            time.sleep(0.25)
+            pulled_recovered = hub.pull_pending_tasks("eval-worker-1", max_tasks=1, visibility_timeout_s=0.2)
+            self.assertEqual(len(pulled_recovered), 1)
+            self.assertEqual(pulled_recovered[0]["task_id"], pulled_first[0]["task_id"])
+
+            # --- Phase A: B2 LLM Ground-Truth Verifier Tests ---
+            # 1. Hidden assertions prevent hardcoding cheats
+            t_hidden = hub.enqueue_nat_task(
+                "eval-worker-1",
+                "brain_inference",
+                {
+                    "prompt": "Write solve(x) returning sum of tuple elements",
+                    "test_assertions": "assert solve((2, 3)) == 5",
+                    "hidden_assertions": "assert solve((4, 5)) == 9",
+                },
+                funded_credits=25,
+            )
+            # Pulled copy has hidden assertions stripped
+            pulled_task_pkt = hub.pull_pending_tasks("eval-worker-1", max_tasks=1)[0]
+            self.assertNotIn("hidden_assertions", pulled_task_pkt.get("payload", {}))
+            self.assertIn("test_assertions", pulled_task_pkt.get("payload", {}))
+
+            # Cheater code hardcoded only to visible test fails hidden test
+            cheat_code = "def solve(x):\n    return 5 if x == (2, 3) else 0"
+            proof_cheat = compute_hmac(w_eval.key, {
+                "task_id": t_hidden["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "nonce": t_hidden["nonce"],
+                "result": {"status": "OK", "code": cheat_code},
+            })
+            settle_cheat = hub.verify_and_settle({
+                "task_id": t_hidden["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "result": {"status": "OK", "code": cheat_code},
+                "worker_proof": proof_cheat,
+            })
+            self.assertFalse(settle_cheat["ok"])
+            self.assertEqual(settle_cheat["status"], "REJECTED")
+            self.assertIn("code_assertions_failed", settle_cheat["reason"])
+
+            # 2. Honest code passes both visible and hidden tests
+            t_honest = hub.enqueue_nat_task(
+                "eval-worker-1",
+                "brain_inference",
+                {
+                    "prompt": "Write solve(x) returning sum of tuple elements",
+                    "test_assertions": "assert solve((2, 3)) == 5",
+                    "hidden_assertions": "assert solve((4, 5)) == 9",
+                },
+                funded_credits=25,
+            )
+            honest_code = "def solve(x):\n    return x[0] + x[1]"
+            proof_honest = compute_hmac(w_eval.key, {
+                "task_id": t_honest["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "nonce": t_honest["nonce"],
+                "result": {"status": "OK", "code": honest_code},
+            })
+            settle_honest = hub.verify_and_settle({
+                "task_id": t_honest["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "result": {"status": "OK", "code": honest_code},
+                "worker_proof": proof_honest,
+            })
+            self.assertTrue(settle_honest["ok"])
+            self.assertEqual(settle_honest["status"], "SETTLED")
+
+            # 3. Schema validation rejects bad/negative age
+            t_schema = hub.create_signed_task(
+                "eval-worker-1",
+                "brain_inference",
+                {"required_keys": ["name", "age"]},
+                funded_credits=25,
+            )
+            proof_schema_bad = compute_hmac(w_eval.key, {
+                "task_id": t_schema["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "nonce": t_schema["nonce"],
+                "result": {"status": "OK", "output": '{"name": "zzz", "age": -999}'},
+            })
+            settle_bad_schema = hub.verify_and_settle({
+                "task_id": t_schema["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "result": {"status": "OK", "output": '{"name": "zzz", "age": -999}'},
+                "worker_proof": proof_schema_bad,
+            })
+            self.assertFalse(settle_bad_schema["ok"])
+            self.assertEqual(settle_bad_schema["status"], "REJECTED")
+
+            # 4. Infinite loop terminates quickly within 2.0s without hanging hub
+            t_inf = hub.create_signed_task(
+                "eval-worker-1",
+                "brain_inference",
+                {"test_assertions": "assert True"},
+                funded_credits=25,
+            )
+            inf_code = "while True:\n    pass"
+            proof_inf = compute_hmac(w_eval.key, {
+                "task_id": t_inf["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "nonce": t_inf["nonce"],
+                "result": {"status": "OK", "code": inf_code},
+            })
+            t_start = time.time()
+            settle_inf = hub.verify_and_settle({
+                "task_id": t_inf["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "result": {"status": "OK", "code": inf_code},
+                "worker_proof": proof_inf,
+            })
+            t_duration = time.time() - t_start
+            self.assertLess(t_duration, 4.0)  # Must be killed quickly within ~2s
+            self.assertFalse(settle_inf["ok"])
+            self.assertEqual(settle_inf["status"], "REJECTED")
+
+            # 5. Free-form 2-Worker Consensus (Darja 2)
+            w_peer = hub.register_worker("peer-worker-2", url="local", initial_credits=50)
+            freeform_prompt = "Explain quantum entanglement in simple terms"
+            t_ff1 = hub.create_signed_task(
+                "eval-worker-1",
+                "brain_inference",
+                {"prompt": freeform_prompt, "consensus_id": "quantum-entangle-1"},
+                funded_credits=25,
+            )
+            t_ff2 = hub.create_signed_task(
+                "peer-worker-2",
+                "brain_inference",
+                {"prompt": freeform_prompt, "consensus_id": "quantum-entangle-1"},
+                funded_credits=25,
+            )
+            out_worker1 = "Quantum entanglement is a physical phenomenon where particles remain connected regardless of distance."
+            proof_ff1 = compute_hmac(w_eval.key, {
+                "task_id": t_ff1["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "nonce": t_ff1["nonce"],
+                "result": {"status": "OK", "output": out_worker1},
+            })
+            settle_ff1 = hub.verify_and_settle({
+                "task_id": t_ff1["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "result": {"status": "OK", "output": out_worker1},
+                "worker_proof": proof_ff1,
+            })
+            # Worker 1 is held in pending consensus
+            self.assertTrue(settle_ff1["ok"])
+            self.assertEqual(settle_ff1["status"], "PENDING_CONSENSUS")
+
+            # Worker 2 independently submits matching topical response
+            out_worker2 = "In physics, quantum entanglement describes particles whose states are correlated even across large distance."
+            proof_ff2 = compute_hmac(w_peer.key, {
+                "task_id": t_ff2["task_id"],
+                "worker_id": "peer-worker-2",
+                "feature": "brain_inference",
+                "nonce": t_ff2["nonce"],
+                "result": {"status": "OK", "output": out_worker2},
+            })
+            settle_ff2 = hub.verify_and_settle({
+                "task_id": t_ff2["task_id"],
+                "worker_id": "peer-worker-2",
+                "feature": "brain_inference",
+                "result": {"status": "OK", "output": out_worker2},
+                "worker_proof": proof_ff2,
+            })
+            # Worker 2 submission completes consensus: both workers settled
+            self.assertTrue(settle_ff2["ok"])
+            self.assertEqual(settle_ff2["status"], "SETTLED")
+
+            # --- Phase A: B5 Redactions Verification ---
+            req_learn = urllib.request.Request(f"{base_url}/api/learning/status")
+            with urllib.request.urlopen(req_learn, timeout=5) as resp_learn:
+                learn_data = json.loads(resp_learn.read().decode("utf-8"))
+                self.assertTrue(learn_data["ok"])
+                if learn_data.get("active_adapter_path"):
+                    self.assertNotIn(":", learn_data["active_adapter_path"])  # no drive letter
+                    self.assertNotIn("/", learn_data["active_adapter_path"])  # basename only
+                    self.assertNotIn("\\", learn_data["active_adapter_path"])
+
+            req_tunnel = urllib.request.Request(f"{base_url}/api/tunnel/status")
+            with urllib.request.urlopen(req_tunnel, timeout=5) as resp_tunnel:
+                tunnel_data = json.loads(resp_tunnel.read().decode("utf-8"))
+                self.assertTrue(tunnel_data["ok"])
+                if tunnel_data.get("github_gist_id"):
+                    self.assertEqual(tunnel_data["github_gist_id"], "[REDACTED]")
+
         finally:
             srv.shutdown()
             srv.server_close()

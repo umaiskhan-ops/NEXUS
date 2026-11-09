@@ -477,16 +477,26 @@ def make_handler(grid, client):
 
             if path == "/api/worker/pull_task":
                 # Security Fix (B1): pull_task requires worker authentication or Hub Owner auth.
-                # Prevents unauthorized attackers from stealing or inspecting other workers' tasks.
+                # Header authentication (X-Worker-Key / Authorization) is preferred to avoid leaking keys in URLs/logs.
                 qs = parse_qs(urlparse(self.path).query)
                 requested_wid = qs.get("worker_id", [""])[0].strip()
                 auth_key = (
                     self.headers.get("X-Worker-Key", "").strip()
                     or self.headers.get("X-Account-Key", "").strip()
+                    or self.headers.get("Authorization", "").replace("Bearer ", "").strip()
                     or qs.get("key", [""])[0].strip()
                     or qs.get("account_key", [""])[0].strip()
                     or self._get_cookie("nexus_account_key").strip()
                 )
+                req_sig = self.headers.get("X-Worker-Signature", "").strip()
+                req_ts = self.headers.get("X-Worker-Timestamp", "").strip()
+                if req_sig and req_ts:
+                    try:
+                        ts_val = float(req_ts)
+                        if abs(time.time() - ts_val) > 300.0:
+                            return self._send(401, {"ok": False, "error": "signature timestamp expired (>300s clock drift)"})
+                    except ValueError:
+                        return self._send(401, {"ok": False, "error": "invalid signature timestamp"})
                 is_owner = self._auth_ok()
                 eff_wid = requested_wid
                 if not is_owner:
@@ -599,24 +609,28 @@ def make_handler(grid, client):
             if path == "/api/tunnel/status":
                 t_mgr = getattr(grid, "tunnel_mgr", None)
                 pub_url = getattr(grid, "public_hub_url", None) or (t_mgr.get_public_url() if t_mgr else None)
+                raw_gist = getattr(cfg, "github_gist_id", "") or (t_mgr.github_gist_id if t_mgr else "")
+                safe_gist = raw_gist if self._auth_ok() else ("[REDACTED]" if raw_gist else "")
                 return self._send(200, {
                     "ok": True,
                     "public_hub_url": pub_url,
                     "status": getattr(t_mgr, "status", "INACTIVE") if t_mgr else "NOT_CONFIGURED",
                     "cloudflared_installed": bool(t_mgr.find_cloudflared_binary() if t_mgr else False),
                     "bootstrap_anchor_url": getattr(cfg, "bootstrap_anchor_url", "") or getattr(grid, "bootstrap_anchor_url", ""),
-                    "github_gist_id": getattr(cfg, "github_gist_id", "") or (t_mgr.github_gist_id if t_mgr else ""),
+                    "github_gist_id": safe_gist,
                 })
 
             if path == "/api/tunnel/bootstrap":
                 t_mgr = getattr(grid, "tunnel_mgr", None)
                 pub_url = getattr(grid, "public_hub_url", None) or (t_mgr.get_public_url() if t_mgr else None)
+                raw_gist = getattr(cfg, "github_gist_id", "") or (t_mgr.github_gist_id if t_mgr else "")
+                safe_gist = raw_gist if self._auth_ok() else ("[REDACTED]" if raw_gist else "")
                 return self._send(200, {
                     "ok": True,
                     "active_hub_url": pub_url or f"http://127.0.0.1:{cfg.port}",
                     "status": getattr(t_mgr, "status", "ONLINE") if t_mgr else "LOCAL",
                     "bootstrap_anchor_url": getattr(cfg, "bootstrap_anchor_url", "") or getattr(grid, "bootstrap_anchor_url", ""),
-                    "github_gist_id": getattr(cfg, "github_gist_id", "") or (t_mgr.github_gist_id if t_mgr else ""),
+                    "github_gist_id": safe_gist,
                     "updated_at": time.time(),
                 })
 
@@ -707,7 +721,14 @@ def make_handler(grid, client):
             if path == "/api/learning/status":
                 if not getattr(grid, "continuous_learning", None):
                     return self._send(500, {"ok": False, "error": "continuous_learning not initialized"})
-                return self._send(200, {"ok": True, **grid.continuous_learning.status()})
+                st = dict(grid.continuous_learning.status())
+                # Security Guard (B5): Redact host local filesystem paths for non-owner callers
+                if not self._auth_ok():
+                    if st.get("active_adapter_path"):
+                        st["active_adapter_path"] = Path(st["active_adapter_path"]).name
+                    if st.get("active_gguf_path"):
+                        st["active_gguf_path"] = Path(st["active_gguf_path"]).name
+                return self._send(200, {"ok": True, **st})
 
             if path == "/api/lottery/status":
                 if not getattr(grid, "token_sink", None):

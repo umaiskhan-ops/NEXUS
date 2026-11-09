@@ -19,6 +19,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import time
@@ -248,6 +249,7 @@ class MasterHubCoordinator:
         self._nat_in_flight: Dict[str, dict] = {}
         self._nat_task_events: Dict[str, threading.Event] = {}
         self._nat_settled_results: Dict[str, dict] = {}
+        self._freeform_consensus: Dict[str, dict] = {}
         self.commercial_revenue_pool: float = 0.0
         self.treasury_balance: float = 0.0
         self.current_epoch: int = 1
@@ -888,6 +890,7 @@ class MasterHubCoordinator:
             valid = [pkt for pkt in queue if (now - pkt.get("issued_at", now)) <= TASK_TTL_S]
             pulled = valid[:max(1, int(max_tasks or 5))]
             self._nat_outbound_queue[w_id] = valid[len(pulled):]
+            sanitized_pulled = []
             for pkt in pulled:
                 self._nat_in_flight[pkt["task_id"]] = {
                     "packet": pkt,
@@ -895,7 +898,15 @@ class MasterHubCoordinator:
                     "pulled_at": now,
                     "timeout_s": float(visibility_timeout_s),
                 }
-            return pulled
+                # Security Guard (B2): Strip hidden assertions from worker's copy to prevent hardcoding cheats
+                w_pkt = dict(pkt)
+                if isinstance(w_pkt.get("payload"), dict):
+                    w_payload = dict(w_pkt["payload"])
+                    for hidden_key in ("hidden_assertions", "hidden_test_assertions", "hidden_tests"):
+                        w_payload.pop(hidden_key, None)
+                    w_pkt["payload"] = w_payload
+                sanitized_pulled.append(w_pkt)
+            return sanitized_pulled
 
     def _reject(self, worker: Optional[WorkerNodeRecord], reason: str) -> dict:
         if worker:
@@ -978,7 +989,6 @@ class MasterHubCoordinator:
                 if isinstance(raw_nums, (list, tuple)):
                     nums = [float(x) for x in raw_nums if isinstance(x, (int, float)) and not isinstance(x, bool)]
                 elif isinstance(raw_nums, str):
-                    import re
                     nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", raw_nums)]
                 if nums and isinstance(result.get("mean"), (int, float)) and not isinstance(result.get("mean"), bool):
                     expected_mean = sum(nums) / len(nums)
@@ -995,7 +1005,6 @@ class MasterHubCoordinator:
                 if isinstance(raw_vals, (list, tuple)):
                     xs = [float(x) for x in raw_vals if isinstance(x, (int, float)) and not isinstance(x, bool)]
                 elif isinstance(raw_vals, str):
-                    import re
                     xs = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", raw_vals)]
                 if len(xs) >= 2:
                     n = len(xs)
@@ -1029,21 +1038,97 @@ class MasterHubCoordinator:
                 or ""
             ).strip()
 
-            if t_payload.get("test_assertions"):
+            test_assertions = str(t_payload.get("test_assertions") or "")
+            hidden_assertions = str(t_payload.get("hidden_assertions") or t_payload.get("hidden_test_assertions") or t_payload.get("hidden_tests") or "")
+            combined_assertions = f"{test_assertions}\n{hidden_assertions}".strip()
+
+            if combined_assertions:
                 from .continuous_learning import ObjectiveGroundTruthVerifier
-                v_res = ObjectiveGroundTruthVerifier.verify_code(out_text, str(t_payload["test_assertions"]))
+                v_res = ObjectiveGroundTruthVerifier.verify_code(out_text, combined_assertions, timeout=2.0)
                 if v_res.get("verified"):
                     verified = True
+                else:
+                    return self._reject(worker, f"code_assertions_failed: {v_res.get('error')}")
             elif t_payload.get("expected_value") is not None:
                 from .continuous_learning import ObjectiveGroundTruthVerifier
                 v_res = ObjectiveGroundTruthVerifier.verify_math(out_text, expected_val=t_payload["expected_value"])
                 if v_res.get("verified"):
                     verified = True
+                else:
+                    return self._reject(worker, f"math_verification_failed: {v_res.get('error')}")
             elif t_payload.get("required_keys"):
                 from .continuous_learning import ObjectiveGroundTruthVerifier
-                v_res = ObjectiveGroundTruthVerifier.verify_json_schema(out_text, t_payload["required_keys"])
+                v_res = ObjectiveGroundTruthVerifier.verify_json_schema(
+                    out_text,
+                    t_payload["required_keys"],
+                    rules=t_payload.get("schema_rules") or t_payload.get("rules"),
+                )
                 if v_res.get("verified"):
                     verified = True
+                else:
+                    return self._reject(worker, f"schema_verification_failed: {v_res.get('error')}")
+            elif (t_payload.get("prompt") or t_payload.get("query")) and out_text and len(out_text) >= 10:
+                # Darja 2: Free-form Redundant Multi-Worker Consensus Verification
+                prompt_str = str(t_payload.get("prompt") or t_payload.get("query") or "").strip()
+                consensus_key = str(t_payload.get("consensus_id") or hashlib.sha256(prompt_str.encode("utf-8")).hexdigest()[:16])
+                existing = self._freeform_consensus.get(consensus_key)
+
+                if existing is None:
+                    # First worker submitted. Hold in buffer awaiting independent verification.
+                    self._freeform_consensus[consensus_key] = {
+                        "worker_id": worker.worker_id,
+                        "task_id": task_id,
+                        "output": out_text,
+                        "worker": worker,
+                        "funded_by": task.get("funded_by", ""),
+                        "task": task,
+                        "created_at": time.time(),
+                    }
+                    return {
+                        "ok": True,
+                        "status": "PENDING_CONSENSUS",
+                        "task_id": task_id,
+                        "worker_id": worker.worker_id,
+                        "message": "Result held for independent multi-worker consensus verification",
+                    }
+                elif existing["worker_id"] != worker.worker_id:
+                    # Second independent worker submitted. Check semantic / keyword similarity between both outputs.
+                    first_text = existing["output"].lower()
+                    second_text = out_text.lower()
+
+                    words1 = set(re.findall(r"\w+", first_text))
+                    words2 = set(re.findall(r"\w+", second_text))
+                    jaccard = len(words1 & words2) / max(1, len(words1 | words2))
+                    len_ratio = min(len(first_text), len(second_text)) / max(len(first_text), len(second_text))
+
+                    # Substantial lexical/topical overlap & comparable length
+                    if (jaccard >= 0.15 or len(words1 & words2) >= 3) and len_ratio >= 0.25:
+                        # Consensus reached! Settle the first worker retrospectively
+                        w1 = existing["worker"]
+                        if w1.status != "SLASHED":
+                            with self._lock:
+                                reward_credits = int(task.get("funded_credits") or 25)
+                                w1.credits += reward_credits
+                                w1.tasks_completed += 1
+                                w1.tasks_verified += 1
+                                if self.ledger:
+                                    self.ledger.append("worker_task_settled", {
+                                        "worker_id": w1.worker_id,
+                                        "task_id": existing["task_id"],
+                                        "feature": task["feature"],
+                                        "credits_awarded": reward_credits,
+                                        "new_balance": w1.credits,
+                                        "funded_by": existing.get("funded_by", ""),
+                                        "consensus": True,
+                                    })
+                                self._flush()
+                                if existing["task_id"] in self._nat_task_events:
+                                    self._nat_task_events[existing["task_id"]].set()
+                        verified = True
+                        self._freeform_consensus.pop(consensus_key, None)
+                    else:
+                        # Divergent / discordant outputs: reject candidate
+                        return self._reject(worker, "consensus_semantic_divergence_rejected")
 
         # Cryptographic Proof-of-Neural-Work Cosine Similarity Verification on LoRA Gradients
         if isinstance(result, dict) and isinstance(result.get("lora_gradients"), dict):
