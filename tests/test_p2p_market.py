@@ -551,18 +551,13 @@ class TestP2PMarketplace(unittest.TestCase):
         self.assertEqual(pulled[0]["task_id"], queued_pkt["task_id"])
 
         from sovereign_mesh.hub_spoke import compute_hmac
+        from sovereign_mesh.brain_matrix import compute_local_lora_gradients
+        nat_prompt = "Implement distributed Byzantine-fault-tolerant FedAvg consensus"
+        nat_bp = compute_local_lora_gradients(nat_prompt, "CODE_DEBUG_EXEC")
         nat_result = {
             "status": "OK",
             "inferred_by_worker": "worker-behind-nat",
-            "lora_gradients": {
-                "domain_shard": "CODE_DEBUG_EXEC",
-                "delta_A": bp["delta_A"],
-                "delta_B": bp["delta_B"],
-                "initial_loss": bp["initial_loss"],
-                "final_loss": bp["final_loss"],
-                "gradient_l2_norm": bp["gradient_l2_norm"],
-                "samples_count": 4,
-            },
+            "lora_gradients": nat_bp,
         }
         proof = compute_hmac(nat_worker.key, {
             "task_id": queued_pkt["task_id"],

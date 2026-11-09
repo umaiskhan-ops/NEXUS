@@ -89,8 +89,12 @@ def _comparable(result: Any) -> Any:
 def _spot_checkable(feature: str, payload: dict) -> bool:
     if feature not in SPOT_CHECKABLE:
         return False
+    if not isinstance(payload, dict):
+        return False
     if feature == "trend_forecasting":
         return isinstance(payload.get("series") or payload.get("data"), list)
+    if feature == "data_analysis":
+        return bool(payload.get("series") or payload.get("data") or payload.get("numbers"))
     if feature == "virtual_experiment_simulator":
         return not payload.get("code")
     return True
@@ -241,6 +245,7 @@ class MasterHubCoordinator:
         self._workers: Dict[str, WorkerNodeRecord] = {}
         self._pending: Dict[str, dict] = {}
         self._nat_outbound_queue: Dict[str, List[dict]] = {}
+        self._nat_in_flight: Dict[str, dict] = {}
         self._nat_task_events: Dict[str, threading.Event] = {}
         self._nat_settled_results: Dict[str, dict] = {}
         self.commercial_revenue_pool: float = 0.0
@@ -850,20 +855,46 @@ class MasterHubCoordinator:
             self._nat_task_events[packet["task_id"]] = threading.Event()
             return packet
 
-    def pull_pending_tasks(self, worker_id: str, max_tasks: int = 5) -> List[dict]:
-        """Called by edge workers behind NAT/Firewall to pull their signed compute/LoRA tasks."""
+    def pull_pending_tasks(
+        self,
+        worker_id: str,
+        max_tasks: int = 5,
+        visibility_timeout_s: float = 90.0,
+    ) -> List[dict]:
+        """Called by edge workers behind NAT/Firewall to pull their signed compute/LoRA tasks.
+        Includes visibility timeout recovery so unacknowledged/lost tasks return to queue.
+        """
         with self._lock:
             worker = self.get_worker(worker_id)
             if not worker or worker.status == "SLASHED":
                 return []
             w_id = worker.worker_id
-            queue = self._nat_outbound_queue.get(w_id, [])
+            now = time.time()
+
+            # 1. Recover any in-flight tasks whose visibility timeout expired without settlement
+            requeued = []
+            for tid, flight in list(self._nat_in_flight.items()):
+                if flight.get("worker_id") == w_id:
+                    if (now - float(flight.get("pulled_at", 0.0))) > float(flight.get("timeout_s", visibility_timeout_s)):
+                        requeued.append(flight["packet"])
+                        self._nat_in_flight.pop(tid, None)
+
+            queue = self._nat_outbound_queue.setdefault(w_id, [])
+            if requeued:
+                queue[0:0] = requeued
+
             if not queue:
                 return []
-            now = time.time()
             valid = [pkt for pkt in queue if (now - pkt.get("issued_at", now)) <= TASK_TTL_S]
             pulled = valid[:max(1, int(max_tasks or 5))]
             self._nat_outbound_queue[w_id] = valid[len(pulled):]
+            for pkt in pulled:
+                self._nat_in_flight[pkt["task_id"]] = {
+                    "packet": pkt,
+                    "worker_id": w_id,
+                    "pulled_at": now,
+                    "timeout_s": float(visibility_timeout_s),
+                }
             return pulled
 
     def _reject(self, worker: Optional[WorkerNodeRecord], reason: str) -> dict:
@@ -921,6 +952,7 @@ class MasterHubCoordinator:
             if not isinstance(result, dict) or not result or result.get("status") == "ERROR":
                 return self._reject(worker, "empty_or_failed_task_result")
             self._pending.pop(task_id, None)  # proof is authentic -> task consumed (replay-safe)
+            self._nat_in_flight.pop(task_id, None)
 
         verified = False
         clean_res, res_flags = sanitize_payload(result)
@@ -929,28 +961,88 @@ class MasterHubCoordinator:
 
         if self.grid is not None and _spot_checkable(task["feature"], task["payload"]) \
                 and secrets.randbelow(10_000) < int(self.spot_check_rate * 10_000):
-            expected = self.grid.registry.get(task["feature"]).handler(self.grid, sanitize_payload(task["payload"])[0])
-            if _canonical(_comparable(expected)) != _canonical(_comparable(result)):
-                with self._lock:
-                    return self._slash(worker, f"spot_check_mismatch on {task['feature']} (task {task_id})")
-            verified = True
+            try:
+                expected = self.grid.registry.get(task["feature"]).handler(self.grid, sanitize_payload(task["payload"])[0])
+                if _canonical(_comparable(expected)) != _canonical(_comparable(result)):
+                    with self._lock:
+                        return self._slash(worker, f"spot_check_mismatch on {task['feature']} (task {task_id})")
+                verified = True
+            except Exception as exc:
+                return self._reject(worker, f"spot_check_handler_error: {exc}")
         elif task["feature"] in SPOT_CHECKABLE:
             # Standalone Hub verification of deterministic features (rejects fabricated answers)
             t_payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
             if task["feature"] == "data_analysis":
                 raw_nums = t_payload.get("series") or t_payload.get("data") or t_payload.get("numbers")
-                if isinstance(result.get("mean"), (int, float)) and not isinstance(result.get("mean"), bool):
-                    if isinstance(raw_nums, (list, tuple)) and len(raw_nums) > 0:
-                        nums = [float(x) for x in raw_nums if isinstance(x, (int, float)) and not isinstance(x, bool)]
-                        if nums and abs(float(result["mean"]) - (sum(nums) / len(nums))) <= 0.05:
+                nums = []
+                if isinstance(raw_nums, (list, tuple)):
+                    nums = [float(x) for x in raw_nums if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                elif isinstance(raw_nums, str):
+                    import re
+                    nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", raw_nums)]
+                if nums and isinstance(result.get("mean"), (int, float)) and not isinstance(result.get("mean"), bool):
+                    expected_mean = sum(nums) / len(nums)
+                    if abs(float(result["mean"]) - expected_mean) <= 0.05:
+                        if "count" in result and int(result["count"]) != len(nums):
+                            verified = False
+                        elif "sum" in result and abs(float(result["sum"]) - sum(nums)) > 0.05:
+                            verified = False
+                        else:
                             verified = True
-                    else:
-                        verified = True
             elif task["feature"] == "trend_forecasting":
-                if any(k in result for k in ("trend", "slope", "projected")) and result.get("trend") in {"UP", "DOWN", "FLAT", "UPWARD", "DOWNWARD", None}:
+                raw_vals = t_payload.get("series") or t_payload.get("data") or t_payload.get("values")
+                xs = []
+                if isinstance(raw_vals, (list, tuple)):
+                    xs = [float(x) for x in raw_vals if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                elif isinstance(raw_vals, str):
+                    import re
+                    xs = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", raw_vals)]
+                if len(xs) >= 2:
+                    n = len(xs)
+                    t = list(range(n))
+                    t_mean = sum(t) / n
+                    x_mean = sum(xs) / n
+                    denom = sum((ti - t_mean) ** 2 for ti in t)
+                    expected_slope = sum((ti - t_mean) * (xi - x_mean) for ti, xi in zip(t, xs)) / (denom if denom != 0 else 1)
+                    expected_direction = "UPWARD" if expected_slope > 0.01 else ("DOWNWARD" if expected_slope < -0.01 else "FLAT")
+                    res_trend = str(result.get("trend") or "").upper()
+                    if res_trend == "UP":
+                        res_trend = "UPWARD"
+                    elif res_trend == "DOWN":
+                        res_trend = "DOWNWARD"
+                    if res_trend == expected_direction:
+                        if "slope" in result and isinstance(result["slope"], (int, float)) and not isinstance(result["slope"], bool):
+                            if abs(float(result["slope"]) - expected_slope) <= 0.05:
+                                verified = True
+                        else:
+                            verified = True
+
+        # Objective Ground Truth Verifier for LLM Tasks (Code assertions, Math logic, Schema contracts)
+        if not verified and task["feature"] in {"brain_inference", "model_query", "neural_shard_compute", "code_review"}:
+            t_payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+            out_text = str(
+                result.get("output")
+                or result.get("code")
+                or result.get("response")
+                or result.get("local_ollama_output")
+                or result.get("text")
+                or ""
+            ).strip()
+
+            if t_payload.get("test_assertions"):
+                from .continuous_learning import ObjectiveGroundTruthVerifier
+                v_res = ObjectiveGroundTruthVerifier.verify_code(out_text, str(t_payload["test_assertions"]))
+                if v_res.get("verified"):
                     verified = True
-            else:
-                if "status" in result and any(k not in {"status", "answer", "output"} for k in result.keys()):
+            elif t_payload.get("expected_value") is not None:
+                from .continuous_learning import ObjectiveGroundTruthVerifier
+                v_res = ObjectiveGroundTruthVerifier.verify_math(out_text, expected_val=t_payload["expected_value"])
+                if v_res.get("verified"):
+                    verified = True
+            elif t_payload.get("required_keys"):
+                from .continuous_learning import ObjectiveGroundTruthVerifier
+                v_res = ObjectiveGroundTruthVerifier.verify_json_schema(out_text, t_payload["required_keys"])
+                if v_res.get("verified"):
                     verified = True
 
         # Cryptographic Proof-of-Neural-Work Cosine Similarity Verification on LoRA Gradients

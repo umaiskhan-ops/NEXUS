@@ -476,16 +476,46 @@ def make_handler(grid, client):
                 })
 
             if path == "/api/worker/pull_task":
+                # Security Fix (B1): pull_task requires worker authentication or Hub Owner auth.
+                # Prevents unauthorized attackers from stealing or inspecting other workers' tasks.
                 qs = parse_qs(urlparse(self.path).query)
-                wid = (qs.get("worker_id", [""])[0] or qs.get("key", [""])[0]).strip()
+                requested_wid = qs.get("worker_id", [""])[0].strip()
+                auth_key = (
+                    self.headers.get("X-Worker-Key", "").strip()
+                    or self.headers.get("X-Account-Key", "").strip()
+                    or qs.get("key", [""])[0].strip()
+                    or qs.get("account_key", [""])[0].strip()
+                    or self._get_cookie("nexus_account_key").strip()
+                )
+                is_owner = self._auth_ok()
+                eff_wid = requested_wid
+                if not is_owner:
+                    if not auth_key:
+                        return self._send(401, {
+                            "ok": False,
+                            "error": "unauthorized: /api/worker/pull_task requires X-Worker-Key header or key query param",
+                        })
+                    try:
+                        wrec = grid.hub.authenticate_worker_key(auth_key)
+                    except PermissionError as p_err:
+                        return self._send(401, {"ok": False, "error": str(p_err)})
+                    if requested_wid and wrec.worker_id != requested_wid:
+                        return self._send(403, {
+                            "ok": False,
+                            "error": "forbidden: cannot pull tasks for another worker node",
+                        })
+                    eff_wid = wrec.worker_id
+                elif not eff_wid:
+                    eff_wid = qs.get("key", [""])[0].strip()
+
                 try:
                     max_t = max(1, min(20, int(qs.get("max_tasks", ["5"])[0] or 5)))
                 except (ValueError, TypeError):
                     max_t = 5
-                tasks_pulled = grid.hub.pull_pending_tasks(wid, max_tasks=max_t) if (wid and getattr(grid, "hub", None)) else []
+                tasks_pulled = grid.hub.pull_pending_tasks(eff_wid, max_tasks=max_t) if (eff_wid and getattr(grid, "hub", None)) else []
                 return self._send(200, {
                     "ok": True,
-                    "worker_id": wid,
+                    "worker_id": eff_wid,
                     "nat_traversal_mode": "OUTBOUND_HTTP_PULL_QUEUE",
                     "tasks_count": len(tasks_pulled),
                     "pending_tasks": tasks_pulled,
@@ -520,9 +550,27 @@ def make_handler(grid, client):
                 })
 
             if path == "/api/brain/worker_deltas":
+                # Security Fix (B5): Querying worker-specific deltas requires worker authentication or Hub Owner auth.
                 qs = parse_qs(urlparse(self.path).query)
                 wid = qs.get("worker_id", [""])[0].strip()
                 shard = qs.get("shard", [""])[0].strip()
+                auth_key = (
+                    self.headers.get("X-Worker-Key", "").strip()
+                    or self.headers.get("X-Account-Key", "").strip()
+                    or qs.get("key", [""])[0].strip()
+                    or qs.get("account_key", [""])[0].strip()
+                )
+                is_owner = self._auth_ok()
+                if wid and not is_owner:
+                    if not auth_key:
+                        return self._send(401, {"ok": False, "error": "unauthorized: querying per-worker deltas requires worker authentication"})
+                    try:
+                        auth_rec = grid.hub.authenticate_worker_key(auth_key)
+                        if auth_rec.worker_id != wid:
+                            return self._send(403, {"ok": False, "error": "forbidden: cannot query deltas for another worker"})
+                    except PermissionError as p_err:
+                        return self._send(401, {"ok": False, "error": str(p_err)})
+
                 deltas_list = []
                 if getattr(grid, "brain_matrix", None):
                     with grid.brain_matrix._lock:
@@ -601,25 +649,55 @@ def make_handler(grid, client):
                 return self._send(200, {"ok": True, **lb})
 
             if path == "/api/p2p/my_trades":
+                # Security Fix (B5): Listing personal trade history requires account key authentication or Hub Owner auth.
                 qs = parse_qs(urlparse(self.path).query)
-                wid = qs.get("worker_id", [""])[0].strip()
-                resolved_wid = wid
-                if wid and getattr(grid, "hub", None):
-                    wrec = grid.hub.get_worker(wid)
-                    if wrec:
-                        resolved_wid = wrec.worker_id
-                trades = grid.p2p.get_user_orders(wid) if wid else {"selling": [], "buying": []}
-                return self._send(200, {"ok": True, "worker_id": resolved_wid, "trades": trades})
+                requested_wid = qs.get("worker_id", [""])[0].strip()
+                auth_key = (
+                    self.headers.get("X-Worker-Key", "").strip()
+                    or self.headers.get("X-Account-Key", "").strip()
+                    or qs.get("account_key", [""])[0].strip()
+                    or qs.get("key", [""])[0].strip()
+                    or self._get_cookie("nexus_account_key").strip()
+                )
+                is_owner = self._auth_ok()
+                if not is_owner:
+                    if not auth_key:
+                        return self._send(401, {"ok": False, "error": "unauthorized: /api/p2p/my_trades requires account authentication"})
+                    try:
+                        auth_rec = grid.hub.authenticate_worker_key(auth_key)
+                    except PermissionError as p_err:
+                        return self._send(401, {"ok": False, "error": str(p_err)})
+                    if requested_wid and auth_rec.worker_id != requested_wid:
+                        return self._send(403, {"ok": False, "error": "forbidden: cannot view trades of another worker node"})
+                    target_wid = auth_rec.worker_id
+                else:
+                    target_wid = requested_wid or grid.owner_tg_id
+                trades = grid.p2p.get_user_orders(target_wid) if target_wid else {"selling": [], "buying": []}
+                return self._send(200, {"ok": True, "worker_id": target_wid, "trades": trades})
 
             if path == "/api/supercomputer/instances":
+                # Security Fix (B5): Listing instances requires private account key or Hub Owner auth.
                 qs = parse_qs(urlparse(self.path).query)
-                acc = (
-                    self.headers.get("X-Account-Key", "")
-                    or self._get_cookie("nexus_account_key")
-                    or qs.get("account_key", [""])[0]
-                    or qs.get("worker_id", [""])[0]
+                auth_key = (
+                    self.headers.get("X-Account-Key", "").strip()
+                    or self.headers.get("X-Worker-Key", "").strip()
+                    or self._get_cookie("nexus_account_key").strip()
+                    or qs.get("account_key", [""])[0].strip()
+                    or qs.get("key", [""])[0].strip()
                 )
-                instances = grid.supercomputer.list_instances(acc.strip() if acc else None)
+                is_owner = self._auth_ok()
+                if not is_owner and not auth_key:
+                    return self._send(401, {"ok": False, "error": "unauthorized: listing instances requires account authentication"})
+                target_acc = None
+                if auth_key:
+                    try:
+                        auth_rec = grid.hub.authenticate_worker_key(auth_key)
+                        target_acc = auth_rec.worker_id
+                    except PermissionError:
+                        target_acc = auth_key
+                elif is_owner:
+                    target_acc = qs.get("worker_id", [""])[0].strip() or None
+                instances = grid.supercomputer.list_instances(target_acc)
                 return self._send(200, {"ok": True, "instances": instances})
 
             if path == "/api/brain/status":
@@ -637,16 +715,29 @@ def make_handler(grid, client):
                 return self._send(200, grid.token_sink.get_lottery_status())
 
             if path == "/api/staking/status":
+                # Security Fix (B5): Querying private staking records requires account key authentication or Hub Owner auth.
                 if not getattr(grid, "token_sink", None):
                     return self._send(500, {"ok": False, "error": "token_sink not initialized"})
                 qs = parse_qs(urlparse(self.path).query)
-                acc = (
+                auth_key = (
                     self.headers.get("X-Account-Key", "").strip()
+                    or self.headers.get("X-Worker-Key", "").strip()
                     or self._get_cookie("nexus_account_key").strip()
                     or qs.get("account_key", [""])[0].strip()
-                    or qs.get("worker_id", [""])[0].strip()
+                    or qs.get("key", [""])[0].strip()
                 )
-                return self._send(200, grid.token_sink.get_staking_status(acc))
+                is_owner = self._auth_ok()
+                if not is_owner and not auth_key:
+                    return self._send(401, {"ok": False, "error": "unauthorized: staking status requires account authentication"})
+                if auth_key:
+                    try:
+                        auth_rec = grid.hub.authenticate_worker_key(auth_key)
+                        target_acc = auth_rec.worker_id
+                    except PermissionError:
+                        target_acc = auth_key
+                else:
+                    target_acc = qs.get("worker_id", [""])[0].strip() or "owner"
+                return self._send(200, grid.token_sink.get_staking_status(target_acc))
 
             if path == "/api/tokensink/stats":
                 total_burned = grid.token_sink.total_deflationary_burned_credits if getattr(grid, "token_sink", None) else 0

@@ -795,6 +795,79 @@ class TestSecurityAudit50(unittest.TestCase):
                 hub.register_worker("subnet-worker-6", url="local", public_ip=f"{subnet_ip_base}6", hardware_uuid="uuid-6")
             self.assertIn("Anti-Sybil Subnet Guard", str(ctx_sybil.exception))
 
+            # --- Phase A: B1 & B5 Endpoint Authentication Guards ---
+            w_victim = hub.register_worker("victim-worker-1", url="local", initial_credits=50)
+
+            # B1: Unauthenticated pull_task cannot steal victim's task (401)
+            hub.enqueue_nat_task("victim-worker-1", "data_analysis", {"series": [10, 20, 30]})
+            req_pull_unauth = urllib.request.Request(f"{base_url}/api/worker/pull_task?worker_id=victim-worker-1")
+            with self.assertRaises(urllib.error.HTTPError) as ctx_p1:
+                urllib.request.urlopen(req_pull_unauth, timeout=5)
+            self.assertEqual(ctx_p1.exception.code, 401)
+
+            # B1: Authenticated worker can pull their own task
+            req_pull_auth = urllib.request.Request(
+                f"{base_url}/api/worker/pull_task?worker_id=victim-worker-1",
+                headers={"X-Worker-Key": w_victim.key},
+            )
+            with urllib.request.urlopen(req_pull_auth, timeout=5) as resp_p_auth:
+                p_data = json.loads(resp_p_auth.read().decode("utf-8"))
+                self.assertTrue(p_data["ok"])
+                self.assertEqual(len(p_data["pending_tasks"]), 1)
+
+            # B5: Unauthenticated GET on my_trades, staking/status, supercomputer/instances is 401
+            for unauth_path in [
+                "/api/p2p/my_trades?worker_id=victim-worker-1",
+                "/api/staking/status?worker_id=victim-worker-1",
+                "/api/supercomputer/instances?worker_id=victim-worker-1",
+                "/api/brain/worker_deltas?worker_id=victim-worker-1",
+            ]:
+                with self.assertRaises(urllib.error.HTTPError) as ctx_ep:
+                    urllib.request.urlopen(f"{base_url}{unauth_path}", timeout=5)
+                self.assertEqual(ctx_ep.exception.code, 401, f"Path {unauth_path} should be 401 unauthorized")
+
+            # --- Phase A: B3 Weak Verifier Hardening ---
+            # 1. data_analysis without numbers or with fake mean is REJECTED
+            t_no_num = hub.create_signed_task("victim-worker-1", "data_analysis", {"prompt": "fake task without numbers"})
+            fake_da_res = {"status": "OK", "mean": 42.0}
+            from sovereign_mesh.hub_spoke import compute_hmac
+            proof_da = compute_hmac(w_victim.key, {
+                "task_id": t_no_num["task_id"],
+                "worker_id": "victim-worker-1",
+                "feature": "data_analysis",
+                "nonce": t_no_num["nonce"],
+                "result": fake_da_res,
+            })
+            settle_da = hub.verify_and_settle({
+                "task_id": t_no_num["task_id"],
+                "worker_id": "victim-worker-1",
+                "feature": "data_analysis",
+                "result": fake_da_res,
+                "worker_proof": proof_da,
+            })
+            self.assertFalse(settle_da["ok"])
+            self.assertIn(settle_da["status"], ("REJECTED", "SLASHED"))
+
+            # 2. trend_forecasting with fake trend inverted from actual regression slope is REJECTED or SLASHED
+            t_trend = hub.create_signed_task("victim-worker-1", "trend_forecasting", {"series": [100.0, 80.0, 60.0, 40.0]})
+            fake_trend_res = {"status": "OK", "trend": "UP"}  # Actual slope is -20.0 (DOWNWARD)
+            proof_trend = compute_hmac(w_victim.key, {
+                "task_id": t_trend["task_id"],
+                "worker_id": "victim-worker-1",
+                "feature": "trend_forecasting",
+                "nonce": t_trend["nonce"],
+                "result": fake_trend_res,
+            })
+            settle_trend = hub.verify_and_settle({
+                "task_id": t_trend["task_id"],
+                "worker_id": "victim-worker-1",
+                "feature": "trend_forecasting",
+                "result": fake_trend_res,
+                "worker_proof": proof_trend,
+            })
+            self.assertFalse(settle_trend["ok"])
+            self.assertIn(settle_trend["status"], ("REJECTED", "SLASHED"))
+
         finally:
             srv.shutdown()
             srv.server_close()
