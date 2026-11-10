@@ -81,6 +81,79 @@ def compute_cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
     return max(-1.0, min(1.0, dot / (math.sqrt(norm_a_sq) * math.sqrt(norm_b_sq))))
 
 
+_STOPWORDS: Set[str] = {
+    # English common grammatical / function words
+    "the", "a", "an", "is", "are", "was", "were", "and", "or", "but", "in", "on", "at",
+    "to", "for", "of", "with", "by", "as", "from", "that", "this", "it", "its", "be",
+    "have", "has", "had", "do", "does", "did", "can", "could", "will", "would", "shall",
+    "should", "may", "might", "must", "they", "them", "their", "we", "us", "our", "you",
+    "your", "he", "him", "his", "she", "her", "i", "me", "my", "so", "than", "then",
+    "there", "here", "when", "where", "why", "how", "all", "any", "both", "each", "few",
+    "more", "most", "other", "some", "such", "no", "nor", "not", "only", "own", "same",
+    "too", "very", "about", "above", "after", "again", "against", "between", "into",
+    "through", "during", "before", "under", "below", "up", "down", "over", "just",
+    "what", "which", "who", "whom", "these", "those", "am", "been", "being",
+    # Roman Urdu common function words
+    "hai", "hain", "ke", "ki", "ko", "se", "par", "ka", "kya", "ye", "woh", "aur",
+    "bhi", "tha", "thi", "the", "kar", "karna", "hoti", "hota", "hote", "mein", "main",
+    "ab", "jab", "tab", "kuch", "apne", "apna", "apni", "humein", "unhein", "unka",
+}
+CONSENSUS_BUFFER_TTL = 300.0  # Seconds before unverified freeform candidate entries expire
+
+
+def extract_content_tokens(text: str) -> List[str]:
+    """Extracts meaningful, non-stopword content tokens from response text."""
+    raw = re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", (text or "").lower())
+    return [t for t in raw if t not in _STOPWORDS and not t.isdigit()]
+
+
+def compute_content_cosine_similarity(text1: str, text2: str) -> float:
+    """Computes exact cosine similarity over substantive content word vectors."""
+    t1 = extract_content_tokens(text1)
+    t2 = extract_content_tokens(text2)
+    if len(t1) < 4 or len(t2) < 4:
+        return 0.0
+
+    from collections import Counter
+    vec1 = Counter(t1)
+    vec2 = Counter(t2)
+    all_keys = set(vec1.keys()) | set(vec2.keys())
+
+    dot = sum(vec1.get(k, 0) * vec2.get(k, 0) for k in all_keys)
+    norm1_sq = sum(v * v for v in vec1.values())
+    norm2_sq = sum(v * v for v in vec2.values())
+    if norm1_sq <= 1e-12 or norm2_sq <= 1e-12:
+        return 0.0
+    return dot / (math.sqrt(norm1_sq) * math.sqrt(norm2_sq))
+
+
+def _is_independent_peer(w1: WorkerNodeRecord, w2: WorkerNodeRecord) -> bool:
+    """Verifies that two workers are genuinely independent nodes (Anti-Sybil Separation)."""
+    if not w1 or not w2:
+        return False
+    if w1.worker_id == w2.worker_id:
+        return False
+    if w1.hardware_uuid and w2.hardware_uuid and w1.hardware_uuid == w2.hardware_uuid:
+        return False
+    ip1 = (getattr(w1, "public_ip", "") or "").strip()
+    ip2 = (getattr(w2, "public_ip", "") or "").strip()
+    local_hosts = {"", "local", "127.0.0.1", "localhost", "::1"}
+    if ip1 not in local_hosts and ip2 not in local_hosts:
+        if ip1 == ip2:
+            return False
+        # Check /24 IPv4 subnet
+        sub1 = ".".join(ip1.split(".")[:3]) if "." in ip1 else ip1
+        sub2 = ".".join(ip2.split(".")[:3]) if "." in ip2 else ip2
+        if sub1 == sub2:
+            return False
+    # Check referral collusion
+    if getattr(w1, "referred_by", "") and w1.referred_by == w2.worker_id:
+        return False
+    if getattr(w2, "referred_by", "") and w2.referred_by == w1.worker_id:
+        return False
+    return True
+
+
 def _comparable(result: Any) -> Any:
     if isinstance(result, dict):
         return {k: v for k, v in result.items() if k not in _VOLATILE_KEYS}
@@ -908,6 +981,14 @@ class MasterHubCoordinator:
                 sanitized_pulled.append(w_pkt)
             return sanitized_pulled
 
+    def _prune_consensus_buffer(self) -> None:
+        """Removes expired entries from the freeform consensus buffer (TTL = 300s)."""
+        now = time.time()
+        with self._lock:
+            expired = [k for k, v in self._freeform_consensus.items() if (now - float(v.get("created_at", now))) > CONSENSUS_BUFFER_TTL]
+            for k in expired:
+                self._freeform_consensus.pop(k, None)
+
     def _reject(self, worker: Optional[WorkerNodeRecord], reason: str) -> dict:
         if worker:
             worker.rejected_packets += 1
@@ -1067,9 +1148,14 @@ class MasterHubCoordinator:
                     verified = True
                 else:
                     return self._reject(worker, f"schema_verification_failed: {v_res.get('error')}")
-            elif (t_payload.get("prompt") or t_payload.get("query")) and out_text and len(out_text) >= 10:
+            elif (t_payload.get("prompt") or t_payload.get("query")) and out_text:
                 # Darja 2: Free-form Redundant Multi-Worker Consensus Verification
+                self._prune_consensus_buffer()
                 prompt_str = str(t_payload.get("prompt") or t_payload.get("query") or "").strip()
+                out_tokens = extract_content_tokens(out_text)
+                if len(out_tokens) < 4:
+                    return self._reject(worker, "low_content_entropy_rejected (response lacks substantive content words)")
+
                 consensus_key = str(t_payload.get("consensus_id") or hashlib.sha256(prompt_str.encode("utf-8")).hexdigest()[:16])
                 existing = self._freeform_consensus.get(consensus_key)
 
@@ -1081,6 +1167,7 @@ class MasterHubCoordinator:
                         "output": out_text,
                         "worker": worker,
                         "funded_by": task.get("funded_by", ""),
+                        "funded_credits": int(task.get("funded_credits") or 0),
                         "task": task,
                         "created_at": time.time(),
                     }
@@ -1091,24 +1178,32 @@ class MasterHubCoordinator:
                         "worker_id": worker.worker_id,
                         "message": "Result held for independent multi-worker consensus verification",
                     }
-                elif existing["worker_id"] != worker.worker_id:
-                    # Second independent worker submitted. Check semantic / keyword similarity between both outputs.
-                    first_text = existing["output"].lower()
-                    second_text = out_text.lower()
+                else:
+                    w1 = existing["worker"]
+                    w2 = worker
 
-                    words1 = set(re.findall(r"\w+", first_text))
-                    words2 = set(re.findall(r"\w+", second_text))
-                    jaccard = len(words1 & words2) / max(1, len(words1 | words2))
-                    len_ratio = min(len(first_text), len(second_text)) / max(len(first_text), len(second_text))
+                    # Anti-Sybil Check: Ensure workers are from independent nodes and subnets
+                    if not _is_independent_peer(w1, w2):
+                        return self._reject(worker, "sybil_consensus_attempt_blocked (consensus peer must be an independent node)")
 
-                    # Substantial lexical/topical overlap & comparable length
-                    if (jaccard >= 0.15 or len(words1 & words2) >= 3) and len_ratio >= 0.25:
-                        # Consensus reached! Settle the first worker retrospectively
-                        w1 = existing["worker"]
+                    # Check semantic cosine similarity on content words
+                    cos_sim = compute_content_cosine_similarity(existing["output"], out_text)
+                    tokens1 = set(extract_content_tokens(existing["output"]))
+                    tokens2 = set(out_tokens)
+                    shared_count = len(tokens1 & tokens2)
+                    len_ratio = min(len(existing["output"]), len(out_text)) / max(len(existing["output"]), len(out_text))
+
+                    # Substantial semantic content agreement (cosine >= 0.35, >=3 shared substantive words, balanced length)
+                    if cos_sim >= 0.35 and shared_count >= 3 and len_ratio >= 0.30:
+                        # Consensus verified! Settle both workers without minting unbacked credits
+                        reward_pool = int(existing.get("funded_credits") or 0)
+                        # Zero-sum distribution: divide funded escrow pool between consensus workers
+                        reward_each = max(0, reward_pool // 2) if reward_pool > 0 else 0
+
                         if w1.status != "SLASHED":
                             with self._lock:
-                                reward_credits = int(task.get("funded_credits") or 25)
-                                w1.credits += reward_credits
+                                if reward_each > 0:
+                                    w1.credits += reward_each
                                 w1.tasks_completed += 1
                                 w1.tasks_verified += 1
                                 if self.ledger:
@@ -1116,18 +1211,22 @@ class MasterHubCoordinator:
                                         "worker_id": w1.worker_id,
                                         "task_id": existing["task_id"],
                                         "feature": task["feature"],
-                                        "credits_awarded": reward_credits,
+                                        "credits_awarded": reward_each,
                                         "new_balance": w1.credits,
                                         "funded_by": existing.get("funded_by", ""),
                                         "consensus": True,
+                                        "consensus_peer": w2.worker_id,
                                     })
                                 self._flush()
                                 if existing["task_id"] in self._nat_task_events:
                                     self._nat_task_events[existing["task_id"]].set()
+
+                        # Configure candidate worker reward
+                        task["funded_credits"] = reward_each
                         verified = True
                         self._freeform_consensus.pop(consensus_key, None)
                     else:
-                        # Divergent / discordant outputs: reject candidate
+                        # Divergent or fraudulent output
                         return self._reject(worker, "consensus_semantic_divergence_rejected")
 
         # Cryptographic Proof-of-Neural-Work Cosine Similarity Verification on LoRA Gradients

@@ -821,6 +821,7 @@ class TestSecurityAudit50(unittest.TestCase):
                 "/api/staking/status?worker_id=victim-worker-1",
                 "/api/supercomputer/instances?worker_id=victim-worker-1",
                 "/api/brain/worker_deltas?worker_id=victim-worker-1",
+                "/api/brain/worker_deltas",  # Raw GET without query params must also be 401
             ]:
                 with self.assertRaises(urllib.error.HTTPError) as ctx_ep:
                     urllib.request.urlopen(f"{base_url}{unauth_path}", timeout=5)
@@ -1053,6 +1054,49 @@ class TestSecurityAudit50(unittest.TestCase):
             # Worker 2 submission completes consensus: both workers settled
             self.assertTrue(settle_ff2["ok"])
             self.assertEqual(settle_ff2["status"], "SETTLED")
+
+            # 6. Low-entropy stopword salad ("the and is of...") is REJECTED
+            t_salad = hub.create_signed_task(
+                "eval-worker-1",
+                "brain_inference",
+                {"prompt": "Explain quantum entanglement in simple terms", "consensus_id": "salad-test-1"},
+            )
+            proof_salad = compute_hmac(w_eval.key, {
+                "task_id": t_salad["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "nonce": t_salad["nonce"],
+                "result": {"status": "OK", "output": "the and is of with by from that this it"},
+            })
+            settle_salad = hub.verify_and_settle({
+                "task_id": t_salad["task_id"],
+                "worker_id": "eval-worker-1",
+                "feature": "brain_inference",
+                "result": {"status": "OK", "output": "the and is of with by from that this it"},
+                "worker_proof": proof_salad,
+            })
+            self.assertFalse(settle_salad["ok"])
+            self.assertEqual(settle_salad["status"], "REJECTED")
+            self.assertIn("low_content_entropy_rejected", settle_salad["reason"])
+
+            # 7. Sybil workers on the same /24 subnet cannot collude to settle freeform consensus
+            w_sybil_a = hub.register_worker("sybil-worker-a", url="local", public_ip="203.0.113.10", hardware_uuid="uuid-a", initial_credits=50)
+            w_sybil_b = hub.register_worker("sybil-worker-b", url="local", public_ip="203.0.113.25", hardware_uuid="uuid-b", initial_credits=50)
+            t_syb_1 = hub.create_signed_task("sybil-worker-a", "brain_inference", {"prompt": "Define photosynthesis", "consensus_id": "syb-cons-1"})
+            t_syb_2 = hub.create_signed_task("sybil-worker-b", "brain_inference", {"prompt": "Define photosynthesis", "consensus_id": "syb-cons-1"})
+            syb_answer = "Photosynthesis is the process by which green plants transform sunlight energy into chemical energy."
+            p_syb_1 = compute_hmac(w_sybil_a.key, {"task_id": t_syb_1["task_id"], "worker_id": "sybil-worker-a", "feature": "brain_inference", "nonce": t_syb_1["nonce"], "result": {"status": "OK", "output": syb_answer}})
+            p_syb_2 = compute_hmac(w_sybil_b.key, {"task_id": t_syb_2["task_id"], "worker_id": "sybil-worker-b", "feature": "brain_inference", "nonce": t_syb_2["nonce"], "result": {"status": "OK", "output": syb_answer}})
+
+            settle_syb_1 = hub.verify_and_settle({"task_id": t_syb_1["task_id"], "worker_id": "sybil-worker-a", "feature": "brain_inference", "result": {"status": "OK", "output": syb_answer}, "worker_proof": p_syb_1})
+            self.assertTrue(settle_syb_1["ok"])
+            self.assertEqual(settle_syb_1["status"], "PENDING_CONSENSUS")
+
+            # Second sybil on same subnet tries to settle: BLOCKED
+            settle_syb_2 = hub.verify_and_settle({"task_id": t_syb_2["task_id"], "worker_id": "sybil-worker-b", "feature": "brain_inference", "result": {"status": "OK", "output": syb_answer}, "worker_proof": p_syb_2})
+            self.assertFalse(settle_syb_2["ok"])
+            self.assertEqual(settle_syb_2["status"], "REJECTED")
+            self.assertIn("sybil_consensus_attempt_blocked", settle_syb_2["reason"])
 
             # --- Phase A: B5 Redactions Verification ---
             req_learn = urllib.request.Request(f"{base_url}/api/learning/status")

@@ -10,7 +10,13 @@
 | `/api/tokensink/stats` | GET | Public | None | Deflationary metrics (burned tokens, lottery pool) |
 | `/api/worker/download` | GET | Public | None | Download worker client script (`nexus_worker.py`) |
 | `/api/worker/ota_check` | GET | Public | Cryptographic HMAC | Worker version check & OTA hash signature |
+| `/api/worker/update_check` | GET | Public | Cryptographic HMAC | Alias for `/api/worker/ota_check` |
 | `/api/worker/ota_download` | GET | Public | Cryptographic HMAC | Worker code download with pinned signature |
+| `/api/worker/latest_script` | GET | Public | Cryptographic HMAC | Alias for `/api/worker/ota_download` |
+| `/api/brain/safetensors` | GET | Public | None | Public download of open Safetensors model shard weights |
+| `/api/crypto/quantum_spec` | GET | Public | None | Public cryptographic specification (HSQK-4096 params) |
+| `/api/machines` | GET | Public (Redacted) | None / Owner for raw | Physical machine status (IP/port targets redacted unless owner) |
+| `/api/p2p/leaderboard` | GET | Public | None | Alias for `/api/leaderboard` |
 | `/api/tunnel/status` | GET | Public (Redacted) | None / Owner for raw | Cloudflare tunnel status (`github_gist_id` redacted unless owner) |
 | `/api/tunnel/bootstrap` | GET | Public (Redacted) | None / Owner for raw | Anchor bootstrap payload (`github_gist_id` redacted unless owner) |
 | `/api/learning/status` | GET | Public (Redacted) | None / Owner for raw | Continuous learning state (Host local paths redacted unless owner) |

@@ -571,13 +571,14 @@ def make_handler(grid, client):
                     or qs.get("account_key", [""])[0].strip()
                 )
                 is_owner = self._auth_ok()
-                if wid and not is_owner:
+                if not is_owner:
                     if not auth_key:
-                        return self._send(401, {"ok": False, "error": "unauthorized: querying per-worker deltas requires worker authentication"})
+                        return self._send(401, {"ok": False, "error": "unauthorized: querying worker deltas requires authentication (X-Worker-Key or session)"})
                     try:
                         auth_rec = grid.hub.authenticate_worker_key(auth_key)
-                        if auth_rec.worker_id != wid:
+                        if wid and auth_rec.worker_id != wid:
                             return self._send(403, {"ok": False, "error": "forbidden: cannot query deltas for another worker"})
+                        wid = auth_rec.worker_id
                     except PermissionError as p_err:
                         return self._send(401, {"ok": False, "error": str(p_err)})
 
