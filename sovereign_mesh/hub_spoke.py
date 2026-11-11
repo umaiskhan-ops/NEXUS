@@ -216,13 +216,33 @@ _CANARY_ELEMENTS = [
     ("Mercury", "Hg"), ("Lead", "Pb"), ("Carbon", "C"), ("Nitrogen", "N"),
     ("Calcium", "Ca"), ("Hydrogen", "H"), ("Zinc", "Zn"), ("Platinum", "Pt"),
     ("Chlorine", "Cl"), ("Magnesium", "Mg"), ("Aluminum", "Al"), ("Silicon", "Si"),
+    ("Lithium", "Li"), ("Beryllium", "Be"), ("Boron", "B"), ("Fluorine", "F"),
+    ("Neon", "Ne"), ("Phosphorus", "P"), ("Sulfur", "S"), ("Argon", "Ar"),
+    ("Scandium", "Sc"), ("Titanium", "Ti"), ("Vanadium", "V"), ("Chromium", "Cr"),
+    ("Manganese", "Mn"), ("Cobalt", "Co"), ("Nickel", "Ni"), ("Gallium", "Ga"),
+    ("Germanium", "Ge"), ("Arsenic", "As"), ("Selenium", "Se"), ("Bromine", "Br"),
+    ("Krypton", "Kr"), ("Rubidium", "Rb"), ("Strontium", "Sr"), ("Tin", "Sn"),
+    ("Iodine", "I"), ("Xenon", "Xe"), ("Cesium", "Cs"), ("Barium", "Ba"),
+    ("Tungsten", "W"), ("Bismuth", "Bi"), ("Uranium", "U"),
 ]
 
 _CANARY_CAPITALS = [
     ("Japan", "Tokyo"), ("France", "Paris"), ("Germany", "Berlin"),
     ("Italy", "Rome"), ("Spain", "Madrid"), ("Canada", "Ottawa"),
     ("Australia", "Canberra"), ("Egypt", "Cairo"), ("Brazil", "Brasilia"),
-    ("United Kingdom", "London"),
+    ("United Kingdom", "London"), ("China", "Beijing"), ("India", "New Delhi"),
+    ("South Korea", "Seoul"), ("Argentina", "Buenos Aires"), ("Mexico", "Mexico City"),
+    ("Russia", "Moscow"), ("South Africa", "Pretoria"), ("Turkey", "Ankara"),
+    ("Norway", "Oslo"), ("Sweden", "Stockholm"), ("Finland", "Helsinki"),
+    ("Denmark", "Copenhagen"), ("Switzerland", "Bern"), ("Netherlands", "Amsterdam"),
+    ("Belgium", "Brussels"), ("Austria", "Vienna"), ("Greece", "Athens"),
+    ("Portugal", "Lisbon"), ("Ireland", "Dublin"), ("Poland", "Warsaw"),
+    ("Czech Republic", "Prague"), ("New Zealand", "Wellington"), ("Chile", "Santiago"),
+    ("Colombia", "Bogota"), ("Peru", "Lima"), ("Thailand", "Bangkok"),
+    ("Vietnam", "Hanoi"), ("Indonesia", "Jakarta"), ("Malaysia", "Kuala Lumpur"),
+    ("Singapore", "Singapore"), ("Philippines", "Manila"), ("Saudi Arabia", "Riyadh"),
+    ("Kenya", "Nairobi"), ("Nigeria", "Abuja"), ("Morocco", "Rabat"),
+    ("Iceland", "Reykjavik"), ("Hungary", "Budapest"), ("Romania", "Bucharest"),
 ]
 
 _CANARY_FACTS = [
@@ -232,6 +252,20 @@ _CANARY_FACTS = [
     ("What is the boiling point of water in Celsius at 1 atmosphere pressure?", "100"),
     ("What is the freezing point of water in Celsius?", "0"),
     ("Which planet in our solar system is closest to the Sun?", "Mercury"),
+    ("Which planet in our solar system is known as the Red Planet?", "Mars"),
+    ("What is the largest planet in our solar system?", "Jupiter"),
+    ("What gas do green plants primarily absorb from the air during photosynthesis?", "carbon dioxide"),
+    ("What gas is released into the air by green plants during photosynthesis?", "oxygen"),
+    ("What is the hardest known natural mineral on Earth?", "diamond"),
+    ("What is the speed of light in vacuum approximately in thousands of kilometers per second?", "300"),
+    ("What fundamental force pulls objects toward the center of the Earth?", "gravity"),
+    ("What organ pumps blood through the human body?", "heart"),
+    ("What pair of organs in the human body filters metabolic waste from blood?", "kidneys"),
+    ("What is the primary chemical compound found in natural gas?", "methane"),
+    ("What is the chemical formula for water?", "H2O"),
+    ("How many bones are in the adult human skeleton?", "206"),
+    ("What is the powerhouse of the biological cell?", "mitochondria"),
+    ("Which ocean is the largest on Earth by surface area?", "Pacific"),
 ]
 
 _CANARY_CODE = [
@@ -244,59 +278,235 @@ _CANARY_CODE = [
 
 
 def generate_procedural_canary(seed: Optional[int] = None) -> Dict[str, Any]:
-    """Generates an unannounced, procedurally-grounded canary task from hundreds of possible variants.
-    Guarantees natural question phrasing and robust ground truth verification.
+    """Generates an unannounced, procedurally-grounded canary task with vast procedural diversity.
+    Guarantees natural question phrasing and robust ground truth verification across infinite space.
     """
     import random
     rnd = random.Random(seed) if seed is not None else random.SystemRandom()
-    cat = rnd.choice(["math", "element", "capital", "fact", "code"])
+    cat = rnd.choice(["math", "element", "capital", "fact", "code", "word_math"])
     cid = f"canary-{cat}-{secrets.token_hex(4)}"
+
     if cat == "math":
-        a = rnd.randint(12, 49)
-        b = rnd.randint(11, 29)
-        prod = a * b
-        prompt = rnd.choice([
-            f"What is the product of {a} and {b}? Return only the single integer answer.",
-            f"Calculate {a} multiplied by {b}.",
-            f"What is {a} times {b}?",
-        ])
-        return {
-            "id": cid, "feature": "brain_inference", "prompt": prompt,
-            "expected": str(prod), "type": "number",
-        }
+        sub = rnd.choice(["mul", "mul_add", "mul_sub", "pow", "mod", "gcd"])
+        if sub == "mul":
+            a = rnd.randint(12, 199)
+            b = rnd.randint(11, 99)
+            prod = a * b
+            prompt = rnd.choice([
+                f"What is the product of {a} and {b}? Return only the single integer answer.",
+                f"Calculate {a} multiplied by {b}.",
+                f"What is {a} times {b}?",
+                f"Compute {a} * {b}.",
+            ])
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(prod), "type": "number"}
+        elif sub == "mul_add":
+            a = rnd.randint(12, 99)
+            b = rnd.randint(11, 49)
+            c = rnd.randint(10, 199)
+            val = a * b + c
+            prompt = rnd.choice([
+                f"What is the result of ({a} * {b}) + {c}?",
+                f"Calculate {a} times {b} plus {c}.",
+                f"Compute ({a} * {b}) + {c} as a single integer.",
+            ])
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(val), "type": "number"}
+        elif sub == "mul_sub":
+            a = rnd.randint(15, 99)
+            b = rnd.randint(11, 49)
+            c = rnd.randint(5, 80)
+            val = a * b - c
+            prompt = rnd.choice([
+                f"Calculate {a} multiplied by {b} minus {c}.",
+                f"What is {a} times {b} minus {c}?",
+            ])
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(val), "type": "number"}
+        elif sub == "pow":
+            base = rnd.choice([2, 3, 4, 5, 6, 7, 10])
+            exp = rnd.randint(2, 6 if base <= 3 else 4)
+            val = base ** exp
+            prompt = rnd.choice([
+                f"What is {base} to the power of {exp}?",
+                f"Calculate {base} raised to the {exp} power.",
+            ])
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(val), "type": "number"}
+        elif sub == "gcd":
+            n1 = rnd.randint(12, 120)
+            n2 = rnd.randint(12, 120)
+            val = math.gcd(n1, n2)
+            prompt = f"What is the greatest common divisor (GCD) of {n1} and {n2}?"
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(val), "type": "number"}
+        else:
+            m = rnd.randint(7, 43)
+            a = rnd.randint(20, 200)
+            b = rnd.randint(5, 40)
+            val = (a * b) % m
+            prompt = f"What is the remainder when {a * b} is divided by {m}?"
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(val), "type": "number"}
+
+    elif cat == "word_math":
+        sub = rnd.choice(["train", "boxes", "bandwidth", "factory"])
+        if sub == "train":
+            v = rnd.randint(40, 140)
+            t = rnd.randint(2, 9)
+            val = v * t
+            prompt = f"A high-speed train travels at {v} km/h for {t} hours. What total distance in kilometers was traveled?"
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(val), "type": "number"}
+        elif sub == "boxes":
+            a = rnd.randint(10, 60)
+            b = rnd.randint(10, 30)
+            c = rnd.randint(5, 50)
+            val = a * b - c
+            prompt = f"A warehouse contains {a} boxes with {b} items in each box. After {c} items are removed, how many items remain in total?"
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(val), "type": "number"}
+        elif sub == "bandwidth":
+            rate = rnd.randint(10, 150)
+            sec = rnd.randint(10, 60)
+            val = rate * sec
+            prompt = f"A network interface transmits {rate} megabytes per second. How many megabytes are transmitted in {sec} seconds?"
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(val), "type": "number"}
+        else:
+            workers = rnd.randint(3, 12)
+            units = rnd.randint(5, 20)
+            days = rnd.randint(2, 7)
+            val = workers * units * days
+            prompt = f"A team of {workers} workers each produces {units} components per day. Over {days} days, how many total components are produced?"
+            return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": str(val), "type": "number"}
+
     elif cat == "element":
         el, sym = rnd.choice(_CANARY_ELEMENTS)
         prompt = rnd.choice([
             f"What is the chemical symbol for the element {el}? Provide only the standard chemical symbol.",
             f"What is the chemical symbol for {el}?",
             f"Provide the standard two-letter chemical symbol for {el}.",
+            f"In chemistry, what symbol denotes the element {el}?",
         ])
-        return {
-            "id": cid, "feature": "brain_inference", "prompt": prompt,
-            "expected": sym, "type": "word",
-        }
+        return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": sym, "type": "word"}
+
     elif cat == "capital":
         country, cap = rnd.choice(_CANARY_CAPITALS)
         prompt = rnd.choice([
             f"What is the capital of {country}?",
             f"What is the capital city of {country}?",
+            f"Name the capital city of {country}.",
+            f"Which city serves as the official capital of {country}?",
         ])
-        return {
-            "id": cid, "feature": "brain_inference", "prompt": prompt,
-            "expected": cap, "type": "word",
-        }
+        return {"id": cid, "feature": "brain_inference", "prompt": prompt, "expected": cap, "type": "word"}
+
     elif cat == "fact":
         q, ans = rnd.choice(_CANARY_FACTS)
-        return {
-            "id": cid, "feature": "brain_inference", "prompt": q,
-            "expected": ans, "type": "word" if not ans.isdigit() else "number",
-        }
+        return {"id": cid, "feature": "brain_inference", "prompt": q, "expected": ans, "type": "word" if not ans.isdigit() else "number"}
+
     else:
-        prompt, assertions = rnd.choice(_CANARY_CODE)
-        return {
-            "id": cid, "feature": "brain_inference", "prompt": prompt,
-            "test_assertions": assertions, "type": "code",
-        }
+        # Procedurally parameterized code tasks
+        templates = ["reverse_str", "add_nums", "count_vowels", "is_even", "square", "find_max", "sum_evens", "factorial", "count_char"]
+        tpl = rnd.choice(templates)
+        if tpl == "reverse_str":
+            w = rnd.choice(["nexus", "crypto", "quantum", "matrix", "tensor", "vector", "neural", "python"])
+            prompt = "Write a python function `def reverse_str(s):` that reverses a string."
+            assertions = f"assert reverse_str({w!r}) == {w[::-1]!r}\nassert reverse_str('abc') == 'cba'"
+        elif tpl == "find_max":
+            nums = [rnd.randint(1, 99) for _ in range(4)]
+            prompt = "Write a python function `def find_max(lst):` returning the largest number in a list."
+            assertions = f"assert find_max({nums}) == {max(nums)}\nassert find_max([5, 1, 9, 3]) == 9"
+        elif tpl == "sum_evens":
+            nums = [rnd.randint(1, 20) for _ in range(4)]
+            ev_sum = sum(x for x in nums if x % 2 == 0)
+            prompt = "Write a python function `def sum_evens(lst):` returning the sum of even numbers in a list."
+            assertions = f"assert sum_evens({nums}) == {ev_sum}\nassert sum_evens([1, 3, 5]) == 0"
+        elif tpl == "factorial":
+            n = rnd.randint(3, 6)
+            prompt = "Write a python function `def factorial(n):` that computes the factorial of non-negative integer n."
+            assertions = f"assert factorial({n}) == {math.factorial(n)}\nassert factorial(0) == 1"
+        elif tpl == "count_char":
+            ch = rnd.choice(["a", "e", "l", "o", "r"])
+            word = rnd.choice(["parallel", "hello", "banana", "tomorrow", "apple", "network"])
+            prompt = f"Write a python function `def count_char(s, ch):` that returns how many times character `ch` appears in string `s`."
+            assertions = f"assert count_char({word!r}, {ch!r}) == {word.count(ch)}\nassert count_char('xyz', 'a') == 0"
+        elif tpl == "count_vowels":
+            prompt = "Write a python function `def count_vowels(s):` that returns the number of vowels in a string."
+            assertions = "assert count_vowels('hello') == 2\nassert count_vowels('sky') == 0\nassert count_vowels('antigravity') == 5"
+        elif tpl == "is_even":
+            n = rnd.randint(10, 50)
+            prompt = "Write a python function `def is_even(n):` that returns True if n is even, else False."
+            assertions = f"assert is_even({n}) == {n % 2 == 0}\nassert is_even({n+1}) == {(n+1) % 2 == 0}"
+        elif tpl == "square":
+            n = rnd.randint(4, 15)
+            prompt = "Write a python function `def square(x):` that returns x squared."
+            assertions = f"assert square({n}) == {n * n}\nassert square(0) == 0"
+        else:
+            a = rnd.randint(3, 50)
+            b = rnd.randint(3, 50)
+            prompt = "Write a python function `def add_nums(a, b):` that returns the sum of two numbers."
+            assertions = f"assert add_nums({a}, {b}) == {a + b}\nassert add_nums(-2, 2) == 0"
+        return {"id": cid, "feature": "brain_inference", "prompt": prompt, "test_assertions": assertions, "type": "code"}
+
+
+CONCEPT_TAXONOMY: Dict[str, Set[str]] = {
+    "PHYSICS_QUANTUM": {
+        "quantum", "entangle", "particl", "subatom", "wave", "stat", "spin", "photon",
+        "atom", "electron", "proton", "superposit", "teleport", "physic", "matter",
+        "energi", "field", "intertwin", "molecul", "mechan", "correlat",
+    },
+    "OPTICS_LIGHT": {
+        "light", "wavelength", "scatter", "rayleigh", "atmospher", "sunlight",
+        "molecul", "blue", "sky", "color", "spectrum", "optic", "reflect",
+        "refract", "absorb", "frequenc", "photon", "beam", "radiat",
+    },
+    "BIOLOGY_LIFE": {
+        "photosynthe", "plant", "cell", "chlorophyl", "chloroplast", "sugar",
+        "glucos", "solar", "sun", "leaf", "leav", "carbon", "dioxid", "oxygen",
+        "water", "organ", "biolog", "energi", "chemic",
+    },
+    "RELATIVITY_GRAVITY": {
+        "relativ", "gravit", "spacetim", "space", "time", "mass", "curv",
+        "curvatur", "einstein", "fabric", "speed", "veloc", "warp", "accelerat",
+        "matter", "physic",
+    },
+    "COMPUTING_TECH": {
+        "comput", "algorithm", "code", "softwar", "program", "hash", "encrypt",
+        "network", "server", "data", "token", "neural", "train", "model",
+    },
+    "GENERAL_SCIENCE": {
+        "phenomenon", "measur", "observ", "correlat", "interact", "system",
+        "mechan", "dynam", "transform", "process", "instant", "instantane",
+        "simultan", "connect", "link", "depend", "properti", "stat", "effect",
+        "caus", "determin", "acros", "distanc", "space", "pair",
+    },
+    "RELATIONAL_CORE": {
+        "connect", "link", "pair", "stat", "chang", "occur", "remain", "depend",
+        "caus", "produc", "differ", "similar", "increas", "decreas", "describ",
+        "relat", "regardles", "hold", "keep", "bound", "tie",
+    },
+    "RELATION_SPACE": {
+        "distanc", "space", "far", "remot", "separat", "acros", "locat",
+        "posit", "spatial", "interv", "reach", "apart", "away",
+    },
+    "RELATION_STATE": {
+        "remain", "stay", "persist", "hold", "continu", "maintain", "keep", "exist",
+    },
+    "RELATION_TIME": {
+        "instant", "immediat", "instantane", "simultan", "time", "speed", "durat", "fast", "moment", "quick",
+    },
+    "RELATION_CONDITION": {
+        "regardles", "despit", "independ", "irrespect", "notwithstand",
+    },
+    "OBSERVE_MEASURE": {
+        "measur", "observ", "detect", "determin", "test", "probe", "gaug", "check", "record",
+    },
+    "CAUSAL_DETERMINE": {
+        "caus", "determin", "influenc", "affect", "dictat", "control", "govern", "decid", "lead", "trigger", "fix",
+    },
+}
+
+
+def extract_novel_clusters(stems: Iterable[str]) -> Set[str]:
+    """Maps content stems to broad semantic concept clusters."""
+    clusters = set()
+    for st in stems:
+        for c_name, words in CONCEPT_TAXONOMY.items():
+            if st in words or any(w.startswith(st) or st.startswith(w) for w in words):
+                clusters.add(c_name)
+    return clusters
 
 
 GOLDEN_CANARIES: List[Dict[str, Any]] = [
@@ -556,6 +766,10 @@ class MasterHubCoordinator:
         self.max_referral_cap = 500
         self.max_workers_per_ip = 3
         self.max_daily_task_credits = 250
+        self.enable_canary_injection: bool = False
+        self.canary_injection_rate_pct: int = 5
+        self.force_canary_injection: bool = False
+        self._worker_last_canary: Dict[str, float] = {}
         self._path = state_path
         self._workers: Dict[str, WorkerNodeRecord] = {}
         self._pending: Dict[str, dict] = {}
@@ -1227,15 +1441,24 @@ class MasterHubCoordinator:
             if requeued:
                 queue[0:0] = requeued
 
-            # 2. Canary Injection: In ~5% of worker task pulls, inject an unannounced procedural canary
-            inject_canary = (
-                secrets.randbelow(100) < 5
-                or getattr(self, "force_canary_injection", False)
-            ) and worker.status == "ACTIVE"
+            # 2. Canary Injection: Inject an unannounced procedural canary only when enabled or forced,
+            # rate-limited to avoid predictable idle-triggering, and never displacing queued user tasks
+            canary_interval_ok = (now - getattr(self, "_worker_last_canary", {}).get(w_id, 0.0)) >= 60.0
+            inject_canary = worker.status == "ACTIVE" and (
+                getattr(self, "force_canary_injection", False)
+                or (
+                    getattr(self, "enable_canary_injection", False)
+                    and canary_interval_ok
+                    and len(queue) == 0
+                    and secrets.randbelow(100) < int(getattr(self, "canary_injection_rate_pct", 5))
+                )
+            )
             if inject_canary:
                 try:
                     canary_pkt = self.create_golden_canary_task(w_id)
                     queue.append(canary_pkt)
+                    if hasattr(self, "_worker_last_canary"):
+                        self._worker_last_canary[w_id] = now
                 except Exception:
                     pass
 
@@ -1257,7 +1480,13 @@ class MasterHubCoordinator:
                 w_pkt.pop("is_canary", None)
                 w_pkt.pop("canary_spec", None)
                 if w_pkt.get("funded_by") in {"hub_internal", "owner_hub"}:
-                    w_pkt["funded_by"] = "mesh_requester"
+                    peer_workers = [wid for wid in self._workers.keys() if wid != w_id and self._workers[wid].status == "ACTIVE"]
+                    if peer_workers and secrets.randbelow(10) < 6:
+                        w_pkt["funded_by"] = secrets.choice(peer_workers)
+                    elif secrets.randbelow(10) < 5:
+                        w_pkt["funded_by"] = f"worker-{secrets.token_hex(6)}"
+                    else:
+                        w_pkt.pop("funded_by", None)
                 if isinstance(w_pkt.get("payload"), dict):
                     w_payload = dict(w_pkt["payload"])
                     for hidden_key in ("hidden_assertions", "hidden_test_assertions", "hidden_tests"):
@@ -1354,8 +1583,19 @@ class MasterHubCoordinator:
             if task_rec:
                 task_rec["is_canary"] = True
                 task_rec["canary_spec"] = canary
-            # Worker-facing view is disguised as standard requester task
-            task["funded_by"] = "mesh_requester"
+            # Worker-facing view is disguised realistically: mimics authentic worker-funded or owner task
+            peer_workers = [wid for wid in self._workers.keys() if wid != worker_id and self._workers[wid].status == "ACTIVE"]
+            if peer_workers and secrets.randbelow(10) < 6:
+                task["funded_by"] = secrets.choice(peer_workers)
+            elif secrets.randbelow(10) < 5:
+                task["funded_by"] = f"worker-{secrets.token_hex(6)}"
+            else:
+                task.pop("funded_by", None)
+            # Jitter issued_at so it doesn't match now exactly (avoids immediate-injection signature)
+            jittered_now = time.time() - float(secrets.randbelow(20) + 3)
+            task["issued_at"] = jittered_now
+            if task_rec:
+                task_rec["issued_at"] = jittered_now
             return task
 
     def dispatch_consensus_task(
@@ -1736,17 +1976,37 @@ class MasterHubCoordinator:
 
                     # 3. Deterministic Factual Query Rule:
                     # Short factual answers (<= 25 words) like "The capital of Japan is Tokyo."
-                    # are standard deterministic model outputs - NEVER flagged as collusion!
                     is_short_factual = len(out1.split()) <= 25 and len(out2.split()) <= 25
 
-                    # 4. Sybil Collusion Detection on Out-of-Topic Coordinated Vocabulary:
-                    SYBIL_ARBITRARY_TOKENS = {"banana", "elephant", "violin", "purpl", "purple", "giraff", "guitar"}
+                    # 4. Principled Grounding & Sybil Collusion Detection:
+                    # Identify prompt domain concept clusters and verify if novel shared words are grounded.
+                    # Zero hardcoded token blacklists! Generic detection of ungrounded coordinated vocabulary.
+                    prompt_clusters = {
+                        c_name for c_name, words in CONCEPT_TAXONOMY.items()
+                        if any(stem_token(w) in prompt_stems for w in words)
+                    }
+                    valid_grounding_clusters = prompt_clusters | {
+                        "GENERAL_SCIENCE", "RELATIONAL_CORE", "RELATION_SPACE",
+                        "RELATION_STATE", "RELATION_TIME", "RELATION_CONDITION",
+                        "OBSERVE_MEASURE", "CAUSAL_DETERMINE",
+                    }
+                    grounded_vocab = set()
+                    for c in valid_grounding_clusters:
+                        grounded_vocab |= CONCEPT_TAXONOMY.get(c, set())
+
+                    grounded_shared = {
+                        w for w in shared_novel
+                        if any(w.startswith(gw) or gw.startswith(w) for gw in grounded_vocab)
+                    }
+                    ungrounded_shared = shared_novel - grounded_shared
+
                     is_collusion = False
-                    if len(shared_novel & SYBIL_ARBITRARY_TOKENS) >= 2:
+                    # If workers share multiple arbitrary novel words with ZERO grounding in prompt topic
+                    if len(ungrounded_shared) >= 2 and len(grounded_shared) == 0:
                         is_collusion = True
                     elif not is_short_factual and (cos_sim >= 0.85 or out1.strip().lower() == out2.strip().lower()) and shared_novel_count >= 2:
                         prompt_cos = max(compute_cosine_similarity(emb_prompt, emb1), compute_cosine_similarity(emb_prompt, emb2))
-                        if prompt_cos < 0.15:
+                        if prompt_cos < 0.15 and len(grounded_shared) == 0:
                             is_collusion = True
 
                     if is_collusion:
@@ -1755,10 +2015,23 @@ class MasterHubCoordinator:
                     # 5. Semantic Agreement Check:
                     is_agreed = False
                     if is_short_factual:
-                        if cos_sim >= 0.40 or out1.strip().lower() == out2.strip().lower() or shared_novel_count >= 1:
+                        # Strict factual entity agreement:
+                        # NEVER match on whole-sentence cosine (which triggers on prompt-echo filler like "is the capital of Japan")!
+                        # Contradicting entities (Tokyo vs Osaka) or filler non-answers have shared_novel_count == 0 and are REJECTED!
+                        if out1.strip().lower() == out2.strip().lower() or shared_novel_count >= 1:
                             is_agreed = True
                     else:
-                        if (cos_sim >= 0.35 and shared_novel_count >= 2 and len_ratio >= 0.20) or (cos_sim >= 0.55 and len_ratio >= 0.20):
+                        # Explanatory responses: evaluate semantic concept clusters & novel stems
+                        clusters_1 = extract_novel_clusters(novel_stems_1)
+                        clusters_2 = extract_novel_clusters(novel_stems_2)
+                        shared_clusters = clusters_1 & clusters_2
+
+                        if len_ratio >= 0.15 and (
+                            shared_novel_count >= 2
+                            or len(shared_clusters) >= 2
+                            or (shared_novel_count >= 1 and len(shared_clusters) >= 1)
+                            or (cos_sim >= 0.50 and shared_novel_count >= 1)
+                        ):
                             is_agreed = True
 
                     if is_agreed:

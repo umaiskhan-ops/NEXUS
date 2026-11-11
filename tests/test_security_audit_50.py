@@ -1179,6 +1179,23 @@ class TestSecurityAudit50(unittest.TestCase):
             self.assertEqual(s_syb_y["status"], "REJECTED")
             self.assertIn("sybil_collusion_detected", s_syb_y["reason"])
 
+            # 11-arbitrary: Generic Sybil Collusion Block with arbitrary unseen ungrounded words (e.g. submarine / apple / pizza)
+            w_syb_u = hub.register_worker("sybil-diff-u", url="local", public_ip="198.18.3.10", hardware_uuid="uuid-syb-u", initial_credits=50)
+            w_syb_v = hub.register_worker("sybil-diff-v", url="local", public_ip="198.18.4.20", hardware_uuid="uuid-syb-v", initial_credits=50)
+            t_syb_u = hub.create_signed_task("sybil-diff-u", "brain_inference", {"prompt": "Explain quantum entanglement in simple terms", "consensus_id": "syb-arbitrary-words-2"}, funded_credits=25)
+            t_syb_v = hub.create_signed_task("sybil-diff-v", "brain_inference", {"prompt": "Explain quantum entanglement in simple terms", "consensus_id": "syb-arbitrary-words-2"}, funded_credits=25)
+            syb_arbitrary_1 = "The quantum submarine discovered an apple next to a golden pizza."
+            syb_arbitrary_2 = "A quantum submarine had an apple with hot pizza."
+            p_syb_u = compute_hmac(w_syb_u.key, {"task_id": t_syb_u["task_id"], "worker_id": "sybil-diff-u", "feature": "brain_inference", "nonce": t_syb_u["nonce"], "result": {"status": "OK", "output": syb_arbitrary_1}})
+            p_syb_v = compute_hmac(w_syb_v.key, {"task_id": t_syb_v["task_id"], "worker_id": "sybil-diff-v", "feature": "brain_inference", "nonce": t_syb_v["nonce"], "result": {"status": "OK", "output": syb_arbitrary_2}})
+            s_syb_u = hub.verify_and_settle({"task_id": t_syb_u["task_id"], "worker_id": "sybil-diff-u", "feature": "brain_inference", "result": {"status": "OK", "output": syb_arbitrary_1}, "worker_proof": p_syb_u})
+            self.assertTrue(s_syb_u["ok"])
+            self.assertEqual(s_syb_u["status"], "PENDING_CONSENSUS")
+            s_syb_v = hub.verify_and_settle({"task_id": t_syb_v["task_id"], "worker_id": "sybil-diff-v", "feature": "brain_inference", "result": {"status": "OK", "output": syb_arbitrary_2}, "worker_proof": p_syb_v})
+            self.assertFalse(s_syb_v["ok"])
+            self.assertEqual(s_syb_v["status"], "REJECTED")
+            self.assertIn("sybil_collusion_detected", s_syb_v["reason"])
+
             # 11b. Deterministic Factual Query Consensus: Identical answers on short factual questions are SETTLED (not sybil)
             w_fact_1 = hub.register_worker("fact-worker-1", url="local", public_ip="192.0.2.110", initial_credits=50)
             w_fact_2 = hub.register_worker("fact-worker-2", url="local", public_ip="192.88.99.120", initial_credits=50)
@@ -1194,6 +1211,33 @@ class TestSecurityAudit50(unittest.TestCase):
             self.assertEqual(s_f2["status"], "SETTLED")
             self.assertEqual(w_fact_1.credits, 75)
             self.assertEqual(w_fact_2.credits, 75)
+
+            # 11c. Short Factual Query Contradiction Guard: "Tokyo" vs "Osaka" is REJECTED
+            t_f_contra_1 = hub.create_signed_task("fact-worker-1", "brain_inference", {"prompt": "What is the capital of Japan?", "consensus_id": "japan-contra-1"}, funded_credits=25)
+            t_f_contra_2 = hub.create_signed_task("fact-worker-2", "brain_inference", {"prompt": "What is the capital of Japan?", "consensus_id": "japan-contra-1"}, funded_credits=25)
+            ans_tokyo = "The capital of Japan is Tokyo."
+            ans_osaka = "Osaka is the capital of Japan."
+            p_fc1 = compute_hmac(w_fact_1.key, {"task_id": t_f_contra_1["task_id"], "worker_id": "fact-worker-1", "feature": "brain_inference", "nonce": t_f_contra_1["nonce"], "result": {"status": "OK", "output": ans_tokyo}})
+            p_fc2 = compute_hmac(w_fact_2.key, {"task_id": t_f_contra_2["task_id"], "worker_id": "fact-worker-2", "feature": "brain_inference", "nonce": t_f_contra_2["nonce"], "result": {"status": "OK", "output": ans_osaka}})
+            s_fc1 = hub.verify_and_settle({"task_id": t_f_contra_1["task_id"], "worker_id": "fact-worker-1", "feature": "brain_inference", "result": {"status": "OK", "output": ans_tokyo}, "worker_proof": p_fc1})
+            self.assertEqual(s_fc1["status"], "PENDING_CONSENSUS")
+            s_fc2 = hub.verify_and_settle({"task_id": t_f_contra_2["task_id"], "worker_id": "fact-worker-2", "feature": "brain_inference", "result": {"status": "OK", "output": ans_osaka}, "worker_proof": p_fc2})
+            self.assertFalse(s_fc2["ok"])
+            self.assertEqual(s_fc2["status"], "REJECTED")
+            self.assertIn("consensus_semantic_divergence_rejected", s_fc2["reason"])
+
+            # 11d. Short Factual Query Filler Non-Answer Guard: "Tokyo" vs generic filler is REJECTED
+            t_f_filler_1 = hub.create_signed_task("fact-worker-1", "brain_inference", {"prompt": "What is the capital of Japan?", "consensus_id": "japan-filler-1"}, funded_credits=25)
+            t_f_filler_2 = hub.create_signed_task("fact-worker-2", "brain_inference", {"prompt": "What is the capital of Japan?", "consensus_id": "japan-filler-1"}, funded_credits=25)
+            ans_filler = "The capital of Japan is a very big city with many people living there."
+            p_ff1 = compute_hmac(w_fact_1.key, {"task_id": t_f_filler_1["task_id"], "worker_id": "fact-worker-1", "feature": "brain_inference", "nonce": t_f_filler_1["nonce"], "result": {"status": "OK", "output": ans_tokyo}})
+            p_ff2 = compute_hmac(w_fact_2.key, {"task_id": t_f_filler_2["task_id"], "worker_id": "fact-worker-2", "feature": "brain_inference", "nonce": t_f_filler_2["nonce"], "result": {"status": "OK", "output": ans_filler}})
+            s_ff1 = hub.verify_and_settle({"task_id": t_f_filler_1["task_id"], "worker_id": "fact-worker-1", "feature": "brain_inference", "result": {"status": "OK", "output": ans_tokyo}, "worker_proof": p_ff1})
+            self.assertEqual(s_ff1["status"], "PENDING_CONSENSUS")
+            s_ff2 = hub.verify_and_settle({"task_id": t_f_filler_2["task_id"], "worker_id": "fact-worker-2", "feature": "brain_inference", "result": {"status": "OK", "output": ans_filler}, "worker_proof": p_ff2})
+            self.assertFalse(s_ff2["ok"])
+            self.assertEqual(s_ff2["status"], "REJECTED")
+            self.assertIn("consensus_semantic_divergence_rejected", s_ff2["reason"])
 
             # 12. Requester Escrow Refund on 300s TTL Expiry (No credits stuck or lost)
             w_requester = hub.register_worker("funder-requester-1", url="local", initial_credits=500)
@@ -1282,7 +1326,13 @@ class TestSecurityAudit50(unittest.TestCase):
             hub.force_canary_injection = False
             self.assertGreater(len(pulled_canaries), 0)
             canary_pkt = pulled_canaries[-1]
-            self.assertEqual(canary_pkt.get("funded_by"), "mesh_requester")
+            # Disguised realistically: never leaks synthetic "mesh_requester" marker
+            self.assertNotEqual(canary_pkt.get("funded_by"), "mesh_requester")
+            self.assertTrue(
+                canary_pkt.get("funded_by") is None
+                or canary_pkt.get("funded_by").startswith("worker-")
+                or canary_pkt.get("funded_by") in hub._workers
+            )
             self.assertNotIn("is_canary", canary_pkt)
             self.assertNotIn("canary_spec", canary_pkt)
 
