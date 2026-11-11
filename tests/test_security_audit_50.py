@@ -1054,6 +1054,9 @@ class TestSecurityAudit50(unittest.TestCase):
             # Worker 2 submission completes consensus: both workers settled
             self.assertTrue(settle_ff2["ok"])
             self.assertEqual(settle_ff2["status"], "SETTLED")
+            # Exact Escrow Payout: Each worker receives their task's full funded amount (Zero credits lost)
+            self.assertEqual(w_eval.credits, 150)
+            self.assertEqual(w_peer.credits, 75)
 
             # 6. Low-entropy stopword salad ("the and is of...") is REJECTED
             t_salad = hub.create_signed_task(
@@ -1098,7 +1101,48 @@ class TestSecurityAudit50(unittest.TestCase):
             self.assertEqual(settle_syb_2["status"], "REJECTED")
             self.assertIn("sybil_consensus_attempt_blocked", settle_syb_2["reason"])
 
-            # --- Phase A: B5 Redactions Verification ---
+            # 8. Prompt-echo attack (repeating prompt keywords without novel content) is REJECTED
+            t_echo = hub.create_signed_task(
+                "eval-worker-1",
+                "brain_inference",
+                {"prompt": "Explain quantum entanglement in simple terms", "consensus_id": "echo-test-1"},
+                funded_credits=25,
+            )
+            echo_ans = "Explain quantum entanglement in simple terms explain quantum entanglement in simple terms"
+            p_echo = compute_hmac(w_eval.key, {"task_id": t_echo["task_id"], "worker_id": "eval-worker-1", "feature": "brain_inference", "nonce": t_echo["nonce"], "result": {"status": "OK", "output": echo_ans}})
+            settle_echo = hub.verify_and_settle({"task_id": t_echo["task_id"], "worker_id": "eval-worker-1", "feature": "brain_inference", "result": {"status": "OK", "output": echo_ans}, "worker_proof": p_echo})
+            self.assertFalse(settle_echo["ok"])
+            self.assertEqual(settle_echo["status"], "REJECTED")
+            self.assertIn("prompt_echo_attack_rejected", settle_echo["reason"])
+
+            # 9. Honest paraphrases across distinct vocabularies (H1 and H3) achieve consensus
+            w_para_a = hub.register_worker("para-worker-a", url="local", public_ip="192.0.2.10", initial_credits=50)
+            w_para_b = hub.register_worker("para-worker-b", url="local", public_ip="203.0.113.88", initial_credits=50)
+            h_prompt = "Explain quantum entanglement in simple terms"
+            t_pa = hub.create_signed_task("para-worker-a", "brain_inference", {"prompt": h_prompt, "consensus_id": "para-test-h1-h3"}, funded_credits=25)
+            t_pb = hub.create_signed_task("para-worker-b", "brain_inference", {"prompt": h_prompt, "consensus_id": "para-test-h1-h3"}, funded_credits=25)
+            ans_h1 = "Quantum entanglement is a physical phenomenon where particles remain connected regardless of distance."
+            ans_h3 = "Subatomic particle pairs remain linked so measuring one instantaneously determines the other correlated state across distance."
+            p_pa = compute_hmac(w_para_a.key, {"task_id": t_pa["task_id"], "worker_id": "para-worker-a", "feature": "brain_inference", "nonce": t_pa["nonce"], "result": {"status": "OK", "output": ans_h1}})
+            p_pb = compute_hmac(w_para_b.key, {"task_id": t_pb["task_id"], "worker_id": "para-worker-b", "feature": "brain_inference", "nonce": t_pb["nonce"], "result": {"status": "OK", "output": ans_h3}})
+            s_pa = hub.verify_and_settle({"task_id": t_pa["task_id"], "worker_id": "para-worker-a", "feature": "brain_inference", "result": {"status": "OK", "output": ans_h1}, "worker_proof": p_pa})
+            self.assertTrue(s_pa["ok"])
+            self.assertEqual(s_pa["status"], "PENDING_CONSENSUS")
+            s_pb = hub.verify_and_settle({"task_id": t_pb["task_id"], "worker_id": "para-worker-b", "feature": "brain_inference", "result": {"status": "OK", "output": ans_h3}, "worker_proof": p_pb})
+            self.assertTrue(s_pb["ok"])
+            self.assertEqual(s_pb["status"], "SETTLED")
+            self.assertEqual(w_para_a.credits, 75)
+            self.assertEqual(w_para_b.credits, 75)
+
+            # --- Phase A: B5 Redactions & Route Verification ---
+            # Verify /chat and /download/worker are accessible
+            req_chat = urllib.request.Request(f"{base_url}/chat")
+            with urllib.request.urlopen(req_chat, timeout=5) as resp_c:
+                self.assertEqual(resp_c.status, 200)
+
+            req_dl = urllib.request.Request(f"{base_url}/download/worker")
+            with urllib.request.urlopen(req_dl, timeout=5) as resp_d:
+                self.assertEqual(resp_d.status, 200)
             req_learn = urllib.request.Request(f"{base_url}/api/learning/status")
             with urllib.request.urlopen(req_learn, timeout=5) as resp_learn:
                 learn_data = json.loads(resp_learn.read().decode("utf-8"))

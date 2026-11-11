@@ -107,6 +107,45 @@ def extract_content_tokens(text: str) -> List[str]:
     return [t for t in raw if t not in _STOPWORDS and not t.isdigit()]
 
 
+def stem_token(w: str) -> str:
+    """Lightweight morphological stemmer for English content words."""
+    w = (w or "").lower()
+    for s in ("ation", "ment", "able", "ible", "ness", "ing", "ies", "ied", "ity", "ive", "ful", "est", "ed", "es", "ly", "al", "s", "e"):
+        if w.endswith(s) and len(w) - len(s) >= 3:
+            w = w[:-len(s)]
+            break
+    return w
+
+
+def extract_prompt_stems(prompt_text: str) -> Set[str]:
+    """Extracts stemmed content keywords from prompt to detect echo attacks."""
+    tokens = re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", (prompt_text or "").lower())
+    return {stem_token(t) for t in tokens if t not in _STOPWORDS and not t.isdigit()}
+
+
+def extract_novel_stems(response_text: str, prompt_stems: Set[str]) -> List[str]:
+    """Extracts stems that represent novel explanatory concepts not merely repeated from prompt."""
+    tokens = re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", (response_text or "").lower())
+    content = [stem_token(t) for t in tokens if t not in _STOPWORDS and not t.isdigit()]
+    return [s for s in content if s not in prompt_stems]
+
+
+def compute_novel_stem_cosine_similarity(stems1: List[str], stems2: List[str]) -> float:
+    """Computes cosine similarity on novel content stem vectors."""
+    if not stems1 or not stems2:
+        return 0.0
+    from collections import Counter
+    v1 = Counter(stems1)
+    v2 = Counter(stems2)
+    keys = set(v1.keys()) | set(v2.keys())
+    dot = sum(v1.get(k, 0) * v2.get(k, 0) for k in keys)
+    n1_sq = sum(v * v for v in v1.values())
+    n2_sq = sum(v * v for v in v2.values())
+    if n1_sq <= 1e-12 or n2_sq <= 1e-12:
+        return 0.0
+    return dot / (math.sqrt(n1_sq) * math.sqrt(n2_sq))
+
+
 def compute_content_cosine_similarity(text1: str, text2: str) -> float:
     """Computes exact cosine similarity over substantive content word vectors."""
     t1 = extract_content_tokens(text1)
@@ -1156,6 +1195,12 @@ class MasterHubCoordinator:
                 if len(out_tokens) < 4:
                     return self._reject(worker, "low_content_entropy_rejected (response lacks substantive content words)")
 
+                # Prompt-Echo Defense: Extract prompt stems and require genuine novel explanatory stems
+                prompt_stems = extract_prompt_stems(prompt_str)
+                novel_stems_2 = extract_novel_stems(out_text, prompt_stems)
+                if len(novel_stems_2) < 4:
+                    return self._reject(worker, "prompt_echo_attack_rejected (response merely repeats prompt keywords without novel explanatory content)")
+
                 consensus_key = str(t_payload.get("consensus_id") or hashlib.sha256(prompt_str.encode("utf-8")).hexdigest()[:16])
                 existing = self._freeform_consensus.get(consensus_key)
 
@@ -1186,24 +1231,24 @@ class MasterHubCoordinator:
                     if not _is_independent_peer(w1, w2):
                         return self._reject(worker, "sybil_consensus_attempt_blocked (consensus peer must be an independent node)")
 
-                    # Check semantic cosine similarity on content words
-                    cos_sim = compute_content_cosine_similarity(existing["output"], out_text)
-                    tokens1 = set(extract_content_tokens(existing["output"]))
-                    tokens2 = set(out_tokens)
-                    shared_count = len(tokens1 & tokens2)
+                    # Check morphological and semantic agreement on novel conceptual stems
+                    novel_stems_1 = extract_novel_stems(existing["output"], prompt_stems)
+                    set1 = set(novel_stems_1)
+                    set2 = set(novel_stems_2)
+                    shared_novel_count = len(set1 & set2)
+                    novel_cos = compute_novel_stem_cosine_similarity(novel_stems_1, novel_stems_2)
                     len_ratio = min(len(existing["output"]), len(out_text)) / max(len(existing["output"]), len(out_text))
 
-                    # Substantial semantic content agreement (cosine >= 0.35, >=3 shared substantive words, balanced length)
-                    if cos_sim >= 0.35 and shared_count >= 3 and len_ratio >= 0.30:
-                        # Consensus verified! Settle both workers without minting unbacked credits
-                        reward_pool = int(existing.get("funded_credits") or 0)
-                        # Zero-sum distribution: divide funded escrow pool between consensus workers
-                        reward_each = max(0, reward_pool // 2) if reward_pool > 0 else 0
+                    # Substantial semantic content agreement (shared novel stems >= 2, novel cosine >= 0.20 or shared >= 3, balanced length)
+                    if shared_novel_count >= 2 and (novel_cos >= 0.20 or shared_novel_count >= 3) and len_ratio >= 0.25:
+                        # Consensus verified! Disburse exact funded escrow to each worker (Zero-sum credit economy)
+                        w1_reward = int(existing.get("funded_credits") or 0)
+                        w2_reward = int(task.get("funded_credits") or 0)
 
                         if w1.status != "SLASHED":
                             with self._lock:
-                                if reward_each > 0:
-                                    w1.credits += reward_each
+                                if w1_reward > 0:
+                                    w1.credits += w1_reward
                                 w1.tasks_completed += 1
                                 w1.tasks_verified += 1
                                 if self.ledger:
@@ -1211,7 +1256,7 @@ class MasterHubCoordinator:
                                         "worker_id": w1.worker_id,
                                         "task_id": existing["task_id"],
                                         "feature": task["feature"],
-                                        "credits_awarded": reward_each,
+                                        "credits_awarded": w1_reward,
                                         "new_balance": w1.credits,
                                         "funded_by": existing.get("funded_by", ""),
                                         "consensus": True,
@@ -1222,7 +1267,7 @@ class MasterHubCoordinator:
                                     self._nat_task_events[existing["task_id"]].set()
 
                         # Configure candidate worker reward
-                        task["funded_credits"] = reward_each
+                        task["funded_credits"] = w2_reward
                         verified = True
                         self._freeform_consensus.pop(consensus_key, None)
                     else:

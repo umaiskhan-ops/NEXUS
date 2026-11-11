@@ -3,12 +3,14 @@
 | Route Path | HTTP Method | Access Level | Authentication Mechanism | Description / Sensitivity Notes |
 |:---|:---:|:---:|:---|:---|
 | `/` | GET | Public | None | Web Dashboard UI (nonce-protected CSP) |
+| `/chat` | GET | Public | None | Chat UI assistant interface |
 | `/healthz` | GET | Public | None | Node health status and version |
 | `/api/features` | GET | Public | None | List of registered mesh features |
 | `/api/leaderboard` | GET | Public | None | Network worker ranking by verified tasks |
 | `/api/p2p/orders` | GET | Public | None | Public marketplace order book |
 | `/api/tokensink/stats` | GET | Public | None | Deflationary metrics (burned tokens, lottery pool) |
 | `/api/worker/download` | GET | Public | None | Download worker client script (`nexus_worker.py`) |
+| `/download/worker` | GET | Public | None | Direct alias for downloading worker client script |
 | `/api/worker/ota_check` | GET | Public | Cryptographic HMAC | Worker version check & OTA hash signature |
 | `/api/worker/update_check` | GET | Public | Cryptographic HMAC | Alias for `/api/worker/ota_check` |
 | `/api/worker/ota_download` | GET | Public | Cryptographic HMAC | Worker code download with pinned signature |
