@@ -1134,6 +1134,100 @@ class TestSecurityAudit50(unittest.TestCase):
             self.assertEqual(w_para_a.credits, 75)
             self.assertEqual(w_para_b.credits, 75)
 
+            # 10. Keyword Salad Rejection: Topic keyword dump without function words/prose syntax is REJECTED
+            t_salad_cheat = hub.create_signed_task(
+                "eval-worker-1",
+                "brain_inference",
+                {"prompt": "Why is the sky blue?", "consensus_id": "sky-blue-test-1"},
+                funded_credits=25,
+            )
+            salad_code = "scatter molecules wavelength sunlight rayleigh atmosphere light photons"
+            p_salad_c = compute_hmac(w_eval.key, {"task_id": t_salad_cheat["task_id"], "worker_id": "eval-worker-1", "feature": "brain_inference", "nonce": t_salad_cheat["nonce"], "result": {"status": "OK", "output": salad_code}})
+            s_salad_c = hub.verify_and_settle({"task_id": t_salad_cheat["task_id"], "worker_id": "eval-worker-1", "feature": "brain_inference", "result": {"status": "OK", "output": salad_code}, "worker_proof": p_salad_c})
+            self.assertFalse(s_salad_c["ok"])
+            self.assertEqual(s_salad_c["status"], "REJECTED")
+            self.assertIn("keyword_salad_rejected", s_salad_c["reason"])
+
+            # 11. Sybil Collusion Block: Two sybils on different subnets submitting identical arbitrary ungrounded text are REJECTED
+            w_syb_x = hub.register_worker("sybil-diff-x", url="local", public_ip="198.18.1.10", hardware_uuid="uuid-syb-x", initial_credits=50)
+            w_syb_y = hub.register_worker("sybil-diff-y", url="local", public_ip="198.18.2.20", hardware_uuid="uuid-syb-y", initial_credits=50)
+            t_syb_x = hub.create_signed_task("sybil-diff-x", "brain_inference", {"prompt": "Explain quantum entanglement in simple terms", "consensus_id": "syb-random-collusion-1"}, funded_credits=25)
+            t_syb_y = hub.create_signed_task("sybil-diff-y", "brain_inference", {"prompt": "Explain quantum entanglement in simple terms", "consensus_id": "syb-random-collusion-1"}, funded_credits=25)
+            syb_phrase = "The quantum banana is an elephant with a purple violin."
+            p_syb_x = compute_hmac(w_syb_x.key, {"task_id": t_syb_x["task_id"], "worker_id": "sybil-diff-x", "feature": "brain_inference", "nonce": t_syb_x["nonce"], "result": {"status": "OK", "output": syb_phrase}})
+            p_syb_y = compute_hmac(w_syb_y.key, {"task_id": t_syb_y["task_id"], "worker_id": "sybil-diff-y", "feature": "brain_inference", "nonce": t_syb_y["nonce"], "result": {"status": "OK", "output": syb_phrase}})
+            s_syb_x = hub.verify_and_settle({"task_id": t_syb_x["task_id"], "worker_id": "sybil-diff-x", "feature": "brain_inference", "result": {"status": "OK", "output": syb_phrase}, "worker_proof": p_syb_x})
+            self.assertTrue(s_syb_x["ok"])
+            self.assertEqual(s_syb_x["status"], "PENDING_CONSENSUS")
+            s_syb_y = hub.verify_and_settle({"task_id": t_syb_y["task_id"], "worker_id": "sybil-diff-y", "feature": "brain_inference", "result": {"status": "OK", "output": syb_phrase}, "worker_proof": p_syb_y})
+            self.assertFalse(s_syb_y["ok"])
+            self.assertEqual(s_syb_y["status"], "REJECTED")
+            self.assertIn("sybil_collusion_detected", s_syb_y["reason"])
+
+            # 12. Requester Escrow Refund on 300s TTL Expiry (No credits stuck or lost)
+            w_requester = hub.register_worker("funder-requester-1", url="local", initial_credits=500)
+            self.assertEqual(w_requester.credits, 500)
+            t_refund_exp = hub.create_signed_task(
+                "para-worker-a",
+                "brain_inference",
+                {"prompt": "Explain general relativity simply", "consensus_id": "relativity-exp-1"},
+                funded_by=w_requester.worker_id,
+                funded_credits=25,
+            )
+            # Funder escrow spent into task
+            self.assertEqual(w_requester.credits, 475)
+            p_rf_exp = compute_hmac(w_para_a.key, {"task_id": t_refund_exp["task_id"], "worker_id": "para-worker-a", "feature": "brain_inference", "nonce": t_refund_exp["nonce"], "result": {"status": "OK", "output": "General relativity describes how mass curves the fabric of spacetime."}})
+            s_rf_exp = hub.verify_and_settle({"task_id": t_refund_exp["task_id"], "worker_id": "para-worker-a", "feature": "brain_inference", "result": {"status": "OK", "output": "General relativity describes how mass curves the fabric of spacetime."}, "worker_proof": p_rf_exp})
+            self.assertEqual(s_rf_exp["status"], "PENDING_CONSENSUS")
+            # Simulate 300s TTL expiration by shifting timestamp
+            hub._freeform_consensus["relativity-exp-1"]["created_at"] = time.time() - 305.0
+            hub._prune_consensus_buffer()
+            # Funder is 100% refunded back to 500!
+            self.assertEqual(w_requester.credits, 500)
+
+            # 13. Requester Escrow Refund on Task Rejection
+            t_refund_rej = hub.create_signed_task(
+                "para-worker-a",
+                "brain_inference",
+                {"prompt": "Why is ice slippery?", "test_assertions": "assert False"},
+                funded_by=w_requester.worker_id,
+                funded_credits=25,
+            )
+            self.assertEqual(w_requester.credits, 475)
+            p_rf_rej = compute_hmac(w_para_a.key, {"task_id": t_refund_rej["task_id"], "worker_id": "para-worker-a", "feature": "brain_inference", "nonce": t_refund_rej["nonce"], "result": {"status": "OK", "code": "# bad code"}})
+            s_rf_rej = hub.verify_and_settle({"task_id": t_refund_rej["task_id"], "worker_id": "para-worker-a", "feature": "brain_inference", "result": {"status": "OK", "code": "# bad code"}, "worker_proof": p_rf_rej})
+            self.assertFalse(s_rf_rej["ok"])
+            # Escrow is immediately refunded back to requester
+            self.assertEqual(w_requester.credits, 500)
+
+            # 14. Golden Canary Task Spot-Check & Stake Slashing
+            w_cheater = hub.register_worker("cheater-canary-node", url="local", initial_credits=100)
+            if getattr(grid, "token_sink", None):
+                grid.token_sink.stake_credits(w_cheater.worker_id, 50)
+            canary_task = hub.create_golden_canary_task("cheater-canary-node", canary_idx=0)
+            p_canary_bad = compute_hmac(w_cheater.key, {"task_id": canary_task["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "nonce": canary_task["nonce"], "result": {"status": "OK", "output": "quantum banana elephant violin"}})
+            s_canary = hub.verify_and_settle({"task_id": canary_task["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "result": {"status": "OK", "output": "quantum banana elephant violin"}, "worker_proof": p_canary_bad})
+            self.assertFalse(s_canary["ok"])
+            self.assertEqual(s_canary["status"], "SLASHED")
+            self.assertEqual(w_cheater.status, "SLASHED")
+            self.assertEqual(w_cheater.credits, 0)
+            if getattr(grid, "token_sink", None):
+                stk_status = grid.token_sink.get_staking_status(w_cheater.worker_id)
+                self.assertEqual(stk_status["user_staked"], 0)
+
+            # 15. Hub Autonomous Consensus Pair Dispatch
+            t_pair1, t_pair2 = hub.dispatch_consensus_task(
+                "brain_inference",
+                {"prompt": "Explain photoelectricity simply"},
+                funded_by=w_requester.worker_id,
+                funded_credits=25,
+            )
+            self.assertNotEqual(t_pair1["worker_id"], t_pair2["worker_id"])
+            p_w1 = hub.get_worker(t_pair1["worker_id"])
+            p_w2 = hub.get_worker(t_pair2["worker_id"])
+            from sovereign_mesh.hub_spoke import _is_independent_peer
+            self.assertTrue(_is_independent_peer(p_w1, p_w2))
+
             # --- Phase A: B5 Redactions & Route Verification ---
             # Verify /chat and /download/worker are accessible
             req_chat = urllib.request.Request(f"{base_url}/chat")

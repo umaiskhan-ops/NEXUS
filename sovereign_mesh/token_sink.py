@@ -65,6 +65,11 @@ class TokenSinkManager:
         min_stake_lock_seconds: float = DEFAULT_STAKE_LOCK_SECONDS,
     ):
         self.hub = hub
+        if hub is not None:
+            try:
+                hub.token_sink = self
+            except Exception:
+                pass
         self.ledger = ledger
         self._path = storage_path
         self.ticket_price = ticket_price
@@ -516,6 +521,24 @@ class TokenSinkManager:
                 "active_credits": grant["new_balance"],
                 "ledger_block": block["hash"][:16],
             }
+
+    def slash_staker(self, worker_id: str, reason: str = "misbehavior_slashed") -> int:
+        """Slashes and burns 100% of staked collateral in the vault for a malicious or cheating node."""
+        with self._lock:
+            rec = self._stakers.get(worker_id)
+            if rec and rec.staked_amount > 0:
+                burned = rec.staked_amount
+                rec.staked_amount = 0
+                rec.tier = "BRONZE"
+                self._flush()
+                if self.ledger:
+                    self.ledger.append("staker_slashed", {
+                        "worker_id": worker_id,
+                        "burned_amount": burned,
+                        "reason": reason,
+                    })
+                return burned
+            return 0
 
     def get_staking_status(self, worker_id_or_key: str = "") -> dict:
         with self._lock:

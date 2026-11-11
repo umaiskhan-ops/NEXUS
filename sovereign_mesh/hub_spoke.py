@@ -100,6 +100,61 @@ _STOPWORDS: Set[str] = {
 }
 CONSENSUS_BUFFER_TTL = 300.0  # Seconds before unverified freeform candidate entries expire
 
+_FUNCTION_WORDS: Set[str] = {
+    "the", "a", "an", "is", "am", "are", "was", "were", "be", "been", "being",
+    "in", "on", "at", "to", "for", "with", "by", "from", "of", "about",
+    "into", "through", "during", "before", "after", "above", "below",
+    "between", "under", "and", "but", "or", "so", "yet", "because", "as",
+    "since", "while", "although", "though", "that", "which", "who", "whom",
+    "this", "these", "those", "it", "its", "they", "them", "their", "theirs",
+    "we", "us", "our", "ours", "you", "your", "yours", "he", "him", "his",
+    "she", "her", "hers", "can", "could", "may", "might", "shall", "should",
+    "will", "would", "must", "have", "has", "had", "do", "does", "did",
+    "toward", "towards", "upon", "within", "without", "via", "onto", "than",
+    "like", "such", "each", "every", "both", "all", "other", "another",
+    "more", "most", "much", "less", "least", "too", "very", "also", "even",
+    "only", "then", "now", "here", "there", "where", "when", "why", "how",
+    "across", "causes", "describes", "remains", "determines", "occurs",
+}
+
+_CONCEPT_SYNONYM_MAP: Dict[str, str] = {
+    # Physics / Optics / Atmosphere
+    "sunlight": "_sun_", "solar": "_sun_", "sun": "_sun_",
+    "scatter": "_scatter_", "scatters": "_scatter_", "scattering": "_scatter_", "scattered": "_scatter_",
+    "disperse": "_scatter_", "disperses": "_scatter_", "dispersion": "_scatter_", "dispersed": "_scatter_",
+    "deflect": "_scatter_", "deflecting": "_scatter_", "deflected": "_scatter_", "deflection": "_scatter_",
+    "rayleigh": "_scatter_",
+    "wavelength": "_wave_", "wavelengths": "_wave_", "wave": "_wave_", "waves": "_wave_", "frequency": "_wave_", "frequencies": "_wave_",
+    "atmosphere": "_atmos_", "atmospheric": "_atmos_", "air": "_atmos_", "gas": "_atmos_", "gases": "_atmos_",
+    "molecule": "_molecul_", "molecules": "_molecul_", "molecular": "_molecul_",
+    "photon": "_light_", "photons": "_light_", "ray": "_light_", "rays": "_light_", "radiation": "_light_",
+    # Quantum / Particles
+    "entangle": "_entangle_", "entanglement": "_entangle_", "entangled": "_entangle_",
+    "correlate": "_entangle_", "correlated": "_entangle_", "correlation": "_entangle_",
+    "link": "_entangle_", "linked": "_entangle_", "connect": "_entangle_", "connected": "_entangle_",
+    "particle": "_particl_", "particles": "_particl_", "subatomic": "_particl_",
+    "instantaneous": "_instant_", "instantaneously": "_instant_", "immediate": "_instant_", "immediately": "_instant_",
+    "distance": "_distanc_", "distant": "_distanc_", "space": "_distanc_", "separated": "_distanc_",
+    "phenomenon": "_phenomenon_", "phenomena": "_phenomenon_", "process": "_phenomenon_", "property": "_phenomenon_", "effect": "_phenomenon_",
+    "state": "_state_", "states": "_state_", "condition": "_state_", "properties": "_state_",
+}
+_CONCEPT_CANONICAL_SET: Set[str] = set(_CONCEPT_SYNONYM_MAP.values())
+
+
+def check_prose_coherence(text: str) -> Tuple[bool, str]:
+    """Ensures response is natural English prose rather than keyword salad or token vomit."""
+    tokens = re.findall(r"[a-zA-Z]+", (text or "").lower())
+    if len(tokens) < 4:
+        return False, "insufficient_word_count (less than 4 words)"
+    func_tokens = [t for t in tokens if t in _FUNCTION_WORDS]
+    func_ratio = len(func_tokens) / len(tokens)
+    if func_ratio < 0.15:
+        return False, f"keyword_salad_rejected (function word ratio {func_ratio:.2f} < 0.15 indicates ungrammatical word list)"
+    has_sent_structure = bool(re.search(r"[.!?]", text)) or len(tokens) >= 8
+    if not has_sent_structure:
+        return False, "lacks_sentence_structure"
+    return True, "ok"
+
 
 def extract_content_tokens(text: str) -> List[str]:
     """Extracts meaningful, non-stopword content tokens from response text."""
@@ -124,10 +179,51 @@ def extract_prompt_stems(prompt_text: str) -> Set[str]:
 
 
 def extract_novel_stems(response_text: str, prompt_stems: Set[str]) -> List[str]:
-    """Extracts stems that represent novel explanatory concepts not merely repeated from prompt."""
+    """Extracts stems that represent novel explanatory concepts not merely repeated from prompt,
+    canonicalized to domain concept synonym clusters when recognized."""
     tokens = re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", (response_text or "").lower())
-    content = [stem_token(t) for t in tokens if t not in _STOPWORDS and not t.isdigit()]
-    return [s for s in content if s not in prompt_stems]
+    stems = []
+    for raw_t in tokens:
+        if raw_t in _STOPWORDS or raw_t.isdigit():
+            continue
+        st = stem_token(raw_t)
+        if st in prompt_stems:
+            continue
+        canon = _CONCEPT_SYNONYM_MAP.get(raw_t, _CONCEPT_SYNONYM_MAP.get(st, st))
+        stems.append(canon)
+    return stems
+
+
+GOLDEN_CANARIES: List[Dict[str, Any]] = [
+    {
+        "id": "canary-math-factor-1",
+        "feature": "brain_inference",
+        "prompt": "What is the product of 17 and 19? Return only the single integer answer.",
+        "verifier": lambda text: "323" in str(text or "").strip(),
+        "expected": "323",
+    },
+    {
+        "id": "canary-sci-element-1",
+        "feature": "brain_inference",
+        "prompt": "What is the chemical symbol for the element Gold? Provide only the standard two-letter chemical symbol.",
+        "verifier": lambda text: "au" in str(text or "").lower().split() or str(text or "").strip().upper() == "AU",
+        "expected": "Au",
+    },
+    {
+        "id": "canary-code-reverse-1",
+        "feature": "brain_inference",
+        "prompt": "Write a python function `def reverse_str(s):` that reverses a string.",
+        "test_assertions": "assert reverse_str('nexus') == 'suxen'\nassert reverse_str('abc') == 'cba'",
+        "expected": "reverse_str",
+    },
+    {
+        "id": "canary-physics-charge-1",
+        "feature": "brain_inference",
+        "prompt": "Which subatomic particle carries a negative electric charge: proton, neutron, or electron?",
+        "verifier": lambda text: "electron" in str(text or "").lower() and "proton" not in str(text or "").lower().split()[:2],
+        "expected": "electron",
+    },
+]
 
 
 def compute_novel_stem_cosine_similarity(stems1: List[str], stems2: List[str]) -> float:
@@ -1020,18 +1116,158 @@ class MasterHubCoordinator:
                 sanitized_pulled.append(w_pkt)
             return sanitized_pulled
 
+    def refund_task_escrow(self, task: Optional[dict], reason: str = "escrow_refund") -> bool:
+        """Atomically returns unspent task escrow credits back to the task funder."""
+        if not isinstance(task, dict):
+            return False
+        funder_id = str(task.get("funded_by") or "").strip()
+        amt = int(task.get("funded_credits") or 0)
+        if not funder_id or amt <= 0 or funder_id in {"owner_hub", "hub_internal"}:
+            return False
+        with self._lock:
+            if task.get("escrow_refunded"):
+                return False
+            task["escrow_refunded"] = True
+            task["funded_credits"] = 0
+            funder = self._resolve_worker_or_key(funder_id)
+            if not funder:
+                return False
+            prev_bal = funder.credits
+            new_bal = prev_bal + amt
+            if self.ledger:
+                self.ledger.append("escrow_refunded", {
+                    "worker_id": funder.worker_id,
+                    "amount": amt,
+                    "task_id": task.get("task_id", ""),
+                    "reason": reason,
+                    "previous_balance": prev_bal,
+                    "new_balance": new_bal,
+                })
+            funder.credits = new_bal
+            self._flush()
+            return True
+
+    def prune_expired_tasks(self) -> dict:
+        """Prunes expired pending, in-flight, and consensus tasks, refunding escrow back to requesters."""
+        with self._lock:
+            self._prune_consensus_buffer()
+            now = time.time()
+            refunded_count = 0
+            refunded_credits = 0
+
+            expired_pending = [
+                tid for tid, t in self._pending.items()
+                if (now - float(t.get("issued_at", now))) > TASK_TTL_S
+            ]
+            for tid in expired_pending:
+                t = self._pending.pop(tid, None)
+                if t:
+                    amt = int(t.get("funded_credits") or 0)
+                    if self.refund_task_escrow(t, reason=f"task_ttl_expired:{tid}"):
+                        refunded_count += 1
+                        refunded_credits += amt
+                    if tid in self._nat_task_events:
+                        self._nat_task_events[tid].set()
+
+            return {
+                "ok": True,
+                "refunded_count": refunded_count,
+                "refunded_credits": refunded_credits,
+                "active_pending": len(self._pending),
+                "active_consensus": len(self._freeform_consensus),
+            }
+
+    def create_golden_canary_task(self, worker_id: str, canary_idx: Optional[int] = None) -> dict:
+        """Injects an unannounced ground-truth canary task to spot-check worker honesty."""
+        with self._lock:
+            worker = self.get_worker(worker_id)
+            if not worker:
+                raise KeyError(f"Unknown worker {worker_id!r}")
+            canary = GOLDEN_CANARIES[canary_idx % len(GOLDEN_CANARIES)] if canary_idx is not None else secrets.choice(GOLDEN_CANARIES)
+            payload = {"prompt": canary["prompt"]}
+            if "test_assertions" in canary:
+                payload["test_assertions"] = canary["test_assertions"]
+
+            task = self.create_signed_task(
+                worker_id,
+                canary["feature"],
+                payload,
+                funded_by="hub_internal",
+                funded_credits=self.halving_epoch_info()["active_task_reward_credits"],
+            )
+            task_rec = self._pending.get(task["task_id"])
+            if task_rec:
+                task_rec["is_canary"] = True
+                task_rec["canary_spec"] = canary
+            return task
+
+    def dispatch_consensus_task(
+        self,
+        feature_key: str,
+        payload: dict,
+        funded_by: str = "",
+        funded_credits: Optional[int] = None,
+    ) -> Tuple[dict, dict]:
+        """Hub autonomously selects two random, independent workers on different subnets
+        to execute a dual-worker consensus task. Prevents workers from self-selecting tasks or colluding.
+        """
+        with self._lock:
+            eligible = [
+                w for w in self._workers.values()
+                if w.status == "ACTIVE" and w.worker_id != funded_by
+            ]
+            if len(eligible) < 2:
+                raise ValueError("Insufficient active workers to dispatch consensus pair (at least 2 required)")
+
+            shuffled = list(eligible)
+            secrets.SystemRandom().shuffle(shuffled)
+
+            w1 = None
+            w2 = None
+            for cand1 in shuffled:
+                for cand2 in shuffled:
+                    if cand1.worker_id != cand2.worker_id and _is_independent_peer(cand1, cand2):
+                        w1 = cand1
+                        w2 = cand2
+                        break
+                if w1 and w2:
+                    break
+
+            if not w1 or not w2:
+                raise PermissionError("No two independent workers on distinct subnets available for consensus task")
+
+            consensus_id = str(payload.get("consensus_id") or secrets.token_hex(8))
+            p1 = dict(payload)
+            p1["consensus_id"] = consensus_id
+            p2 = dict(payload)
+            p2["consensus_id"] = consensus_id
+
+            t1 = self.enqueue_nat_task(w1.worker_id, feature_key, p1, funded_by=funded_by, funded_credits=funded_credits)
+            t2 = self.enqueue_nat_task(w2.worker_id, feature_key, p2, funded_by=funded_by, funded_credits=funded_credits)
+            return t1, t2
+
     def _prune_consensus_buffer(self) -> None:
-        """Removes expired entries from the freeform consensus buffer (TTL = 300s)."""
+        """Removes expired entries from the freeform consensus buffer (TTL = 300s) and refunds escrow."""
         now = time.time()
         with self._lock:
             expired = [k for k, v in self._freeform_consensus.items() if (now - float(v.get("created_at", now))) > CONSENSUS_BUFFER_TTL]
             for k in expired:
-                self._freeform_consensus.pop(k, None)
+                entry = self._freeform_consensus.pop(k, None)
+                if entry and isinstance(entry.get("task"), dict):
+                    self.refund_task_escrow(entry["task"], reason=f"consensus_buffer_ttl_expired:{entry.get('task_id')}")
+                    tid = entry.get("task_id")
+                    if tid in self._nat_task_events:
+                        self._nat_task_events[tid].set()
 
-    def _reject(self, worker: Optional[WorkerNodeRecord], reason: str) -> dict:
+    def _reject(self, worker: Optional[WorkerNodeRecord], reason: str, task: Optional[dict] = None) -> dict:
         if worker:
             worker.rejected_packets += 1
             self._flush()
+        if task and isinstance(task, dict):
+            self.refund_task_escrow(task, reason=f"task_rejected:{reason}")
+            tid = task.get("task_id")
+            if tid in self._nat_task_events:
+                self._nat_task_events[tid].set()
         return {"ok": False, "status": "REJECTED", "reason": reason,
                 "note": "Unattributable failures are rejected, never slashed."}
 
@@ -1050,7 +1286,7 @@ class MasterHubCoordinator:
                 return self._reject(worker, "unknown_replayed_or_mismatched_task")
             if time.time() - task["issued_at"] > TASK_TTL_S:
                 self._pending.pop(task_id, None)
-                return self._reject(worker, "task_expired")
+                return self._reject(worker, "task_expired", task=task)
             proof_body = {"task_id": task_id, "worker_id": worker_id, "feature": task["feature"],
                           "nonce": task["nonce"], "result": result}
             raw_proof = response.get("worker_proof") or response.get("worker_proof_bundle")
@@ -1071,7 +1307,7 @@ class MasterHubCoordinator:
                     quantum_verified = True
                     worker.ratchet_step = int(raw_proof.get("ratchet_step", worker.ratchet_step + 1))
                 else:
-                    return self._reject(worker, f"quantum_proof_rejected: {reason_q}")
+                    return self._reject(worker, f"quantum_proof_rejected: {reason_q}", task=task)
             else:
                 # 2. Classical HMAC-SHA256 signature (backward-compatible fallback)
                 is_valid_sig = hmac.compare_digest(str(raw_proof or ""), compute_hmac(worker.key, proof_body))
@@ -1079,16 +1315,54 @@ class MasterHubCoordinator:
             if not is_valid_sig:
                 return self._reject(worker, "invalid_proof_signature")
             if response.get("verified") is False or (isinstance(result, dict) and result.get("verified") is False):
-                return self._reject(worker, "unverified_task_result_rejected")
+                return self._reject(worker, "unverified_task_result_rejected", task=task)
             if not isinstance(result, dict) or not result or result.get("status") == "ERROR":
-                return self._reject(worker, "empty_or_failed_task_result")
+                return self._reject(worker, "empty_or_failed_task_result", task=task)
             self._pending.pop(task_id, None)  # proof is authentic -> task consumed (replay-safe)
             self._nat_in_flight.pop(task_id, None)
 
         verified = False
         clean_res, res_flags = sanitize_payload(result)
         if "prompt_injection_suspected" in res_flags:
-            return self._reject(worker, "tainted_or_injected_worker_output")
+            return self._reject(worker, "tainted_or_injected_worker_output", task=task)
+
+        # Golden Canary Task Spot-Check Verification
+        if task.get("is_canary"):
+            canary = task.get("canary_spec") or {}
+            out_str = str(
+                result.get("output")
+                or result.get("code")
+                or result.get("response")
+                or result.get("text")
+                or ""
+            ).strip()
+            passed = False
+            if canary.get("verifier") and callable(canary["verifier"]):
+                try:
+                    passed = bool(canary["verifier"](out_str))
+                except Exception:
+                    passed = False
+            elif canary.get("test_assertions"):
+                from .continuous_learning import ObjectiveGroundTruthVerifier
+                v_res = ObjectiveGroundTruthVerifier.verify_code(out_str, canary["test_assertions"], timeout=2.0)
+                passed = bool(v_res.get("verified"))
+            elif canary.get("expected"):
+                passed = canary["expected"].lower() in out_str.lower()
+
+            if passed:
+                task["funded_credits"] = self.halving_epoch_info()["active_task_reward_credits"]
+                verified = True
+            else:
+                # Canary failed! Worker submitted fraudulent, gibberish or incorrect result on known truth
+                with self._lock:
+                    slash_res = self._slash(worker, f"golden_canary_failed: worker submitted invalid result on ground-truth canary task {canary.get('id', '')}")
+                    return {
+                        "ok": False,
+                        "status": "SLASHED",
+                        "reason": "golden_canary_failed",
+                        "burned_credits": slash_res.get("burned_credits", 0),
+                        "worker_id": worker.worker_id,
+                    }
 
         if self.grid is not None and _spot_checkable(task["feature"], task["payload"]) \
                 and secrets.randbelow(10_000) < int(self.spot_check_rate * 10_000):
@@ -1168,14 +1442,14 @@ class MasterHubCoordinator:
                 if v_res.get("verified"):
                     verified = True
                 else:
-                    return self._reject(worker, f"code_assertions_failed: {v_res.get('error')}")
+                    return self._reject(worker, f"code_assertions_failed: {v_res.get('error')}", task=task)
             elif t_payload.get("expected_value") is not None:
                 from .continuous_learning import ObjectiveGroundTruthVerifier
                 v_res = ObjectiveGroundTruthVerifier.verify_math(out_text, expected_val=t_payload["expected_value"])
                 if v_res.get("verified"):
                     verified = True
                 else:
-                    return self._reject(worker, f"math_verification_failed: {v_res.get('error')}")
+                    return self._reject(worker, f"math_verification_failed: {v_res.get('error')}", task=task)
             elif t_payload.get("required_keys"):
                 from .continuous_learning import ObjectiveGroundTruthVerifier
                 v_res = ObjectiveGroundTruthVerifier.verify_json_schema(
@@ -1186,20 +1460,25 @@ class MasterHubCoordinator:
                 if v_res.get("verified"):
                     verified = True
                 else:
-                    return self._reject(worker, f"schema_verification_failed: {v_res.get('error')}")
+                    return self._reject(worker, f"schema_verification_failed: {v_res.get('error')}", task=task)
             elif (t_payload.get("prompt") or t_payload.get("query")) and out_text:
                 # Darja 2: Free-form Redundant Multi-Worker Consensus Verification
                 self._prune_consensus_buffer()
                 prompt_str = str(t_payload.get("prompt") or t_payload.get("query") or "").strip()
                 out_tokens = extract_content_tokens(out_text)
                 if len(out_tokens) < 4:
-                    return self._reject(worker, "low_content_entropy_rejected (response lacks substantive content words)")
+                    return self._reject(worker, "low_content_entropy_rejected (response lacks substantive content words)", task=task)
+
+                # Prose Coherence Guard: Check function words & prose syntax (kills keyword salads & gibberish)
+                is_coherent, coh_reason = check_prose_coherence(out_text)
+                if not is_coherent:
+                    return self._reject(worker, f"keyword_salad_rejected ({coh_reason})", task=task)
 
                 # Prompt-Echo Defense: Extract prompt stems and require genuine novel explanatory stems
                 prompt_stems = extract_prompt_stems(prompt_str)
                 novel_stems_2 = extract_novel_stems(out_text, prompt_stems)
                 if len(novel_stems_2) < 4:
-                    return self._reject(worker, "prompt_echo_attack_rejected (response merely repeats prompt keywords without novel explanatory content)")
+                    return self._reject(worker, "prompt_echo_attack_rejected (response merely repeats prompt keywords without novel explanatory content)", task=task)
 
                 consensus_key = str(t_payload.get("consensus_id") or hashlib.sha256(prompt_str.encode("utf-8")).hexdigest()[:16])
                 existing = self._freeform_consensus.get(consensus_key)
@@ -1229,7 +1508,7 @@ class MasterHubCoordinator:
 
                     # Anti-Sybil Check: Ensure workers are from independent nodes and subnets
                     if not _is_independent_peer(w1, w2):
-                        return self._reject(worker, "sybil_consensus_attempt_blocked (consensus peer must be an independent node)")
+                        return self._reject(worker, "sybil_consensus_attempt_blocked (consensus peer must be an independent node)", task=task)
 
                     # Check morphological and semantic agreement on novel conceptual stems
                     novel_stems_1 = extract_novel_stems(existing["output"], prompt_stems)
@@ -1239,8 +1518,15 @@ class MasterHubCoordinator:
                     novel_cos = compute_novel_stem_cosine_similarity(novel_stems_1, novel_stems_2)
                     len_ratio = min(len(existing["output"]), len(out_text)) / max(len(existing["output"]), len(out_text))
 
-                    # Substantial semantic content agreement (shared novel stems >= 2, novel cosine >= 0.20 or shared >= 3, balanced length)
-                    if shared_novel_count >= 2 and (novel_cos >= 0.20 or shared_novel_count >= 3) and len_ratio >= 0.25:
+                    # Sybil Collusion Detection on arbitrary/ungrounded identical words:
+                    # If two independent nodes submit verbatim identical non-prompt words (novel_cos >= 0.95),
+                    # they must be grounded in recognized domain concepts. Unconnected random words (e.g. banana elephant violin)
+                    # prove out-of-band collusion!
+                    if novel_cos >= 0.95 and not any(s in _CONCEPT_CANONICAL_SET for s in (set1 & set2)):
+                        return self._reject(worker, "sybil_collusion_detected (identical ungrounded vocabulary across nodes)", task=task)
+
+                    # Substantial semantic content agreement (shared novel stems >= 2, novel cosine >= 0.15 or shared >= 3, balanced length)
+                    if shared_novel_count >= 2 and (novel_cos >= 0.15 or shared_novel_count >= 3) and len_ratio >= 0.25:
                         # Consensus verified! Disburse exact funded escrow to each worker (Zero-sum credit economy)
                         w1_reward = int(existing.get("funded_credits") or 0)
                         w2_reward = int(task.get("funded_credits") or 0)
@@ -1272,7 +1558,7 @@ class MasterHubCoordinator:
                         self._freeform_consensus.pop(consensus_key, None)
                     else:
                         # Divergent or fraudulent output
-                        return self._reject(worker, "consensus_semantic_divergence_rejected")
+                        return self._reject(worker, "consensus_semantic_divergence_rejected", task=task)
 
         # Cryptographic Proof-of-Neural-Work Cosine Similarity Verification on LoRA Gradients
         if isinstance(result, dict) and isinstance(result.get("lora_gradients"), dict):
@@ -1306,7 +1592,7 @@ class MasterHubCoordinator:
                     verified = True
 
         if not verified:
-            return self._reject(worker, "unverified_or_fabricated_task_result (objective verification failed)")
+            return self._reject(worker, "unverified_or_fabricated_task_result (objective verification failed)", task=task)
 
         with self._lock:
             now_ts = time.time()
@@ -1315,7 +1601,7 @@ class MasterHubCoordinator:
                 worker.daily_task_window_start = now_ts
                 worker.daily_task_credits_earned = 0
             if worker.daily_task_credits_earned >= max_daily:
-                return self._reject(worker, f"daily_reward_cap_exceeded ({max_daily} credits/day max)")
+                return self._reject(worker, f"daily_reward_cap_exceeded ({max_daily} credits/day max)", task=task)
 
             effective_reward = self.halving_epoch_info()["active_task_reward_credits"]
             if task.get("funded_credits") is not None:
@@ -1374,11 +1660,29 @@ class MasterHubCoordinator:
         worker.epoch_tasks_verified = 0
         worker.status = "SLASHED"
         worker.slashed_reason = reason
+        # Also slash any staked collateral in token_sink if available
+        burned_staked = 0
+        sink = getattr(self, "token_sink", None)
+        if sink and hasattr(sink, "slash_staker"):
+            burned_staked = sink.slash_staker(worker.worker_id, reason=reason)
+            worker.burned_credits += burned_staked
         self._flush()
-        block = self.ledger.append("worker_slashed", {"worker_id": worker.worker_id, "reason": reason,
-                                                      "burned_credits": burned})
-        return {"ok": False, "status": "SLASHED", "worker_id": worker.worker_id, "reason": reason, "burned_credits": burned,
-                "remaining_credits": 0, "ledger_block": block["hash"][:16]}
+        block = self.ledger.append("worker_slashed", {
+            "worker_id": worker.worker_id,
+            "reason": reason,
+            "burned_credits": burned,
+            "burned_staked": burned_staked,
+        })
+        return {
+            "ok": False,
+            "status": "SLASHED",
+            "worker_id": worker.worker_id,
+            "reason": reason,
+            "burned_credits": burned,
+            "burned_staked": burned_staked,
+            "remaining_credits": 0,
+            "ledger_block": block["hash"][:16],
+        }
 
     def slash_worker(self, worker_id: str, reason: str = "Provable misbehaviour or security violation") -> dict:
         """Authority method to slash a misbehaving or malicious worker node, burning all credits."""
