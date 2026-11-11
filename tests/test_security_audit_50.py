@@ -1134,7 +1134,7 @@ class TestSecurityAudit50(unittest.TestCase):
             self.assertEqual(w_para_a.credits, 75)
             self.assertEqual(w_para_b.credits, 75)
 
-            # 10. Keyword Salad Rejection: Topic keyword dump without function words/prose syntax is REJECTED
+            # 10. Keyword Salad Rejection: Topic keyword dump and prepositional template salads are REJECTED
             t_salad_cheat = hub.create_signed_task(
                 "eval-worker-1",
                 "brain_inference",
@@ -1148,21 +1148,52 @@ class TestSecurityAudit50(unittest.TestCase):
             self.assertEqual(s_salad_c["status"], "REJECTED")
             self.assertIn("keyword_salad_rejected", s_salad_c["reason"])
 
-            # 11. Sybil Collusion Block: Two sybils on different subnets submitting identical arbitrary ungrounded text are REJECTED
+            # 10b. Complex pseudo-grammatical keyword salad ("The scatter of the molecules...") is REJECTED
+            t_salad_struct = hub.create_signed_task(
+                "eval-worker-1",
+                "brain_inference",
+                {"prompt": "Why is the sky blue?", "consensus_id": "sky-blue-test-2"},
+                funded_credits=25,
+            )
+            salad_struct_text = "The scatter of the molecules and the wavelength of the sunlight is the rayleigh light of the atmosphere."
+            p_salad_s = compute_hmac(w_eval.key, {"task_id": t_salad_struct["task_id"], "worker_id": "eval-worker-1", "feature": "brain_inference", "nonce": t_salad_struct["nonce"], "result": {"status": "OK", "output": salad_struct_text}})
+            s_salad_s = hub.verify_and_settle({"task_id": t_salad_struct["task_id"], "worker_id": "eval-worker-1", "feature": "brain_inference", "result": {"status": "OK", "output": salad_struct_text}, "worker_proof": p_salad_s})
+            self.assertFalse(s_salad_s["ok"])
+            self.assertEqual(s_salad_s["status"], "REJECTED")
+            self.assertIn("keyword_salad_rejected", s_salad_s["reason"])
+
+            # 11. Sybil Collusion Block: Two sybils on different subnets submitting coordinated ungrounded text are REJECTED
             w_syb_x = hub.register_worker("sybil-diff-x", url="local", public_ip="198.18.1.10", hardware_uuid="uuid-syb-x", initial_credits=50)
             w_syb_y = hub.register_worker("sybil-diff-y", url="local", public_ip="198.18.2.20", hardware_uuid="uuid-syb-y", initial_credits=50)
             t_syb_x = hub.create_signed_task("sybil-diff-x", "brain_inference", {"prompt": "Explain quantum entanglement in simple terms", "consensus_id": "syb-random-collusion-1"}, funded_credits=25)
             t_syb_y = hub.create_signed_task("sybil-diff-y", "brain_inference", {"prompt": "Explain quantum entanglement in simple terms", "consensus_id": "syb-random-collusion-1"}, funded_credits=25)
-            syb_phrase = "The quantum banana is an elephant with a purple violin."
-            p_syb_x = compute_hmac(w_syb_x.key, {"task_id": t_syb_x["task_id"], "worker_id": "sybil-diff-x", "feature": "brain_inference", "nonce": t_syb_x["nonce"], "result": {"status": "OK", "output": syb_phrase}})
-            p_syb_y = compute_hmac(w_syb_y.key, {"task_id": t_syb_y["task_id"], "worker_id": "sybil-diff-y", "feature": "brain_inference", "nonce": t_syb_y["nonce"], "result": {"status": "OK", "output": syb_phrase}})
-            s_syb_x = hub.verify_and_settle({"task_id": t_syb_x["task_id"], "worker_id": "sybil-diff-x", "feature": "brain_inference", "result": {"status": "OK", "output": syb_phrase}, "worker_proof": p_syb_x})
+            syb_phrase_1 = "The quantum banana is an elephant with a purple violin."
+            syb_phrase_2 = "A quantum banana was observed near a giant elephant holding a violin."
+            p_syb_x = compute_hmac(w_syb_x.key, {"task_id": t_syb_x["task_id"], "worker_id": "sybil-diff-x", "feature": "brain_inference", "nonce": t_syb_x["nonce"], "result": {"status": "OK", "output": syb_phrase_1}})
+            p_syb_y = compute_hmac(w_syb_y.key, {"task_id": t_syb_y["task_id"], "worker_id": "sybil-diff-y", "feature": "brain_inference", "nonce": t_syb_y["nonce"], "result": {"status": "OK", "output": syb_phrase_2}})
+            s_syb_x = hub.verify_and_settle({"task_id": t_syb_x["task_id"], "worker_id": "sybil-diff-x", "feature": "brain_inference", "result": {"status": "OK", "output": syb_phrase_1}, "worker_proof": p_syb_x})
             self.assertTrue(s_syb_x["ok"])
             self.assertEqual(s_syb_x["status"], "PENDING_CONSENSUS")
-            s_syb_y = hub.verify_and_settle({"task_id": t_syb_y["task_id"], "worker_id": "sybil-diff-y", "feature": "brain_inference", "result": {"status": "OK", "output": syb_phrase}, "worker_proof": p_syb_y})
+            s_syb_y = hub.verify_and_settle({"task_id": t_syb_y["task_id"], "worker_id": "sybil-diff-y", "feature": "brain_inference", "result": {"status": "OK", "output": syb_phrase_2}, "worker_proof": p_syb_y})
             self.assertFalse(s_syb_y["ok"])
             self.assertEqual(s_syb_y["status"], "REJECTED")
             self.assertIn("sybil_collusion_detected", s_syb_y["reason"])
+
+            # 11b. Deterministic Factual Query Consensus: Identical answers on short factual questions are SETTLED (not sybil)
+            w_fact_1 = hub.register_worker("fact-worker-1", url="local", public_ip="192.0.2.110", initial_credits=50)
+            w_fact_2 = hub.register_worker("fact-worker-2", url="local", public_ip="192.88.99.120", initial_credits=50)
+            t_f1 = hub.create_signed_task("fact-worker-1", "brain_inference", {"prompt": "What is the capital of Japan?", "consensus_id": "japan-cap-1"}, funded_credits=25)
+            t_f2 = hub.create_signed_task("fact-worker-2", "brain_inference", {"prompt": "What is the capital of Japan?", "consensus_id": "japan-cap-1"}, funded_credits=25)
+            ans_fact = "The capital of Japan is Tokyo."
+            p_f1 = compute_hmac(w_fact_1.key, {"task_id": t_f1["task_id"], "worker_id": "fact-worker-1", "feature": "brain_inference", "nonce": t_f1["nonce"], "result": {"status": "OK", "output": ans_fact}})
+            p_f2 = compute_hmac(w_fact_2.key, {"task_id": t_f2["task_id"], "worker_id": "fact-worker-2", "feature": "brain_inference", "nonce": t_f2["nonce"], "result": {"status": "OK", "output": ans_fact}})
+            s_f1 = hub.verify_and_settle({"task_id": t_f1["task_id"], "worker_id": "fact-worker-1", "feature": "brain_inference", "result": {"status": "OK", "output": ans_fact}, "worker_proof": p_f1})
+            self.assertEqual(s_f1["status"], "PENDING_CONSENSUS")
+            s_f2 = hub.verify_and_settle({"task_id": t_f2["task_id"], "worker_id": "fact-worker-2", "feature": "brain_inference", "result": {"status": "OK", "output": ans_fact}, "worker_proof": p_f2})
+            self.assertTrue(s_f2["ok"])
+            self.assertEqual(s_f2["status"], "SETTLED")
+            self.assertEqual(w_fact_1.credits, 75)
+            self.assertEqual(w_fact_2.credits, 75)
 
             # 12. Requester Escrow Refund on 300s TTL Expiry (No credits stuck or lost)
             w_requester = hub.register_worker("funder-requester-1", url="local", initial_credits=500)
@@ -1200,22 +1231,62 @@ class TestSecurityAudit50(unittest.TestCase):
             # Escrow is immediately refunded back to requester
             self.assertEqual(w_requester.credits, 500)
 
-            # 14. Golden Canary Task Spot-Check & Stake Slashing
+            # 14. Golden Canary Task Spot-Check & Graduated Penalty System
+            # 14a. Natural sentence answers ("The chemical symbol for gold is Au.") PASS cleanly
+            w_honest_canary = hub.register_worker("honest-canary-node", url="local", initial_credits=100)
+            canary_nat = hub.create_golden_canary_task("honest-canary-node", canary_idx=1)  # Au element canary
+            p_canary_nat = compute_hmac(w_honest_canary.key, {"task_id": canary_nat["task_id"], "worker_id": "honest-canary-node", "feature": "brain_inference", "nonce": canary_nat["nonce"], "result": {"status": "OK", "output": "The chemical symbol for gold is Au."}})
+            s_canary_nat = hub.verify_and_settle({"task_id": canary_nat["task_id"], "worker_id": "honest-canary-node", "feature": "brain_inference", "result": {"status": "OK", "output": "The chemical symbol for gold is Au."}, "worker_proof": p_canary_nat})
+            self.assertTrue(s_canary_nat["ok"])
+            self.assertEqual(s_canary_nat["status"], "SETTLED")
+            self.assertEqual(w_honest_canary.credits, 125)
+
+            # 14b. Graduated Saza: Strike 1 (Warning), Strike 2 (20% burn), Strike 3 (Slashing)
             w_cheater = hub.register_worker("cheater-canary-node", url="local", initial_credits=100)
             if getattr(grid, "token_sink", None):
                 grid.token_sink.stake_credits(w_cheater.worker_id, 50)
-            canary_task = hub.create_golden_canary_task("cheater-canary-node", canary_idx=0)
-            p_canary_bad = compute_hmac(w_cheater.key, {"task_id": canary_task["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "nonce": canary_task["nonce"], "result": {"status": "OK", "output": "quantum banana elephant violin"}})
-            s_canary = hub.verify_and_settle({"task_id": canary_task["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "result": {"status": "OK", "output": "quantum banana elephant violin"}, "worker_proof": p_canary_bad})
-            self.assertFalse(s_canary["ok"])
-            self.assertEqual(s_canary["status"], "SLASHED")
+
+            # Strike 1: First incorrect answer -> Warning, 0 credits deducted
+            c1 = hub.create_golden_canary_task("cheater-canary-node", canary_idx=0)
+            p_c1 = compute_hmac(w_cheater.key, {"task_id": c1["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "nonce": c1["nonce"], "result": {"status": "OK", "output": "incorrect answer"}})
+            s_c1 = hub.verify_and_settle({"task_id": c1["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "result": {"status": "OK", "output": "incorrect answer"}, "worker_proof": p_c1})
+            self.assertFalse(s_c1["ok"])
+            self.assertEqual(s_c1["status"], "REJECTED")
+            self.assertIn("canary_strike_1_warning", s_c1["reason"])
+            self.assertEqual(w_cheater.credits, 50)  # No penalty on strike 1 (50 liquid remains)
+
+            # Strike 2: Second incorrect answer -> 20% burn of balance
+            c2 = hub.create_golden_canary_task("cheater-canary-node", canary_idx=0)
+            p_c2 = compute_hmac(w_cheater.key, {"task_id": c2["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "nonce": c2["nonce"], "result": {"status": "OK", "output": "wrong again"}})
+            s_c2 = hub.verify_and_settle({"task_id": c2["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "result": {"status": "OK", "output": "wrong again"}, "worker_proof": p_c2})
+            self.assertFalse(s_c2["ok"])
+            self.assertEqual(s_c2["status"], "REJECTED")
+            self.assertIn("canary_strike_2_penalty", s_c2["reason"])
+            self.assertEqual(w_cheater.credits, 40)  # 20% burned: 50 - 10 = 40
+
+            # Strike 3: Third incorrect answer -> Full slash and blacklist
+            c3 = hub.create_golden_canary_task("cheater-canary-node", canary_idx=0)
+            p_c3 = compute_hmac(w_cheater.key, {"task_id": c3["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "nonce": c3["nonce"], "result": {"status": "OK", "output": "fraudulent gibberish"}})
+            s_c3 = hub.verify_and_settle({"task_id": c3["task_id"], "worker_id": "cheater-canary-node", "feature": "brain_inference", "result": {"status": "OK", "output": "fraudulent gibberish"}, "worker_proof": p_c3})
+            self.assertFalse(s_c3["ok"])
+            self.assertEqual(s_c3["status"], "SLASHED")
             self.assertEqual(w_cheater.status, "SLASHED")
             self.assertEqual(w_cheater.credits, 0)
             if getattr(grid, "token_sink", None):
                 stk_status = grid.token_sink.get_staking_status(w_cheater.worker_id)
                 self.assertEqual(stk_status["user_staked"], 0)
 
-            # 15. Hub Autonomous Consensus Pair Dispatch
+            # 14c. Automated Canary Injection and Disguised Pull Verification
+            hub.force_canary_injection = True
+            pulled_canaries = hub.pull_pending_tasks("honest-canary-node")
+            hub.force_canary_injection = False
+            self.assertGreater(len(pulled_canaries), 0)
+            canary_pkt = pulled_canaries[-1]
+            self.assertEqual(canary_pkt.get("funded_by"), "mesh_requester")
+            self.assertNotIn("is_canary", canary_pkt)
+            self.assertNotIn("canary_spec", canary_pkt)
+
+            # 15. Hub Autonomous Consensus Pair Dispatch & HTTP API Endpoint
             t_pair1, t_pair2 = hub.dispatch_consensus_task(
                 "brain_inference",
                 {"prompt": "Explain photoelectricity simply"},
@@ -1227,6 +1298,25 @@ class TestSecurityAudit50(unittest.TestCase):
             p_w2 = hub.get_worker(t_pair2["worker_id"])
             from sovereign_mesh.hub_spoke import _is_independent_peer
             self.assertTrue(_is_independent_peer(p_w1, p_w2))
+
+            # Verify /api/worker/enqueue_task with consensus=True routes via dispatch_consensus_task
+            enqueue_req = urllib.request.Request(
+                f"{base_url}/api/worker/enqueue_task",
+                data=json.dumps({
+                    "consensus": True,
+                    "feature_key": "brain_inference",
+                    "payload": {"prompt": "What is machine learning?"},
+                    "funded_by_key": w_requester.key,
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(enqueue_req, timeout=5) as enq_resp:
+                self.assertEqual(enq_resp.status, 200)
+                enq_data = json.loads(enq_resp.read().decode("utf-8"))
+                self.assertTrue(enq_data["ok"])
+                self.assertTrue(enq_data["consensus"])
+                self.assertEqual(len(enq_data["queued_packets"]), 2)
+                self.assertNotEqual(enq_data["queued_packets"][0]["worker_id"], enq_data["queued_packets"][1]["worker_id"])
 
             # --- Phase A: B5 Redactions & Route Verification ---
             # Verify /chat and /download/worker are accessible

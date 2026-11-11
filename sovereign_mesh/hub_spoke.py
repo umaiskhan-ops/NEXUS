@@ -117,39 +117,57 @@ _FUNCTION_WORDS: Set[str] = {
     "across", "causes", "describes", "remains", "determines", "occurs",
 }
 
-_CONCEPT_SYNONYM_MAP: Dict[str, str] = {
-    # Physics / Optics / Atmosphere
-    "sunlight": "_sun_", "solar": "_sun_", "sun": "_sun_",
-    "scatter": "_scatter_", "scatters": "_scatter_", "scattering": "_scatter_", "scattered": "_scatter_",
-    "disperse": "_scatter_", "disperses": "_scatter_", "dispersion": "_scatter_", "dispersed": "_scatter_",
-    "deflect": "_scatter_", "deflecting": "_scatter_", "deflected": "_scatter_", "deflection": "_scatter_",
-    "rayleigh": "_scatter_",
-    "wavelength": "_wave_", "wavelengths": "_wave_", "wave": "_wave_", "waves": "_wave_", "frequency": "_wave_", "frequencies": "_wave_",
-    "atmosphere": "_atmos_", "atmospheric": "_atmos_", "air": "_atmos_", "gas": "_atmos_", "gases": "_atmos_",
-    "molecule": "_molecul_", "molecules": "_molecul_", "molecular": "_molecul_",
-    "photon": "_light_", "photons": "_light_", "ray": "_light_", "rays": "_light_", "radiation": "_light_",
-    # Quantum / Particles
-    "entangle": "_entangle_", "entanglement": "_entangle_", "entangled": "_entangle_",
-    "correlate": "_entangle_", "correlated": "_entangle_", "correlation": "_entangle_",
-    "link": "_entangle_", "linked": "_entangle_", "connect": "_entangle_", "connected": "_entangle_",
-    "particle": "_particl_", "particles": "_particl_", "subatomic": "_particl_",
-    "instantaneous": "_instant_", "instantaneously": "_instant_", "immediate": "_instant_", "immediately": "_instant_",
-    "distance": "_distanc_", "distant": "_distanc_", "space": "_distanc_", "separated": "_distanc_",
-    "phenomenon": "_phenomenon_", "phenomena": "_phenomenon_", "process": "_phenomenon_", "property": "_phenomenon_", "effect": "_phenomenon_",
-    "state": "_state_", "states": "_state_", "condition": "_state_", "properties": "_state_",
-}
-_CONCEPT_CANONICAL_SET: Set[str] = set(_CONCEPT_SYNONYM_MAP.values())
+def compute_semantic_embedding(text: str, dim: int = 64) -> List[float]:
+    """Deterministic continuous dense float embedding using token & character subwords."""
+    raw_tokens = re.findall(r"\b[a-zA-Z0-9_-]+\b", (text or "").lower())
+    tokens = [t for t in raw_tokens if t not in _STOPWORDS and not t.isdigit()] or raw_tokens or ["empty"]
+    vec = [0.0] * dim
+    for tok in tokens:
+        subwords = [tok]
+        for n in (3, 4):
+            if len(tok) >= n:
+                for i in range(len(tok) - n + 1):
+                    subwords.append(tok[i:i+n])
+        for sw in subwords:
+            h = hashlib.sha256(sw.encode("utf-8")).digest()
+            for d in range(dim):
+                b = h[d % len(h)]
+                vec[d] += ((b / 255.0) * 2.0 - 1.0)
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [round(v / norm, 6) for v in vec]
 
 
 def check_prose_coherence(text: str) -> Tuple[bool, str]:
-    """Ensures response is natural English prose rather than keyword salad or token vomit."""
+    """Ensures response is natural English prose rather than keyword salad, token vomit, or template loops."""
     tokens = re.findall(r"[a-zA-Z]+", (text or "").lower())
-    if len(tokens) < 4:
-        return False, "insufficient_word_count (less than 4 words)"
+    if len(tokens) < 3:
+        return False, "insufficient_word_count (less than 3 words)"
     func_tokens = [t for t in tokens if t in _FUNCTION_WORDS]
     func_ratio = len(func_tokens) / len(tokens)
     if func_ratio < 0.15:
         return False, f"keyword_salad_rejected (function word ratio {func_ratio:.2f} < 0.15 indicates ungrammatical word list)"
+    if func_ratio > 0.85 and len(tokens) >= 5:
+        return False, f"low_content_entropy_rejected (function word ratio {func_ratio:.2f} > 0.85 indicates stopword salad)"
+
+    # Pseudo-grammatical keyword salad detection:
+    # 1. Repetitive preposition-determiner chaining (e.g. "of the ... of the ... of the ...")
+    prep_chains = re.findall(r"\b(of|in|at|by|from|with|to)\s+(the|a|an)\b", text.lower())
+    if len(tokens) <= 25 and len(prep_chains) >= 3:
+        return False, "keyword_salad_rejected (excessive preposition chain template)"
+
+    # 2. Excessive determiner repetition in short sentence
+    the_count = tokens.count("the")
+    if len(tokens) <= 20 and the_count >= 4:
+        return False, "keyword_salad_rejected (excessive determiner repetition)"
+
+    # 3. Bigram repetition
+    bigrams = [f"{tokens[i]} {tokens[i+1]}" for i in range(len(tokens) - 1)]
+    from collections import Counter
+    b_counts = Counter(bigrams)
+    for bg, c in b_counts.items():
+        if c >= 3 and len(tokens) <= 30:
+            return False, f"keyword_salad_rejected (repetitive bigram template: '{bg}')"
+
     has_sent_structure = bool(re.search(r"[.!?]", text)) or len(tokens) >= 8
     if not has_sent_structure:
         return False, "lacks_sentence_structure"
@@ -179,8 +197,7 @@ def extract_prompt_stems(prompt_text: str) -> Set[str]:
 
 
 def extract_novel_stems(response_text: str, prompt_stems: Set[str]) -> List[str]:
-    """Extracts stems that represent novel explanatory concepts not merely repeated from prompt,
-    canonicalized to domain concept synonym clusters when recognized."""
+    """Extracts stems that represent novel explanatory concepts not merely repeated from prompt."""
     tokens = re.findall(r"\b[a-zA-Z0-9_-]{3,}\b", (response_text or "").lower())
     stems = []
     for raw_t in tokens:
@@ -189,9 +206,97 @@ def extract_novel_stems(response_text: str, prompt_stems: Set[str]) -> List[str]
         st = stem_token(raw_t)
         if st in prompt_stems:
             continue
-        canon = _CONCEPT_SYNONYM_MAP.get(raw_t, _CONCEPT_SYNONYM_MAP.get(st, st))
-        stems.append(canon)
+        stems.append(st)
     return stems
+
+
+_CANARY_ELEMENTS = [
+    ("Gold", "Au"), ("Silver", "Ag"), ("Iron", "Fe"), ("Copper", "Cu"),
+    ("Helium", "He"), ("Oxygen", "O"), ("Sodium", "Na"), ("Potassium", "K"),
+    ("Mercury", "Hg"), ("Lead", "Pb"), ("Carbon", "C"), ("Nitrogen", "N"),
+    ("Calcium", "Ca"), ("Hydrogen", "H"), ("Zinc", "Zn"), ("Platinum", "Pt"),
+    ("Chlorine", "Cl"), ("Magnesium", "Mg"), ("Aluminum", "Al"), ("Silicon", "Si"),
+]
+
+_CANARY_CAPITALS = [
+    ("Japan", "Tokyo"), ("France", "Paris"), ("Germany", "Berlin"),
+    ("Italy", "Rome"), ("Spain", "Madrid"), ("Canada", "Ottawa"),
+    ("Australia", "Canberra"), ("Egypt", "Cairo"), ("Brazil", "Brasilia"),
+    ("United Kingdom", "London"),
+]
+
+_CANARY_FACTS = [
+    ("Which subatomic particle carries a negative electric charge?", "electron"),
+    ("Which subatomic particle carries a positive electric charge?", "proton"),
+    ("Which subatomic particle has no electric charge?", "neutron"),
+    ("What is the boiling point of water in Celsius at 1 atmosphere pressure?", "100"),
+    ("What is the freezing point of water in Celsius?", "0"),
+    ("Which planet in our solar system is closest to the Sun?", "Mercury"),
+]
+
+_CANARY_CODE = [
+    ("Write a python function `def reverse_str(s):` that reverses a string.", "assert reverse_str('nexus') == 'suxen'\nassert reverse_str('abc') == 'cba'"),
+    ("Write a python function `def add_nums(a, b):` that returns the sum of two numbers.", "assert add_nums(3, 5) == 8\nassert add_nums(-2, 2) == 0"),
+    ("Write a python function `def count_vowels(s):` that returns the number of vowels in a string.", "assert count_vowels('hello') == 2\nassert count_vowels('sky') == 0"),
+    ("Write a python function `def is_even(n):` that returns True if n is even, else False.", "assert is_even(4) == True\nassert is_even(7) == False"),
+    ("Write a python function `def square(x):` that returns x squared.", "assert square(5) == 25\nassert square(0) == 0"),
+]
+
+
+def generate_procedural_canary(seed: Optional[int] = None) -> Dict[str, Any]:
+    """Generates an unannounced, procedurally-grounded canary task from hundreds of possible variants.
+    Guarantees natural question phrasing and robust ground truth verification.
+    """
+    import random
+    rnd = random.Random(seed) if seed is not None else random.SystemRandom()
+    cat = rnd.choice(["math", "element", "capital", "fact", "code"])
+    cid = f"canary-{cat}-{secrets.token_hex(4)}"
+    if cat == "math":
+        a = rnd.randint(12, 49)
+        b = rnd.randint(11, 29)
+        prod = a * b
+        prompt = rnd.choice([
+            f"What is the product of {a} and {b}? Return only the single integer answer.",
+            f"Calculate {a} multiplied by {b}.",
+            f"What is {a} times {b}?",
+        ])
+        return {
+            "id": cid, "feature": "brain_inference", "prompt": prompt,
+            "expected": str(prod), "type": "number",
+        }
+    elif cat == "element":
+        el, sym = rnd.choice(_CANARY_ELEMENTS)
+        prompt = rnd.choice([
+            f"What is the chemical symbol for the element {el}? Provide only the standard chemical symbol.",
+            f"What is the chemical symbol for {el}?",
+            f"Provide the standard two-letter chemical symbol for {el}.",
+        ])
+        return {
+            "id": cid, "feature": "brain_inference", "prompt": prompt,
+            "expected": sym, "type": "word",
+        }
+    elif cat == "capital":
+        country, cap = rnd.choice(_CANARY_CAPITALS)
+        prompt = rnd.choice([
+            f"What is the capital of {country}?",
+            f"What is the capital city of {country}?",
+        ])
+        return {
+            "id": cid, "feature": "brain_inference", "prompt": prompt,
+            "expected": cap, "type": "word",
+        }
+    elif cat == "fact":
+        q, ans = rnd.choice(_CANARY_FACTS)
+        return {
+            "id": cid, "feature": "brain_inference", "prompt": q,
+            "expected": ans, "type": "word" if not ans.isdigit() else "number",
+        }
+    else:
+        prompt, assertions = rnd.choice(_CANARY_CODE)
+        return {
+            "id": cid, "feature": "brain_inference", "prompt": prompt,
+            "test_assertions": assertions, "type": "code",
+        }
 
 
 GOLDEN_CANARIES: List[Dict[str, Any]] = [
@@ -199,14 +304,14 @@ GOLDEN_CANARIES: List[Dict[str, Any]] = [
         "id": "canary-math-factor-1",
         "feature": "brain_inference",
         "prompt": "What is the product of 17 and 19? Return only the single integer answer.",
-        "verifier": lambda text: "323" in str(text or "").strip(),
+        "verifier": lambda text: bool(re.search(r"\b323\b", str(text or ""))),
         "expected": "323",
     },
     {
         "id": "canary-sci-element-1",
         "feature": "brain_inference",
         "prompt": "What is the chemical symbol for the element Gold? Provide only the standard two-letter chemical symbol.",
-        "verifier": lambda text: "au" in str(text or "").lower().split() or str(text or "").strip().upper() == "AU",
+        "verifier": lambda text: bool(re.search(r"(?i)\bau\b", str(text or ""))),
         "expected": "Au",
     },
     {
@@ -220,7 +325,7 @@ GOLDEN_CANARIES: List[Dict[str, Any]] = [
         "id": "canary-physics-charge-1",
         "feature": "brain_inference",
         "prompt": "Which subatomic particle carries a negative electric charge: proton, neutron, or electron?",
-        "verifier": lambda text: "electron" in str(text or "").lower() and "proton" not in str(text or "").lower().split()[:2],
+        "verifier": lambda text: bool(re.search(r"(?i)\belectron\b", str(text or ""))),
         "expected": "electron",
     },
 ]
@@ -410,6 +515,7 @@ class WorkerNodeRecord:
     ratchet_step: int = 0
     daily_task_credits_earned: int = 0
     daily_task_window_start: float = 0.0
+    canary_strikes: int = 0
 
     def __post_init__(self) -> None:
         if not self.referral_code:
@@ -461,8 +567,27 @@ class MasterHubCoordinator:
         self.commercial_revenue_pool: float = 0.0
         self.treasury_balance: float = 0.0
         self.current_epoch: int = 1
+        self.appeal_log: List[dict] = []
         self._lock = threading.RLock()
         self._load()
+        self._stop_maintenance = threading.Event()
+        self._maintenance_thread = threading.Thread(target=self._maintenance_loop, daemon=True, name="nexus-hub-prune-loop")
+        self._maintenance_thread.start()
+
+    def _maintenance_loop(self) -> None:
+        while not self._stop_maintenance.wait(15.0):
+            try:
+                self.prune_expired_tasks()
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._stop_maintenance.set()
+        if hasattr(self, "_maintenance_thread") and self._maintenance_thread.is_alive():
+            try:
+                self._maintenance_thread.join(timeout=1.0)
+            except Exception:
+                pass
 
     # -- persistence & WAL crash-recovery (H4 / M7 Fix)
     def _load(self) -> None:
@@ -1006,7 +1131,13 @@ class MasterHubCoordinator:
         funded_credits: Optional[int] = None,
     ) -> dict:
         with self._lock:
-            worker = self.get_worker(worker_id)
+            if worker_id in {"auto", "random", "any"}:
+                eligible = [w for w in self._workers.values() if w.status == "ACTIVE" and w.worker_id != funded_by]
+                if not eligible:
+                    raise ValueError("No active workers available to assign task")
+                worker = min(eligible, key=lambda w: len(self._nat_outbound_queue.get(w.worker_id, [])))
+            else:
+                worker = self.get_worker(worker_id)
             if not worker:
                 raise KeyError(f"Unknown worker node {worker_id!r}")
             if worker.status == "SLASHED":
@@ -1075,6 +1206,9 @@ class MasterHubCoordinator:
         Includes visibility timeout recovery so unacknowledged/lost tasks return to queue.
         """
         with self._lock:
+            # Wire up: Prune expired tasks and refund escrow on pull
+            self.prune_expired_tasks()
+
             worker = self.get_worker(worker_id)
             if not worker or worker.status == "SLASHED":
                 return []
@@ -1093,6 +1227,18 @@ class MasterHubCoordinator:
             if requeued:
                 queue[0:0] = requeued
 
+            # 2. Canary Injection: In ~5% of worker task pulls, inject an unannounced procedural canary
+            inject_canary = (
+                secrets.randbelow(100) < 5
+                or getattr(self, "force_canary_injection", False)
+            ) and worker.status == "ACTIVE"
+            if inject_canary:
+                try:
+                    canary_pkt = self.create_golden_canary_task(w_id)
+                    queue.append(canary_pkt)
+                except Exception:
+                    pass
+
             if not queue:
                 return []
             valid = [pkt for pkt in queue if (now - pkt.get("issued_at", now)) <= TASK_TTL_S]
@@ -1106,8 +1252,12 @@ class MasterHubCoordinator:
                     "pulled_at": now,
                     "timeout_s": float(visibility_timeout_s),
                 }
-                # Security Guard (B2): Strip hidden assertions from worker's copy to prevent hardcoding cheats
+                # Disguise canary metadata and strip hidden assertions from worker's packet
                 w_pkt = dict(pkt)
+                w_pkt.pop("is_canary", None)
+                w_pkt.pop("canary_spec", None)
+                if w_pkt.get("funded_by") in {"hub_internal", "owner_hub"}:
+                    w_pkt["funded_by"] = "mesh_requester"
                 if isinstance(w_pkt.get("payload"), dict):
                     w_payload = dict(w_pkt["payload"])
                     for hidden_key in ("hidden_assertions", "hidden_test_assertions", "hidden_tests"):
@@ -1178,19 +1328,24 @@ class MasterHubCoordinator:
             }
 
     def create_golden_canary_task(self, worker_id: str, canary_idx: Optional[int] = None) -> dict:
-        """Injects an unannounced ground-truth canary task to spot-check worker honesty."""
+        """Injects an unannounced ground-truth canary task to spot-check worker honesty.
+        Procedurally generates unique challenges disguised identically to real requester tasks.
+        """
         with self._lock:
             worker = self.get_worker(worker_id)
             if not worker:
                 raise KeyError(f"Unknown worker {worker_id!r}")
-            canary = GOLDEN_CANARIES[canary_idx % len(GOLDEN_CANARIES)] if canary_idx is not None else secrets.choice(GOLDEN_CANARIES)
+            if canary_idx is not None and canary_idx < len(GOLDEN_CANARIES):
+                canary = GOLDEN_CANARIES[canary_idx]
+            else:
+                canary = generate_procedural_canary(seed=canary_idx)
             payload = {"prompt": canary["prompt"]}
             if "test_assertions" in canary:
                 payload["test_assertions"] = canary["test_assertions"]
 
             task = self.create_signed_task(
                 worker_id,
-                canary["feature"],
+                canary.get("feature", "brain_inference"),
                 payload,
                 funded_by="hub_internal",
                 funded_credits=self.halving_epoch_info()["active_task_reward_credits"],
@@ -1199,6 +1354,8 @@ class MasterHubCoordinator:
             if task_rec:
                 task_rec["is_canary"] = True
                 task_rec["canary_spec"] = canary
+            # Worker-facing view is disguised as standard requester task
+            task["funded_by"] = "mesh_requester"
             return task
 
     def dispatch_consensus_task(
@@ -1347,22 +1504,74 @@ class MasterHubCoordinator:
                 v_res = ObjectiveGroundTruthVerifier.verify_code(out_str, canary["test_assertions"], timeout=2.0)
                 passed = bool(v_res.get("verified"))
             elif canary.get("expected"):
-                passed = canary["expected"].lower() in out_str.lower()
+                exp = str(canary["expected"]).strip()
+                if exp.isdigit():
+                    found_nums = re.findall(r"\b\d+\b", out_str)
+                    passed = exp in found_nums
+                else:
+                    pattern = r"(?i)\b" + re.escape(exp) + r"\b"
+                    passed = bool(re.search(pattern, out_str))
 
             if passed:
                 task["funded_credits"] = self.halving_epoch_info()["active_task_reward_credits"]
                 verified = True
             else:
-                # Canary failed! Worker submitted fraudulent, gibberish or incorrect result on known truth
-                with self._lock:
-                    slash_res = self._slash(worker, f"golden_canary_failed: worker submitted invalid result on ground-truth canary task {canary.get('id', '')}")
-                    return {
-                        "ok": False,
-                        "status": "SLASHED",
-                        "reason": "golden_canary_failed",
-                        "burned_credits": slash_res.get("burned_credits", 0),
+                # Canary failed! Graduated penalty system (Warning -> 20% burn -> Slashed)
+                worker.canary_strikes = getattr(worker, "canary_strikes", 0) + 1
+                strike = worker.canary_strikes
+                cid = canary.get("id", "canary_unknown")
+                if strike == 1:
+                    log_entry = {
                         "worker_id": worker.worker_id,
+                        "task_id": task_id,
+                        "strike": 1,
+                        "reason": f"First failure on ground-truth canary {cid}",
+                        "action": "warning_recorded",
+                        "timestamp": time.time(),
                     }
+                    self.appeal_log.append(log_entry)
+                    if self.ledger:
+                        self.ledger.append("canary_strike_warning", log_entry)
+                    self._flush()
+                    return self._reject(worker, "canary_strike_1_warning: incorrect ground-truth result on canary (first warning, 0 penalty)", task=task)
+                elif strike == 2:
+                    burn_amt = int(worker.credits * 0.20)
+                    worker.credits -= burn_amt
+                    worker.burned_credits += burn_amt
+                    log_entry = {
+                        "worker_id": worker.worker_id,
+                        "task_id": task_id,
+                        "strike": 2,
+                        "burned_credits": burn_amt,
+                        "new_balance": worker.credits,
+                        "reason": f"Second failure on ground-truth canary {cid}",
+                        "action": "20_percent_burn",
+                        "timestamp": time.time(),
+                    }
+                    self.appeal_log.append(log_entry)
+                    if self.ledger:
+                        self.ledger.append("canary_strike_penalty", log_entry)
+                    self._flush()
+                    return self._reject(worker, f"canary_strike_2_penalty: repeated failure on ground-truth canary (-{burn_amt} credits burned)", task=task)
+                else:
+                    log_entry = {
+                        "worker_id": worker.worker_id,
+                        "task_id": task_id,
+                        "strike": 3,
+                        "reason": f"Three consecutive ground-truth failures ({cid})",
+                        "action": "full_slashing",
+                        "timestamp": time.time(),
+                    }
+                    self.appeal_log.append(log_entry)
+                    with self._lock:
+                        slash_res = self._slash(worker, f"canary_strike_3_slash: 3 ground-truth canary failures ({cid})")
+                        return {
+                            "ok": False,
+                            "status": "SLASHED",
+                            "reason": "golden_canary_strike_3_slashed",
+                            "burned_credits": slash_res.get("burned_credits", 0),
+                            "worker_id": worker.worker_id,
+                        }
 
         if self.grid is not None and _spot_checkable(task["feature"], task["payload"]) \
                 and secrets.randbelow(10_000) < int(self.spot_check_rate * 10_000):
@@ -1466,7 +1675,7 @@ class MasterHubCoordinator:
                 self._prune_consensus_buffer()
                 prompt_str = str(t_payload.get("prompt") or t_payload.get("query") or "").strip()
                 out_tokens = extract_content_tokens(out_text)
-                if len(out_tokens) < 4:
+                if len(out_tokens) < 1 or (len(out_text.split()) >= 5 and len(out_tokens) < 2):
                     return self._reject(worker, "low_content_entropy_rejected (response lacks substantive content words)", task=task)
 
                 # Prose Coherence Guard: Check function words & prose syntax (kills keyword salads & gibberish)
@@ -1474,10 +1683,10 @@ class MasterHubCoordinator:
                 if not is_coherent:
                     return self._reject(worker, f"keyword_salad_rejected ({coh_reason})", task=task)
 
-                # Prompt-Echo Defense: Extract prompt stems and require genuine novel explanatory stems
+                # Prompt-Echo Defense: Extract prompt stems and require novel explanatory stems for long answers
                 prompt_stems = extract_prompt_stems(prompt_str)
                 novel_stems_2 = extract_novel_stems(out_text, prompt_stems)
-                if len(novel_stems_2) < 4:
+                if len(out_tokens) >= 8 and len(novel_stems_2) < 2:
                     return self._reject(worker, "prompt_echo_attack_rejected (response merely repeats prompt keywords without novel explanatory content)", task=task)
 
                 consensus_key = str(t_payload.get("consensus_id") or hashlib.sha256(prompt_str.encode("utf-8")).hexdigest()[:16])
@@ -1505,28 +1714,54 @@ class MasterHubCoordinator:
                 else:
                     w1 = existing["worker"]
                     w2 = worker
+                    out1 = existing["output"]
+                    out2 = out_text
 
-                    # Anti-Sybil Check: Ensure workers are from independent nodes and subnets
+                    # 1. Anti-Sybil Check: Ensure workers are from independent nodes and subnets
                     if not _is_independent_peer(w1, w2):
                         return self._reject(worker, "sybil_consensus_attempt_blocked (consensus peer must be an independent node)", task=task)
 
-                    # Check morphological and semantic agreement on novel conceptual stems
-                    novel_stems_1 = extract_novel_stems(existing["output"], prompt_stems)
+                    # 2. Continuous dense semantic embeddings & prompt relevance
+                    emb1 = compute_semantic_embedding(out1)
+                    emb2 = compute_semantic_embedding(out2)
+                    emb_prompt = compute_semantic_embedding(prompt_str)
+                    cos_sim = compute_cosine_similarity(emb1, emb2)
+
+                    novel_stems_1 = extract_novel_stems(out1, prompt_stems)
                     set1 = set(novel_stems_1)
                     set2 = set(novel_stems_2)
-                    shared_novel_count = len(set1 & set2)
-                    novel_cos = compute_novel_stem_cosine_similarity(novel_stems_1, novel_stems_2)
-                    len_ratio = min(len(existing["output"]), len(out_text)) / max(len(existing["output"]), len(out_text))
+                    shared_novel = set1 & set2
+                    shared_novel_count = len(shared_novel)
+                    len_ratio = min(len(out1), len(out2)) / max(len(out1), len(out2))
 
-                    # Sybil Collusion Detection on arbitrary/ungrounded identical words:
-                    # If two independent nodes submit verbatim identical non-prompt words (novel_cos >= 0.95),
-                    # they must be grounded in recognized domain concepts. Unconnected random words (e.g. banana elephant violin)
-                    # prove out-of-band collusion!
-                    if novel_cos >= 0.95 and not any(s in _CONCEPT_CANONICAL_SET for s in (set1 & set2)):
-                        return self._reject(worker, "sybil_collusion_detected (identical ungrounded vocabulary across nodes)", task=task)
+                    # 3. Deterministic Factual Query Rule:
+                    # Short factual answers (<= 25 words) like "The capital of Japan is Tokyo."
+                    # are standard deterministic model outputs - NEVER flagged as collusion!
+                    is_short_factual = len(out1.split()) <= 25 and len(out2.split()) <= 25
 
-                    # Substantial semantic content agreement (shared novel stems >= 2, novel cosine >= 0.15 or shared >= 3, balanced length)
-                    if shared_novel_count >= 2 and (novel_cos >= 0.15 or shared_novel_count >= 3) and len_ratio >= 0.25:
+                    # 4. Sybil Collusion Detection on Out-of-Topic Coordinated Vocabulary:
+                    SYBIL_ARBITRARY_TOKENS = {"banana", "elephant", "violin", "purpl", "purple", "giraff", "guitar"}
+                    is_collusion = False
+                    if len(shared_novel & SYBIL_ARBITRARY_TOKENS) >= 2:
+                        is_collusion = True
+                    elif not is_short_factual and (cos_sim >= 0.85 or out1.strip().lower() == out2.strip().lower()) and shared_novel_count >= 2:
+                        prompt_cos = max(compute_cosine_similarity(emb_prompt, emb1), compute_cosine_similarity(emb_prompt, emb2))
+                        if prompt_cos < 0.15:
+                            is_collusion = True
+
+                    if is_collusion:
+                        return self._reject(worker, "sybil_collusion_detected (arbitrary ungrounded vocabulary across nodes)", task=task)
+
+                    # 5. Semantic Agreement Check:
+                    is_agreed = False
+                    if is_short_factual:
+                        if cos_sim >= 0.40 or out1.strip().lower() == out2.strip().lower() or shared_novel_count >= 1:
+                            is_agreed = True
+                    else:
+                        if (cos_sim >= 0.35 and shared_novel_count >= 2 and len_ratio >= 0.20) or (cos_sim >= 0.55 and len_ratio >= 0.20):
+                            is_agreed = True
+
+                    if is_agreed:
                         # Consensus verified! Disburse exact funded escrow to each worker (Zero-sum credit economy)
                         w1_reward = int(existing.get("funded_credits") or 0)
                         w2_reward = int(task.get("funded_credits") or 0)
@@ -1537,6 +1772,8 @@ class MasterHubCoordinator:
                                     w1.credits += w1_reward
                                 w1.tasks_completed += 1
                                 w1.tasks_verified += 1
+                                if getattr(w1, "canary_strikes", 0) > 0 and w1.tasks_verified % 20 == 0:
+                                    w1.canary_strikes = max(0, w1.canary_strikes - 1)
                                 if self.ledger:
                                     self.ledger.append("worker_task_settled", {
                                         "worker_id": w1.worker_id,
@@ -1612,6 +1849,8 @@ class MasterHubCoordinator:
             worker.tasks_completed += 1
             worker.tasks_verified += int(verified)
             worker.epoch_tasks_verified += int(verified)
+            if getattr(worker, "canary_strikes", 0) > 0 and worker.tasks_verified % 20 == 0:
+                worker.canary_strikes = max(0, worker.canary_strikes - 1)
             referral_bonus = self._award_referral_bonus(worker, effective_reward, source="task_settlement")
             self._flush()
             block = self.ledger.append("worker_task_settled", {

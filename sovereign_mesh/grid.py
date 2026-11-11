@@ -160,6 +160,11 @@ class UltimateAgiSovereignGrid:
     def stop(self) -> None:
         self.shutdown_event.set()
         self.scheduler.stop()
+        if hasattr(self, "hub") and self.hub and hasattr(self.hub, "stop"):
+            try:
+                self.hub.stop()
+            except Exception:
+                pass
         try:
             self.continuous_learning.stop_auto_gpu_training_daemon()
         except Exception:
@@ -212,6 +217,11 @@ class UltimateAgiSovereignGrid:
 
     def _monitor_loop(self) -> None:
         while not self.shutdown_event.wait(60.0):
+            if hasattr(self, "hub") and self.hub and hasattr(self.hub, "prune_expired_tasks"):
+                try:
+                    self.hub.prune_expired_tasks()
+                except Exception:
+                    pass
             alerts = set(self.check_alerts())
             new = alerts - self._last_alerts
             self._last_alerts = alerts

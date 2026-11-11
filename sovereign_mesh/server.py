@@ -1294,15 +1294,16 @@ def make_handler(grid, client):
                     wid = str(body.get("worker_id") or "").strip()
                     fkey = str(body.get("feature_key") or "brain_inference").strip()
                     payload_data = body.get("payload") if isinstance(body.get("payload"), dict) else {"prompt": str(body.get("prompt") or "")}
-                    if not wid:
-                        return self._send(400, {"ok": False, "error": "worker_id is required"})
+                    is_consensus = bool(body.get("consensus")) or wid.lower() in {"consensus"}
+                    if not wid and not is_consensus:
+                        wid = "auto"
                     funded_by_id = "owner_hub"
                     if not is_owner:
                         try:
                             req_worker = grid.hub.authenticate_worker_key(funded_by_key)
                         except PermissionError as p_err:
                             return self._send(401, {"ok": False, "error": str(p_err)})
-                        if req_worker.worker_id == wid:
+                        if wid and req_worker.worker_id == wid and not is_consensus:
                             return self._send(403, {
                                 "ok": False,
                                 "error": "self_enqueued_task_forbidden: workers cannot enqueue or fund tasks for themselves",
@@ -1311,6 +1312,37 @@ def make_handler(grid, client):
                     elif body.get("funded_by"):
                         funded_by_id = str(body.get("funded_by")).strip()
                     try:
+                        if is_consensus:
+                            t1, t2 = grid.hub.dispatch_consensus_task(
+                                fkey,
+                                payload_data,
+                                funded_by=funded_by_id,
+                                funded_credits=body.get("funded_credits"),
+                            )
+                            return self._send(200, {
+                                "ok": True,
+                                "consensus": True,
+                                "queued_packets": [
+                                    {
+                                        "task_id": t1["task_id"],
+                                        "worker_id": t1["worker_id"],
+                                        "feature": t1["feature"],
+                                        "issued_at": t1["issued_at"],
+                                        "funded_by": t1.get("funded_by", funded_by_id),
+                                        "funded_credits": t1.get("funded_credits", 0),
+                                        "status": "QUEUED",
+                                    },
+                                    {
+                                        "task_id": t2["task_id"],
+                                        "worker_id": t2["worker_id"],
+                                        "feature": t2["feature"],
+                                        "issued_at": t2["issued_at"],
+                                        "funded_by": t2.get("funded_by", funded_by_id),
+                                        "funded_credits": t2.get("funded_credits", 0),
+                                        "status": "QUEUED",
+                                    },
+                                ],
+                            })
                         pkt = grid.hub.enqueue_nat_task(wid, fkey, payload_data, funded_by=funded_by_id)
                         # Never leak nonce or hub_signature in enqueue_task HTTP response
                         safe_summary = {
