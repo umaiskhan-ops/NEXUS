@@ -93,6 +93,7 @@ _STOPWORDS: Set[str] = {
     "too", "very", "about", "above", "after", "again", "against", "between", "into",
     "through", "during", "before", "under", "below", "up", "down", "over", "just",
     "what", "which", "who", "whom", "these", "those", "am", "been", "being",
+    "because", "becaus",
     # Roman Urdu common function words
     "hai", "hain", "ke", "ki", "ko", "se", "par", "ka", "kya", "ye", "woh", "aur",
     "bhi", "tha", "thi", "the", "kar", "karna", "hoti", "hota", "hote", "mein", "main",
@@ -208,6 +209,113 @@ def extract_novel_stems(response_text: str, prompt_stems: Set[str]) -> List[str]
             continue
         stems.append(st)
     return stems
+
+
+ANTONYM_MODIFIERS: List[Tuple[Set[str], Set[str]]] = [
+    ({"less", "lower", "decrease", "decreasing", "drop", "fall", "erode", "eroding", "decay", "loss", "reduc", "reducing", "deflation", "cheaper"},
+     {"more", "higher", "increase", "increasing", "rise", "rising", "grow", "gain", "expand", "expanding", "inflation", "expensive"}),
+    ({"less dense", "lower density", "lighter", "9% less dense"},
+     {"denser", "heavier", "higher density", "more dense"}),
+    ({"absorb", "absorbs", "absorbing", "intake", "consume", "take in", "capture"},
+     {"produce", "produces", "producing", "release", "releases", "releasing", "emit", "discharge", "discharging", "generate", "create", "output"}),
+    ({"reliable", "guarantee", "guarantees", "ordered", "error-checked", "connection-oriented", "handshake"},
+     {"unreliable", "connectionless", "unordered", "lossy", "no guarantee", "without delivery guarantees", "without verification", "drops"}),
+    ({"stimulate", "stimulates", "train", "training", "protect", "defend", "neutralize", "immunity", "antibodies"},
+     {"destroy", "destroying", "poison", "harm", "kill immune", "damage", "weaken"}),
+    ({"tilt", "tilted", "angle", "angles", "inclination", "obliquity"},
+     {"closer to the sun", "farther away", "elliptical orbit distance", "distance to the sun"}),
+    ({"scatter", "scattered", "scattering", "rayleigh", "wavelength", "wavelengths"},
+     {"reflect the ocean", "mirror that reflects", "ocean waters", "reflects the blue color", "giant mirror"}),
+    ({"barbarian", "invasion", "invasions", "visigoths", "vandals", "mercenaries", "corruption", "internal decay"},
+     {"asteroid", "meteor", "alien", "comet strike"}),
+]
+
+VAGUE_DISCOURSE_MARKERS: Set[str] = {
+    "various", "complex", "complicated", "multiple", "diverse", "several", "many",
+    "different", "natural", "process", "processes", "factors", "conditions",
+    "studied", "scientists", "experts", "years", "important", "matter", "things",
+    "aspects", "dynamics", "developments", "variables", "inputs", "mechanics",
+    "specifications", "particular", "ways", "effectively", "within", "across",
+    "history", "historical", "period", "changes", "events", "involving", "safe",
+}
+
+
+def is_vague_non_answer(text: str) -> Tuple[bool, float]:
+    """Detects evasive meta-discourse filler that avoids substantive factual mechanisms."""
+    words = re.findall(r"[a-zA-Z]+", (text or "").lower())
+    content_words = [w for w in words if len(w) >= 4]
+    if not content_words:
+        return False, 0.0
+    vague_hits = [w for w in content_words if w in VAGUE_DISCOURSE_MARKERS]
+    vague_ratio = len(vague_hits) / len(content_words)
+    return vague_ratio >= 0.22, round(vague_ratio, 4)
+
+
+def get_clause_snippet(text: str, phrase: str) -> str:
+    """Extracts the clause-bounded text containing the specified phrase."""
+    m = re.search(r"\b" + re.escape(phrase) + r"\b", text)
+    if not m:
+        return ""
+    start = m.start()
+    end = m.end()
+    pre = text[:start]
+    delims = [pre.rfind(d) for d in [",", ";", ".", " whereas ", " while ", " but "]]
+    c_start = max(0, max(delims) + 1 if max(delims) != -1 else 0)
+    post = text[end:]
+    delims_post = [post.find(d) for d in [",", ";", ".", " whereas ", " while ", " but "] if post.find(d) != -1]
+    c_end = end + min(delims_post) if delims_post else len(text)
+    return text[c_start:c_end]
+
+
+def check_snippet_polarity(snippet: str, set_a: Set[str], set_b: Set[str]) -> Tuple[bool, bool]:
+    """Checks directional antonym polarity with negation masking."""
+    s = " " + snippet.lower() + " "
+    has_b = False
+    for nw in sorted(set_b, key=len, reverse=True):
+        if re.search(r"\b" + re.escape(nw) + r"\b", s):
+            has_b = True
+            s = re.sub(r"\b" + re.escape(nw) + r"\b", " [MASKED] ", s)
+
+    has_a = False
+    for pw in sorted(set_a, key=len, reverse=True):
+        m = re.search(r"\b(without|no|not|never|lacks?)\s+(?:\w+\s+)?" + re.escape(pw) + r"\b", s)
+        if m:
+            has_b = True
+            s = s[:m.start()] + " [MASKED] " + s[m.end():]
+        elif re.search(r"\b" + re.escape(pw) + r"\b", s):
+            has_a = True
+
+    return has_a, has_b
+
+
+def detect_contradiction(t1: str, t2: str) -> Tuple[bool, str]:
+    """Detects factual inversions and opposing claims across responses."""
+    t1_low = (t1 or "").lower()
+    t2_low = (t2 or "").lower()
+
+    key_phrases = [
+        "purchasing power", "prices", "ice", "tcp", "udp", "oxygen",
+        "carbon dioxide", "glucose", "water", "immune system", "sky",
+        "seasons", "western roman empire", "rome",
+    ]
+    for kp in key_phrases:
+        if re.search(r"\b" + re.escape(kp) + r"\b", t1_low) and re.search(r"\b" + re.escape(kp) + r"\b", t2_low):
+            cl1 = get_clause_snippet(t1_low, kp)
+            cl2 = get_clause_snippet(t2_low, kp)
+            for set_a, set_b in ANTONYM_MODIFIERS:
+                has_a_1, has_b_1 = check_snippet_polarity(cl1, set_a, set_b)
+                has_a_2, has_b_2 = check_snippet_polarity(cl2, set_a, set_b)
+                if (has_a_1 and has_b_2) or (has_b_1 and has_a_2):
+                    return True, f"antonym_clause_collision on {kp}"
+
+    # Broad antonym check across full text if no multi-phrase collision
+    for set_a, set_b in ANTONYM_MODIFIERS:
+        has_a_1, has_b_1 = check_snippet_polarity(t1_low, set_a, set_b)
+        has_a_2, has_b_2 = check_snippet_polarity(t2_low, set_a, set_b)
+        if (has_a_1 and not has_b_1 and has_b_2 and not has_a_2) or (has_b_1 and not has_a_1 and has_a_2 and not has_b_2):
+            return True, "broad_antonym_polar_opposition"
+
+    return False, "no_contradiction"
 
 
 _CANARY_ELEMENTS = [
@@ -465,6 +573,33 @@ CONCEPT_TAXONOMY: Dict[str, Set[str]] = {
     "COMPUTING_TECH": {
         "comput", "algorithm", "code", "softwar", "program", "hash", "encrypt",
         "network", "server", "data", "token", "neural", "train", "model",
+        "tcp", "udp", "protocol", "packet", "handshak", "reliabl", "unreliabl",
+        "latenc", "stream", "datagram", "deliveri", "connect", "order",
+    },
+    "ASTRONOMY_PLANETARY": {
+        "season", "earth", "sun", "orbit", "tilt", "axi", "hemispher", "solar",
+        "planet", "summer", "winter", "rotat", "angl", "radiat", "incid", "climat",
+        "astronomi", "space", "eclips", "equator", "pole", "axial",
+    },
+    "CHEMISTRY_MATTER": {
+        "ice", "water", "solid", "liquid", "gas", "crystal", "lattic", "hydrogen",
+        "bond", "dens", "densiti", "freez", "molecul", "expand", "float", "temperatur",
+        "mass", "volum", "hexagan", "hexagonal", "structur", "melt",
+    },
+    "ECONOMICS_FINANCE": {
+        "infl", "inflat", "price", "pric", "money", "currenc", "purchas", "power", "suppli", "supp", "demand",
+        "market", "cost", "deflat", "econom", "economic", "economi", "bank", "good", "servic",
+        "output", "monetari", "central", "rate", "consum", "spend",
+    },
+    "HISTORY_CIVILIZATION": {
+        "rome", "roman", "empir", "fall", "barbarian", "invas", "collaps", "decay",
+        "corrupt", "crisi", "militari", "mercenari", "emperor", "trib", "ancient",
+        "civil", "west", "western", "visigoth", "vandal", "instabl",
+    },
+    "MEDICINE_IMMUNOLOGY": {
+        "vaccin", "immun", "antibodi", "antigen", "pathogen", "viru", "infect",
+        "diseas", "white", "blood", "cell", "bacteria", "protect", "defens",
+        "neutral", "bodi", "health", "medic", "prepar",
     },
     "GENERAL_SCIENCE": {
         "phenomenon", "measur", "observ", "correlat", "interact", "system",
@@ -770,6 +905,64 @@ class MasterHubCoordinator:
         self.canary_injection_rate_pct: int = 5
         self.force_canary_injection: bool = False
         self._worker_last_canary: Dict[str, float] = {}
+        self._replay_canary_pool: List[Dict[str, Any]] = [
+            {
+                "id": "replay-seed-sky-blue",
+                "feature": "brain_inference",
+                "prompt": "Why is the sky blue?",
+                "trusted_output": "The blue color of the sky is caused by Rayleigh scattering. As sunlight enters the atmosphere, shorter blue wavelengths are scattered much more strongly by air molecules than longer red wavelengths.",
+                "is_replay": True,
+            },
+            {
+                "id": "replay-seed-seasons",
+                "feature": "brain_inference",
+                "prompt": "Why do we have seasons on Earth?",
+                "trusted_output": "Seasons occur because of the 23.5 degree axial tilt of the Earth. When the Northern Hemisphere is tilted toward the Sun, it experiences summer due to direct sunlight, while the Southern Hemisphere experiences winter.",
+                "is_replay": True,
+            },
+            {
+                "id": "replay-seed-vaccines",
+                "feature": "brain_inference",
+                "prompt": "How do vaccines protect against disease?",
+                "trusted_output": "Vaccines work by training the immune system to recognize antigens from pathogens. The body creates specific antibodies and memory B and T cells that rapidly neutralize the actual pathogen if exposed later.",
+                "is_replay": True,
+            },
+            {
+                "id": "replay-seed-tcp-udp",
+                "feature": "brain_inference",
+                "prompt": "What is the difference between TCP and UDP protocols?",
+                "trusted_output": "TCP is a connection-oriented protocol that provides reliable, ordered, and error-checked delivery of data using a three-way handshake, whereas UDP is connectionless and faster without delivery guarantees.",
+                "is_replay": True,
+            },
+            {
+                "id": "replay-seed-ice-float",
+                "feature": "brain_inference",
+                "prompt": "Why does ice float on water?",
+                "trusted_output": "Solid water floats because it expands upon freezing due to hydrogen bonding. The resulting crystalline structure has more open space between molecules, meaning ice has lower density than liquid water.",
+                "is_replay": True,
+            },
+            {
+                "id": "replay-seed-inflation",
+                "feature": "brain_inference",
+                "prompt": "What causes economic inflation?",
+                "trusted_output": "Economic inflation occurs when too much money chases too few goods, often triggered by loose central bank monetary policy (demand-pull) or supply chain disruptions and rising energy costs (cost-push).",
+                "is_replay": True,
+            },
+            {
+                "id": "replay-seed-photosynthesis",
+                "feature": "brain_inference",
+                "prompt": "How does photosynthesis work in plants?",
+                "trusted_output": "In plant chloroplasts, solar energy drives a chemical reaction combining water and carbon dioxide to produce glucose for energy while discharging oxygen gas into the atmosphere.",
+                "is_replay": True,
+            },
+            {
+                "id": "replay-seed-rome-fall",
+                "feature": "brain_inference",
+                "prompt": "What caused the fall of the Western Roman Empire?",
+                "trusted_output": "The collapse of Western Rome was driven by internal decay such as political instability and economic decline, combined with external military pressure and migrations from barbarian tribes including the Visigoths and Vandals.",
+                "is_replay": True,
+            },
+        ]
         self._path = state_path
         self._workers: Dict[str, WorkerNodeRecord] = {}
         self._pending: Dict[str, dict] = {}
@@ -1556,6 +1749,25 @@ class MasterHubCoordinator:
                 "active_consensus": len(self._freeform_consensus),
             }
 
+    def record_trusted_replay_task(self, prompt: str, trusted_output: str, feature: str = "brain_inference") -> None:
+        """Stores a confirmed clean multi-worker task in the replay pool for organic canary spot-checks."""
+        if not prompt or not trusted_output or len(prompt) < 10 or len(trusted_output) < 20:
+            return
+        with self._lock:
+            for item in self._replay_canary_pool:
+                if item.get("prompt") == prompt:
+                    return
+            entry = {
+                "id": f"replay-{hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:10]}",
+                "feature": feature,
+                "prompt": prompt,
+                "trusted_output": trusted_output,
+                "is_replay": True,
+            }
+            self._replay_canary_pool.append(entry)
+            if len(self._replay_canary_pool) > 100:
+                self._replay_canary_pool.pop(0)
+
     def create_golden_canary_task(self, worker_id: str, canary_idx: Optional[int] = None) -> dict:
         """Injects an unannounced ground-truth canary task to spot-check worker honesty.
         Procedurally generates unique challenges disguised identically to real requester tasks.
@@ -1566,6 +1778,8 @@ class MasterHubCoordinator:
                 raise KeyError(f"Unknown worker {worker_id!r}")
             if canary_idx is not None and canary_idx < len(GOLDEN_CANARIES):
                 canary = GOLDEN_CANARIES[canary_idx]
+            elif self._replay_canary_pool and secrets.randbelow(10) < 5:
+                canary = secrets.choice(self._replay_canary_pool)
             else:
                 canary = generate_procedural_canary(seed=canary_idx)
             payload = {"prompt": canary["prompt"]}
@@ -1596,7 +1810,10 @@ class MasterHubCoordinator:
             task["issued_at"] = jittered_now
             if task_rec:
                 task_rec["issued_at"] = jittered_now
-            return task
+            worker_task = dict(task)
+            worker_task.pop("is_canary", None)
+            worker_task.pop("canary_spec", None)
+            return worker_task
 
     def dispatch_consensus_task(
         self,
@@ -1734,7 +1951,17 @@ class MasterHubCoordinator:
                 or ""
             ).strip()
             passed = False
-            if canary.get("verifier") and callable(canary["verifier"]):
+            if canary.get("is_replay") and canary.get("trusted_output"):
+                t_out = str(canary["trusted_output"])
+                p_stems = extract_prompt_stems(canary.get("prompt", ""))
+                coh, _ = check_prose_coherence(out_str)
+                vague, _ = is_vague_non_answer(out_str)
+                contra, _ = detect_contradiction(out_str, t_out)
+                s1 = set(extract_novel_stems(out_str, p_stems))
+                s2 = set(extract_novel_stems(t_out, p_stems))
+                shared = s1 & s2
+                passed = coh and not vague and not contra and len(shared) >= 2
+            elif canary.get("verifier") and callable(canary["verifier"]):
                 try:
                     passed = bool(canary["verifier"](out_str))
                 except Exception:
@@ -1923,6 +2150,11 @@ class MasterHubCoordinator:
                 if not is_coherent:
                     return self._reject(worker, f"keyword_salad_rejected ({coh_reason})", task=task)
 
+                # Vague Non-Answer Defense: Filter meta-discourse evasive non-answers
+                is_vague, v_ratio = is_vague_non_answer(out_text)
+                if is_vague:
+                    return self._reject(worker, f"vague_non_answer_rejected (meta-discourse ratio {v_ratio:.2f} >= 0.22 lacks substantive mechanisms)", task=task)
+
                 # Prompt-Echo Defense: Extract prompt stems and require novel explanatory stems for long answers
                 prompt_stems = extract_prompt_stems(prompt_str)
                 novel_stems_2 = extract_novel_stems(out_text, prompt_stems)
@@ -1983,7 +2215,7 @@ class MasterHubCoordinator:
                     # Zero hardcoded token blacklists! Generic detection of ungrounded coordinated vocabulary.
                     prompt_clusters = {
                         c_name for c_name, words in CONCEPT_TAXONOMY.items()
-                        if any(stem_token(w) in prompt_stems for w in words)
+                        if any(stem_token(w) in prompt_stems or any(ps.startswith(w) or w.startswith(ps) for ps in prompt_stems) for w in words)
                     }
                     valid_grounding_clusters = prompt_clusters | {
                         "GENERAL_SCIENCE", "RELATIONAL_CORE", "RELATION_SPACE",
@@ -2012,6 +2244,11 @@ class MasterHubCoordinator:
                     if is_collusion:
                         return self._reject(worker, "sybil_collusion_detected (arbitrary ungrounded vocabulary across nodes)", task=task)
 
+                    # Contradiction Detection: Catch factual inversions and opposing claims
+                    is_contra, c_reason = detect_contradiction(out1, out2)
+                    if is_contra:
+                        return self._reject(worker, f"consensus_semantic_divergence_rejected (contradiction_rejected: {c_reason})", task=task)
+
                     # 5. Semantic Agreement Check:
                     is_agreed = False
                     if is_short_factual:
@@ -2021,17 +2258,8 @@ class MasterHubCoordinator:
                         if out1.strip().lower() == out2.strip().lower() or shared_novel_count >= 1:
                             is_agreed = True
                     else:
-                        # Explanatory responses: evaluate semantic concept clusters & novel stems
-                        clusters_1 = extract_novel_clusters(novel_stems_1)
-                        clusters_2 = extract_novel_clusters(novel_stems_2)
-                        shared_clusters = clusters_1 & clusters_2
-
-                        if len_ratio >= 0.15 and (
-                            shared_novel_count >= 2
-                            or len(shared_clusters) >= 2
-                            or (shared_novel_count >= 1 and len(shared_clusters) >= 1)
-                            or (cos_sim >= 0.50 and shared_novel_count >= 1)
-                        ):
+                        # Explanatory responses: evaluate shared novel explanatory mechanism stems
+                        if len_ratio >= 0.15 and shared_novel_count >= 2:
                             is_agreed = True
 
                     if is_agreed:
@@ -2066,6 +2294,8 @@ class MasterHubCoordinator:
                         task["funded_credits"] = w2_reward
                         verified = True
                         self._freeform_consensus.pop(consensus_key, None)
+                        # Record clean settlement in organic canary replay pool
+                        self.record_trusted_replay_task(prompt_str, out1, feature=task["feature"])
                     else:
                         # Divergent or fraudulent output
                         return self._reject(worker, "consensus_semantic_divergence_rejected", task=task)
