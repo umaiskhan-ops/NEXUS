@@ -60,6 +60,10 @@ class TestConsensusEvaluation(unittest.TestCase):
 
     def test_consensus_8_topic_benchmark_suite(self):
         """End-to-end multi-worker consensus verification on the 8 benchmark topics."""
+        from sovereign_mesh.hub_spoke import check_semantic_models_status
+        if not check_semantic_models_status()["active"]:
+            self.skipTest("Semantic models (MiniLM/DeBERTa) not installed locally. Run 'python scripts/download_models.py' to enable.")
+
         topics = {
             "sky": {
                 "prompt": "Why is the sky blue?",
@@ -198,6 +202,10 @@ class TestConsensusEvaluation(unittest.TestCase):
 
     def test_canary_replay_lifecycle(self):
         """Verifies that the Canary Replay pool records clean tasks and evaluates workers reliably."""
+        from sovereign_mesh.hub_spoke import check_semantic_models_status
+        if not check_semantic_models_status()["active"]:
+            self.skipTest("Semantic models (MiniLM/DeBERTa) not installed locally. Run 'python scripts/download_models.py' to enable.")
+
         # 1. Check replay pool initialization (starts empty, organic population)
         self.assertEqual(len(self.hub._replay_canary_pool), 0)
 

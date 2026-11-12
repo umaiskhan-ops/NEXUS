@@ -130,6 +130,15 @@ class UltimateAgiSovereignGrid:
         self._started = False
         print(f"[GRID] Sovereign mesh node {self.node_id} initialised | {len(self.registry)} features | "
               f"{len(nodes)} local model nodes")
+        try:
+            from .hub_spoke import check_semantic_models_status
+            m_stat = check_semantic_models_status()
+            if m_stat["active"]:
+                print("       Neural NLI & Consensus : ACTIVE (MiniLM-L6-v2 + DeBERTa-v3-xsmall ONNX)")
+            else:
+                print("       Neural NLI & Consensus : INACTIVE [FAIL-CLOSED] (Run scripts/download_models.py to activate)")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ lifecycle
     def _load_node_id(self) -> str:

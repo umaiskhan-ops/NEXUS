@@ -177,6 +177,20 @@ def run_onnx_nli(p: str, h: str) -> Optional[Dict[str, float]]:
     except Exception:
         return None
 
+def check_semantic_models_status() -> Dict[str, Any]:
+    """Checks whether neural semantic embedding and NLI models are locally loaded and ready."""
+    emb_sess, emb_tok = _get_minilm_session()
+    nli_sess, nli_tok, nli_cfg = _get_nli_session()
+    emb_ready = emb_sess is not None and emb_tok is not None
+    nli_ready = nli_sess is not None and nli_tok is not None and nli_cfg is not None
+    return {
+        "active": bool(emb_ready and nli_ready),
+        "embedding_active": bool(emb_ready),
+        "nli_active": bool(nli_ready),
+        "embedding_model": "Xenova/all-MiniLM-L6-v2",
+        "nli_model": "Xenova/nli-deberta-v3-xsmall",
+    }
+
 def compute_semantic_embedding(text: str, dim: int = 64) -> List[float]:
     """Continuous dense semantic embedding using MiniLM ONNX on CPU with pure-Python fallback."""
     sess, tok = _get_minilm_session()
@@ -944,6 +958,18 @@ class MasterHubCoordinator:
         self.appeal_log: List[dict] = []
         self._lock = threading.RLock()
         self._load()
+        # Attest neural consensus models on coordinator startup
+        _st = check_semantic_models_status()
+        if _st["active"]:
+            print("[NLI & CONSENSUS] ACTIVE: MiniLM-L6-v2 & DeBERTa-v3 ONNX ready | Free-form semantic consensus online")
+        else:
+            missing = []
+            if not _st["embedding_active"]:
+                missing.append("MiniLM-L6-v2")
+            if not _st["nli_active"]:
+                missing.append("DeBERTa-v3-xsmall")
+            print(f"[!] [NLI & CONSENSUS] INACTIVE (Missing: {', '.join(missing)}).")
+            print("[!] Free-form consensus will FAIL-CLOSED. Run 'python scripts/download_models.py' to activate.")
         self._stop_maintenance = threading.Event()
         self._maintenance_thread = threading.Thread(target=self._maintenance_loop, daemon=True, name="nexus-hub-prune-loop")
         self._maintenance_thread.start()
@@ -1924,18 +1950,26 @@ class MasterHubCoordinator:
             passed = False
             if canary.get("is_replay") and canary.get("trusted_output"):
                 t_out = str(canary["trusted_output"])
-                p_stems = extract_prompt_stems(canary.get("prompt", ""))
-                coh, _ = check_prose_coherence(out_str)
-                vague, _ = is_vague_non_answer(out_str)
-                contra, _ = detect_contradiction(out_str, t_out, prompt=canary.get("prompt", ""))
-                s1_mech = set(extract_novel_stems(out_str, p_stems)) - SETTING_DISCOURSE_WORDS
-                s2_mech = set(extract_novel_stems(t_out, p_stems)) - SETTING_DISCOURSE_WORDS
-                shared_mech_count = len(s1_mech & s2_mech)
-                cos_sim = compute_cosine_similarity(
-                    compute_semantic_embedding(out_str),
-                    compute_semantic_embedding(t_out)
-                )
-                passed = coh and not vague and not contra and (shared_mech_count >= 2 or (cos_sim >= 0.74 and shared_mech_count >= 1))
+                is_exact = (out_str.strip().lower() == t_out.strip().lower())
+                m_st = check_semantic_models_status()
+                if not is_exact and not m_st["active"]:
+                    # Free-form canary verification requires neural models (fail-closed)
+                    passed = False
+                elif is_exact:
+                    passed = True
+                else:
+                    p_stems = extract_prompt_stems(canary.get("prompt", ""))
+                    coh, _ = check_prose_coherence(out_str)
+                    vague, _ = is_vague_non_answer(out_str)
+                    contra, _ = detect_contradiction(out_str, t_out, prompt=canary.get("prompt", ""))
+                    s1_mech = set(extract_novel_stems(out_str, p_stems)) - SETTING_DISCOURSE_WORDS
+                    s2_mech = set(extract_novel_stems(t_out, p_stems)) - SETTING_DISCOURSE_WORDS
+                    shared_mech_count = len(s1_mech & s2_mech)
+                    cos_sim = compute_cosine_similarity(
+                        compute_semantic_embedding(out_str),
+                        compute_semantic_embedding(t_out)
+                    )
+                    passed = coh and not vague and not contra and (shared_mech_count >= 2 or (cos_sim >= 0.74 and shared_mech_count >= 1))
             elif canary.get("verifier") and callable(canary["verifier"]):
                 try:
                     passed = bool(canary["verifier"](out_str))
@@ -2167,6 +2201,21 @@ class MasterHubCoordinator:
                     # 1. Anti-Sybil Check: Ensure workers are from independent nodes and subnets
                     if not _is_independent_peer(w1, w2):
                         return self._reject(worker, "sybil_consensus_attempt_blocked (consensus peer must be an independent node)", task=task)
+
+                    # 1b. Fail-Closed Policy for Free-Form Consensus:
+                    # Non-identical natural language answers require neural ONNX models (MiniLM & DeBERTa).
+                    # If models are not installed, refuse unbacked lexical speculation and fail-closed.
+                    is_exact_match = (out1.strip().lower() == out2.strip().lower())
+                    if not is_exact_match:
+                        models_status = check_semantic_models_status()
+                        if not models_status["active"]:
+                            self._freeform_consensus.pop(consensus_key, None)
+                            self.refund_task_escrow(existing["task"], reason="free_form_consensus_unavailable_models_inactive")
+                            return self._reject(
+                                worker,
+                                "free_form_consensus_unavailable_models_inactive (Run scripts/download_models.py to activate ONNX MiniLM/DeBERTa)",
+                                task=task
+                            )
 
                     # 2. Continuous dense semantic embeddings & prompt relevance
                     emb1 = compute_semantic_embedding(out1)

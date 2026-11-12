@@ -2550,6 +2550,13 @@ def serve(grid, open_browser: bool = False) -> None:
     print(f"  [5] Built-in Worker Node  : {spoke_id} (http://127.0.0.1:{spoke_port})")
     print(f"  [6] Capabilities Active   : {len(grid.registry)} Features | P2P Market | Supercomputer")
     print(f"  [7] Public Cloud HTTPS    : {public_status_line}")
+    try:
+        from .hub_spoke import check_semantic_models_status
+        m_status = check_semantic_models_status()
+        nli_line = "ACTIVE (MiniLM-L6-v2 + DeBERTa-v3 ONNX)" if m_status["active"] else "INACTIVE [FAIL-CLOSED] (Run python scripts/download_models.py)"
+    except Exception:
+        nli_line = "INACTIVE"
+    print(f"  [8] Neural NLI & Consensus: {nli_line}")
     print("=" * 72, flush=True)
 
     if open_browser and os.environ.get("NO_BROWSER", "").strip() not in {"1", "true", "yes"}:
