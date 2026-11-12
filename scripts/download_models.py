@@ -4,9 +4,10 @@ NEXUS Sovereign Mesh — Neural Consensus Models Downloader & Attestation
 Downloads, pins, and verifies the CPU ONNX models required for neural semantic
 embedding and cross-encoder contradiction detection in Sovereign Mesh consensus.
 
-Models:
-  1. Xenova/all-MiniLM-L6-v2      (ONNX Quantized ~21.9 MB)
-  2. Xenova/nli-deberta-v3-xsmall (ONNX Quantized ~83.2 MB)
+Verifies exact SHA-256 cryptographic signatures for:
+  - ONNX quantized model weights
+  - Model configuration (config.json)
+  - Tokenizer vocabulary and state (tokenizer.json, tokenizer_config.json, special_tokens_map.json)
 
 Usage:
   python scripts/download_models.py
@@ -25,19 +26,57 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "name": "MiniLM-L6-v2",
         "repo_id": "Xenova/all-MiniLM-L6-v2",
         "revision": "751bff37182d3f1213fa05d7196b954e230abad9",
-        "onnx_subpath": "onnx/model_quantized.onnx",
-        "expected_sha256": "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1",
-        "expected_size": 22972370,
         "description": "384-dimensional dense sentence embeddings for semantic similarity & grounding",
+        "files": {
+            "onnx/model_quantized.onnx": {
+                "sha256": "afdb6f1a0e45b715d0bb9b11772f032c399babd23bfc31fed1c170afc848bdb1",
+                "size": 22972370,
+            },
+            "config.json": {
+                "sha256": "7135149f7cffa1a573466c6e4d8423ed73b62fd2332c575bf738a0d033f70df7",
+                "size": 650,
+            },
+            "tokenizer.json": {
+                "sha256": "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0",
+                "size": 711661,
+            },
+            "tokenizer_config.json": {
+                "sha256": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+                "size": 366,
+            },
+            "special_tokens_map.json": {
+                "sha256": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+                "size": 125,
+            },
+        },
     },
     "nli": {
         "name": "NLI-DeBERTa-v3-xsmall",
         "repo_id": "Xenova/nli-deberta-v3-xsmall",
         "revision": "2a4f614a701367a02d51389039afc998faeda637",
-        "onnx_subpath": "onnx/model_quantized.onnx",
-        "expected_sha256": "3fac2500c45c75af42c7711de0d1b93d59577456100208be0dc1f9e8811946b6",
-        "expected_size": 87246587,
         "description": "Cross-encoder NLI classifier for factual contradiction & inversion detection",
+        "files": {
+            "onnx/model_quantized.onnx": {
+                "sha256": "3fac2500c45c75af42c7711de0d1b93d59577456100208be0dc1f9e8811946b6",
+                "size": 87246587,
+            },
+            "config.json": {
+                "sha256": "ec0bd14cc28640326474399cd61d38ccd52b64900228799d0f81debda8c4bc53",
+                "size": 1038,
+            },
+            "tokenizer.json": {
+                "sha256": "a86f883318afa11c8c10466f1bf4efaeb6ded28a52cbe57217a8fa0d0a2a87df",
+                "size": 8656551,
+            },
+            "tokenizer_config.json": {
+                "sha256": "d8d3bb123b99317634d5ee3d1d2d8b2ddb01510a0654687fc2639a5347a7291f",
+                "size": 384,
+            },
+            "special_tokens_map.json": {
+                "sha256": "311de3f4eed9d76a43bf0d71f10e62e086ca65ccce9f15d5da0d2098bf519ecc",
+                "size": 173,
+            },
+        },
     },
 }
 
@@ -58,23 +97,28 @@ def verify_model(key: str) -> Tuple[bool, str]:
     except ImportError as exc:
         return False, f"Missing required libraries: {exc}"
 
-    try:
-        onnx_path = hf_hub_download(
-            repo_id=spec["repo_id"],
-            filename=spec["onnx_subpath"],
-            revision=spec["revision"],
-            local_files_only=True,
-        )
-    except Exception as exc:
-        return False, f"ONNX file not found in local cache: {exc}"
+    verified_paths = []
+    for rel_path, meta in spec["files"].items():
+        try:
+            local_path = hf_hub_download(
+                repo_id=spec["repo_id"],
+                filename=rel_path,
+                revision=spec["revision"],
+                local_files_only=True,
+            )
+        except Exception as exc:
+            return False, f"File '{rel_path}' not found in local cache: {exc}"
 
-    if not os.path.exists(onnx_path):
-        return False, f"File does not exist: {onnx_path}"
+        if not os.path.exists(local_path):
+            return False, f"File does not exist: {local_path}"
 
-    sha = compute_file_sha256(onnx_path)
-    if sha != spec["expected_sha256"]:
-        return False, f"SHA-256 mismatch: got {sha}, expected {spec['expected_sha256']}"
+        actual_sha = compute_file_sha256(local_path)
+        if actual_sha != meta["sha256"]:
+            return False, f"SHA-256 mismatch for {rel_path}: got {actual_sha}, expected {meta['sha256']}"
 
+        verified_paths.append(local_path)
+
+    # Sanity check: Ensure tokenizer and config can initialize from verified cache
     try:
         AutoTokenizer.from_pretrained(spec["repo_id"], revision=spec["revision"], local_files_only=True)
     except Exception as exc:
@@ -86,7 +130,7 @@ def verify_model(key: str) -> Tuple[bool, str]:
         except Exception as exc:
             return False, f"Config verification failed: {exc}"
 
-    return True, onnx_path
+    return True, verified_paths[0]
 
 
 def download_model(key: str, force: bool = False) -> bool:
@@ -94,7 +138,7 @@ def download_model(key: str, force: bool = False) -> bool:
     if not force:
         ok, path = verify_model(key)
         if ok:
-            print(f"  [*] {spec['name']} already verified in cache: {path}")
+            print(f"  [*] {spec['name']} already verified in cache (all 5 files attested): {path}")
             return True
 
     print(f"  [>] Downloading {spec['name']} from huggingface.co/{spec['repo_id']} (rev: {spec['revision'][:8]})...")
@@ -103,7 +147,7 @@ def download_model(key: str, force: bool = False) -> bool:
         snapshot_download(
             repo_id=spec["repo_id"],
             revision=spec["revision"],
-            allow_patterns=["*.json", "*.txt", spec["onnx_subpath"]],
+            allow_patterns=["*.json", "*.txt", "onnx/model_quantized.onnx"],
         )
     except Exception as exc:
         print(f"  [!] Download failed for {spec['name']}: {exc}")
@@ -111,7 +155,7 @@ def download_model(key: str, force: bool = False) -> bool:
 
     ok, path = verify_model(key)
     if ok:
-        print(f"  [+] {spec['name']} verified successfully: {path}")
+        print(f"  [+] {spec['name']} verified successfully (all files attested): {path}")
         return True
     else:
         print(f"  [!] Post-download verification failed for {spec['name']}: {path}")
@@ -134,8 +178,9 @@ def main():
         if args.verify_only:
             ok, res = verify_model(key)
             if ok:
-                print(f"  [+] STATUS: ACTIVE (SHA-256 attested: {spec['expected_sha256'][:16]}...)")
-                print(f"      Path: {res}")
+                print(f"  [+] STATUS: ACTIVE (All files verified & attested)")
+                for fpath, fmeta in spec["files"].items():
+                    print(f"      - {fpath:25}: sha256={fmeta['sha256'][:16]}...")
             else:
                 print(f"  [-] STATUS: INACTIVE ({res})")
                 all_ok = False
@@ -146,7 +191,7 @@ def main():
 
     print("\n" + "=" * 72)
     if all_ok:
-        print("  [SUCCESS] All neural consensus models are ACTIVE and attested.")
+        print("  [SUCCESS] All neural consensus models & tokenizers are ACTIVE and attested.")
         print("            Free-form semantic consensus & NLI guards are fully operational.")
         print("=" * 72)
         sys.exit(0)

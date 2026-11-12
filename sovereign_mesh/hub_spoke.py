@@ -2231,8 +2231,9 @@ class MasterHubCoordinator:
                     len_ratio = min(len(out1), len(out2)) / max(len(out1), len(out2))
 
                     # 3. Deterministic Factual Query Rule:
-                    # Short factual answers (<= 25 words) like "The capital of Japan is Tokyo."
-                    is_short_factual = len(out1.split()) <= 25 and len(out2.split()) <= 25
+                    # Concise atomic factual answers (<= 10 words, e.g. "The capital of Japan is Tokyo.")
+                    is_explanatory = any(prompt_str.lower().startswith(q) for q in ["why", "how", "explain", "describe", "what causes", "what is the difference"])
+                    is_short_factual = (not is_explanatory) and len(out1.split()) <= 10 and len(out2.split()) <= 10
 
                     # 4. Principled Grounding & Sybil Collusion Detection:
                     # Semantic embedding grounding check without hardcoded token taxonomies.
@@ -2264,7 +2265,7 @@ class MasterHubCoordinator:
                             is_agreed = True
                     else:
                         # Explanatory responses: evaluate shared novel explanatory mechanism stems
-                        if len_ratio >= 0.15 and (shared_mech_count >= 2 or (cos_sim >= 0.82 and shared_mech_count >= 1)):
+                        if len_ratio >= 0.15 and (shared_mech_count >= 2 or (cos_sim >= 0.74 and shared_mech_count >= 1)):
                             is_agreed = True
 
                     if is_agreed:
