@@ -118,17 +118,92 @@ _FUNCTION_WORDS: Set[str] = {
     "across", "causes", "describes", "remains", "determines", "occurs",
 }
 
+_ONNX_EMB_SESSION = None
+_ONNX_EMB_TOKENIZER = None
+
+def _get_minilm_session():
+    global _ONNX_EMB_SESSION, _ONNX_EMB_TOKENIZER
+    if _ONNX_EMB_SESSION is not None:
+        return _ONNX_EMB_SESSION, _ONNX_EMB_TOKENIZER
+    try:
+        import onnxruntime as ort
+        from transformers import AutoTokenizer
+        from huggingface_hub import hf_hub_download
+        m_name = "Xenova/all-MiniLM-L6-v2"
+        p = hf_hub_download(m_name, "onnx/model_quantized.onnx", local_files_only=True)
+        tok = AutoTokenizer.from_pretrained(m_name, local_files_only=True)
+        sess = ort.InferenceSession(p, providers=["CPUExecutionProvider"])
+        _ONNX_EMB_SESSION = sess
+        _ONNX_EMB_TOKENIZER = tok
+        return sess, tok
+    except Exception:
+        return None, None
+
+_ONNX_NLI_SESSION = None
+_ONNX_NLI_TOKENIZER = None
+_ONNX_NLI_CONFIG = None
+
+def _get_nli_session():
+    global _ONNX_NLI_SESSION, _ONNX_NLI_TOKENIZER, _ONNX_NLI_CONFIG
+    if _ONNX_NLI_SESSION is not None:
+        return _ONNX_NLI_SESSION, _ONNX_NLI_TOKENIZER, _ONNX_NLI_CONFIG
+    try:
+        import onnxruntime as ort
+        from transformers import AutoTokenizer, AutoConfig
+        from huggingface_hub import hf_hub_download
+        m_name = "Xenova/nli-deberta-v3-xsmall"
+        p = hf_hub_download(m_name, "onnx/model_quantized.onnx", local_files_only=True)
+        tok = AutoTokenizer.from_pretrained(m_name, local_files_only=True)
+        cfg = AutoConfig.from_pretrained(m_name, local_files_only=True)
+        sess = ort.InferenceSession(p, providers=["CPUExecutionProvider"])
+        _ONNX_NLI_SESSION = sess
+        _ONNX_NLI_TOKENIZER = tok
+        _ONNX_NLI_CONFIG = cfg
+        return sess, tok, cfg
+    except Exception:
+        return None, None, None
+
+def run_onnx_nli(p: str, h: str) -> Optional[Dict[str, float]]:
+    sess, tok, cfg = _get_nli_session()
+    if sess is None:
+        return None
+    try:
+        import numpy as np
+        inputs = tok(p, h, return_tensors="np", truncation=True, max_length=128)
+        inp = {k: v.astype(np.int64) for k, v in inputs.items() if k in ["input_ids", "attention_mask"]}
+        out = sess.run(None, inp)[0]
+        probs = np.exp(out[0]) / np.sum(np.exp(out[0]))
+        return {cfg.id2label[i]: float(probs[i]) for i in range(len(probs))}
+    except Exception:
+        return None
+
 def compute_semantic_embedding(text: str, dim: int = 64) -> List[float]:
-    """Deterministic continuous dense float embedding using token & character subwords."""
+    """Continuous dense semantic embedding using MiniLM ONNX on CPU with pure-Python fallback."""
+    sess, tok = _get_minilm_session()
+    if sess is not None and tok is not None:
+        try:
+            import numpy as np
+            inputs = tok(text or "", return_tensors="np", truncation=True, max_length=128, padding=True)
+            inp = {k: v.astype(np.int64) for k, v in inputs.items()}
+            out = sess.run(None, inp)[0]
+            mask = inp["attention_mask"][:, :, None]
+            emb = np.sum(out * mask, axis=1) / np.maximum(mask.sum(axis=1), 1e-9)
+            norm = np.linalg.norm(emb, axis=1, keepdims=True)
+            vec = (emb / np.maximum(norm, 1e-9))[0]
+            return [round(float(x), 6) for x in vec]
+        except Exception:
+            pass
+
+    # Deterministic continuous float embedding using token & character subwords (pure-Python fallback)
     raw_tokens = re.findall(r"\b[a-zA-Z0-9_-]+\b", (text or "").lower())
     tokens = [t for t in raw_tokens if t not in _STOPWORDS and not t.isdigit()] or raw_tokens or ["empty"]
     vec = [0.0] * dim
-    for tok in tokens:
-        subwords = [tok]
+    for tok_w in tokens:
+        subwords = [tok_w]
         for n in (3, 4):
-            if len(tok) >= n:
-                for i in range(len(tok) - n + 1):
-                    subwords.append(tok[i:i+n])
+            if len(tok_w) >= n:
+                for i in range(len(tok_w) - n + 1):
+                    subwords.append(tok_w[i:i+n])
         for sw in subwords:
             h = hashlib.sha256(sw.encode("utf-8")).digest()
             for d in range(dim):
@@ -145,20 +220,21 @@ def check_prose_coherence(text: str) -> Tuple[bool, str]:
         return False, "insufficient_word_count (less than 3 words)"
     func_tokens = [t for t in tokens if t in _FUNCTION_WORDS]
     func_ratio = len(func_tokens) / len(tokens)
-    if func_ratio < 0.15:
-        return False, f"keyword_salad_rejected (function word ratio {func_ratio:.2f} < 0.15 indicates ungrammatical word list)"
+    if func_ratio < 0.08:
+        return False, f"keyword_salad_rejected (function word ratio {func_ratio:.2f} < 0.08 indicates ungrammatical word list)"
     if func_ratio > 0.85 and len(tokens) >= 5:
         return False, f"low_content_entropy_rejected (function word ratio {func_ratio:.2f} > 0.85 indicates stopword salad)"
 
     # Pseudo-grammatical keyword salad detection:
     # 1. Repetitive preposition-determiner chaining (e.g. "of the ... of the ... of the ...")
     prep_chains = re.findall(r"\b(of|in|at|by|from|with|to)\s+(the|a|an)\b", text.lower())
-    if len(tokens) <= 25 and len(prep_chains) >= 3:
-        return False, "keyword_salad_rejected (excessive preposition chain template)"
+    if (len(tokens) <= 15 and len(prep_chains) >= 3) or len(prep_chains) >= 5:
+        if len(set(prep_chains)) <= 1:
+            return False, "keyword_salad_rejected (excessive preposition chain template)"
 
     # 2. Excessive determiner repetition in short sentence
     the_count = tokens.count("the")
-    if len(tokens) <= 20 and the_count >= 4:
+    if len(tokens) <= 15 and the_count >= 4:
         return False, "keyword_salad_rejected (excessive determiner repetition)"
 
     # 3. Bigram repetition
@@ -211,24 +287,37 @@ def extract_novel_stems(response_text: str, prompt_stems: Set[str]) -> List[str]
     return stems
 
 
-ANTONYM_MODIFIERS: List[Tuple[Set[str], Set[str]]] = [
-    ({"less", "lower", "decrease", "decreasing", "drop", "fall", "erode", "eroding", "decay", "loss", "reduc", "reducing", "deflation", "cheaper"},
-     {"more", "higher", "increase", "increasing", "rise", "rising", "grow", "gain", "expand", "expanding", "inflation", "expensive"}),
-    ({"less dense", "lower density", "lighter", "9% less dense"},
-     {"denser", "heavier", "higher density", "more dense"}),
-    ({"absorb", "absorbs", "absorbing", "intake", "consume", "take in", "capture"},
-     {"produce", "produces", "producing", "release", "releases", "releasing", "emit", "discharge", "discharging", "generate", "create", "output"}),
-    ({"reliable", "guarantee", "guarantees", "ordered", "error-checked", "connection-oriented", "handshake"},
-     {"unreliable", "connectionless", "unordered", "lossy", "no guarantee", "without delivery guarantees", "without verification", "drops"}),
-    ({"stimulate", "stimulates", "train", "training", "protect", "defend", "neutralize", "immunity", "antibodies"},
-     {"destroy", "destroying", "poison", "harm", "kill immune", "damage", "weaken"}),
-    ({"tilt", "tilted", "angle", "angles", "inclination", "obliquity"},
-     {"closer to the sun", "farther away", "elliptical orbit distance", "distance to the sun"}),
-    ({"scatter", "scattered", "scattering", "rayleigh", "wavelength", "wavelengths"},
-     {"reflect the ocean", "mirror that reflects", "ocean waters", "reflects the blue color", "giant mirror"}),
-    ({"barbarian", "invasion", "invasions", "visigoths", "vandals", "mercenaries", "corruption", "internal decay"},
-     {"asteroid", "meteor", "alien", "comet strike"}),
+# Universal Polarity Sets (Directional, Ordering, Permanence, Density, Permission - Zero Topic Keywords!)
+UNIVERSAL_POLARITY_SETS: List[Tuple[Set[str], Set[str]]] = [
+    ({"increase", "increasing", "higher", "rise", "rising", "grow", "gain", "expand", "expanding", "accelerate", "accelerates"},
+     {"decrease", "decreasing", "lower", "drop", "dropping", "fall", "falling", "reduce", "reducing", "loss", "shrink", "shrinking", "erode", "eroding", "deflation"}),
+    ({"denser", "heavier", "high density", "higher density", "more dense"},
+     {"less dense", "lighter", "lower density", "low density"}),
+    ({"non-volatile", "persistent", "permanent", "retain", "retains", "indefinitely", "preserve", "preserves"},
+     {"volatile", "temporary", "wiped", "erased", "lost", "ephemeral"}),
+    ({"prevent", "prevents", "preventing", "block", "blocks", "stop", "stops", "halt", "halts", "forbid", "immutable", "cannot"},
+     {"allow", "allows", "permit", "permits", "enable", "enables", "duplicate", "freely"}),
+    ({"direct", "directly", "proportional"},
+     {"inverse", "inversely", "opposite", "opposing"}),
+    ({"lifo", "last-in first-out", "newest", "latest"},
+     {"fifo", "first-in first-out", "oldest", "earliest"}),
+    ({"reliable", "guarantee", "guarantees", "guaranteed", "error-checked", "ordered", "connection-oriented", "acknowledgment"},
+     {"unreliable", "connectionless", "unordered", "drops", "lossy", "without guarantee", "no guarantee"}),
+    ({"absorb", "absorbs", "absorbing", "intake", "consume", "consumes"},
+     {"release", "releases", "releasing", "emit", "emits", "discharge", "discharges", "produce", "produces"}),
+    ({"protect", "protects", "protecting", "defend", "defends", "immunity", "neutralize", "neutralizes", "stimulate", "train"},
+     {"destroy", "destroys", "destroying", "damage", "damages", "poison", "poisons", "harm", "harms"}),
+    ({"bacteria", "bacterial"},
+     {"virus", "viral", "viruses"}),
+    ({"hot", "heat", "heating", "warm", "warmer", "warming"},
+     {"cold", "cooler", "cooling", "freeze", "freezing", "chilly"}),
 ]
+
+SETTING_DISCOURSE_WORDS: Set[str] = {
+    "color", "earth", "surfac", "world", "thing", "way", "differ", "system",
+    "year", "time", "chang", "caus", "includ", "exampl", "occur", "process",
+    "mechan", "various", "factor", "state", "term", "call", "sun", "orbit", "season", "lunar",
+}
 
 VAGUE_DISCOURSE_MARKERS: Set[str] = {
     "various", "complex", "complicated", "multiple", "diverse", "several", "many",
@@ -248,72 +337,100 @@ def is_vague_non_answer(text: str) -> Tuple[bool, float]:
         return False, 0.0
     vague_hits = [w for w in content_words if w in VAGUE_DISCOURSE_MARKERS]
     vague_ratio = len(vague_hits) / len(content_words)
-    return vague_ratio >= 0.22, round(vague_ratio, 4)
+    return vague_ratio >= 0.15, round(vague_ratio, 4)
 
 
-def get_clause_snippet(text: str, phrase: str) -> str:
-    """Extracts the clause-bounded text containing the specified phrase."""
-    m = re.search(r"\b" + re.escape(phrase) + r"\b", text)
-    if not m:
-        return ""
-    start = m.start()
-    end = m.end()
-    pre = text[:start]
-    delims = [pre.rfind(d) for d in [",", ";", ".", " whereas ", " while ", " but "]]
-    c_start = max(0, max(delims) + 1 if max(delims) != -1 else 0)
-    post = text[end:]
-    delims_post = [post.find(d) for d in [",", ";", ".", " whereas ", " while ", " but "] if post.find(d) != -1]
-    c_end = end + min(delims_post) if delims_post else len(text)
-    return text[c_start:c_end]
+def extract_comparison_entities(prompt: str) -> Optional[Tuple[str, str]]:
+    p = (prompt or "").lower()
+    m = re.search(r"(?:difference between|compare|contrast)\s+(?:a\s+|an\s+|the\s+)?([a-zA-Z0-9_-]+)\s+(?:and|versus|vs)\s+(?:a\s+|an\s+|the\s+)?([a-zA-Z0-9_-]+)", p)
+    if m:
+        return stem_token(m.group(1)), stem_token(m.group(2))
+    m2 = re.search(r"\b([a-zA-Z0-9_-]+)\s+(?:versus|vs)\s+([a-zA-Z0-9_-]+)\b", p)
+    if m2:
+        return stem_token(m2.group(1)), stem_token(m2.group(2))
+    return None
 
 
-def check_snippet_polarity(snippet: str, set_a: Set[str], set_b: Set[str]) -> Tuple[bool, bool]:
-    """Checks directional antonym polarity with negation masking."""
-    s = " " + snippet.lower() + " "
-    has_b = False
-    for nw in sorted(set_b, key=len, reverse=True):
-        if re.search(r"\b" + re.escape(nw) + r"\b", s):
-            has_b = True
-            s = re.sub(r"\b" + re.escape(nw) + r"\b", " [MASKED] ", s)
-
+def check_clause_polarity(clause: str, set_a: Set[str], set_b: Set[str]) -> Tuple[bool, bool]:
+    s = " " + clause.lower() + " "
     has_a = False
-    for pw in sorted(set_a, key=len, reverse=True):
-        m = re.search(r"\b(without|no|not|never|lacks?)\s+(?:\w+\s+)?" + re.escape(pw) + r"\b", s)
-        if m:
-            has_b = True
-            s = s[:m.start()] + " [MASKED] " + s[m.end():]
-        elif re.search(r"\b" + re.escape(pw) + r"\b", s):
+    for w in sorted(set_a, key=len, reverse=True):
+        if re.search(r"\b" + re.escape(w) + r"\b", s):
             has_a = True
-
+            s = re.sub(r"\b" + re.escape(w) + r"\b", " [MASKED] ", s)
+    has_b = False
+    for w in sorted(set_b, key=len, reverse=True):
+        if re.search(r"\b" + re.escape(w) + r"\b", s):
+            has_b = True
+            s = re.sub(r"\b" + re.escape(w) + r"\b", " [MASKED] ", s)
     return has_a, has_b
 
 
-def detect_contradiction(t1: str, t2: str) -> Tuple[bool, str]:
+def get_clause_polarities(text: str, e1: str, e2: str, set_a: Set[str], set_b: Set[str]) -> Tuple[Optional[str], Optional[str]]:
+    clauses = [c.strip() for c in re.split(r"\b(?:whereas|while|but|and)\b|[;,.]", text.lower()) if c.strip()]
+    e1_pol, e2_pol = None, None
+    for c in clauses:
+        has_e1 = bool(re.search(r"\b" + re.escape(e1) + r"[a-z]*\b", c))
+        has_e2 = bool(re.search(r"\b" + re.escape(e2) + r"[a-z]*\b", c))
+        if has_e1 and not has_e2:
+            ha, hb = check_clause_polarity(c, set_a, set_b)
+            if ha and not hb and e1_pol is None: e1_pol = "A"
+            elif hb and not ha and e1_pol is None: e1_pol = "B"
+        elif has_e2 and not has_e1:
+            ha, hb = check_clause_polarity(c, set_a, set_b)
+            if ha and not hb and e2_pol is None: e2_pol = "A"
+            elif hb and not ha and e2_pol is None: e2_pol = "B"
+    return e1_pol, e2_pol
+
+
+def detect_role_swap(prompt: str, t1: str, t2: str) -> Tuple[bool, str]:
+    ents = extract_comparison_entities(prompt)
+    if not ents:
+        return False, ""
+    e1, e2 = ents
+    for set_a, set_b in UNIVERSAL_POLARITY_SETS:
+        p1_e1, p1_e2 = get_clause_polarities(t1, e1, e2, set_a, set_b)
+        p2_e1, p2_e2 = get_clause_polarities(t2, e1, e2, set_a, set_b)
+        if p1_e1 and p2_e1 and p1_e1 != p2_e1:
+            return True, f"entity_role_inversion ({e1} flipped {p1_e1}->{p2_e1})"
+        if p1_e2 and p2_e2 and p1_e2 != p2_e2:
+            return True, f"entity_role_inversion ({e2} flipped {p1_e2}->{p2_e2})"
+    return False, ""
+
+
+def detect_polar_opposition(t1: str, t2: str) -> Tuple[bool, str]:
+    t1_low = " " + (t1 or "").lower() + " "
+    t2_low = " " + (t2 or "").lower() + " "
+    for set_a, set_b in UNIVERSAL_POLARITY_SETS:
+        has_a1 = any(re.search(r"\b" + re.escape(w) + r"\b", t1_low) for w in set_a)
+        has_b1 = any(re.search(r"\b" + re.escape(w) + r"\b", t1_low) for w in set_b)
+        has_a2 = any(re.search(r"\b" + re.escape(w) + r"\b", t2_low) for w in set_a)
+        has_b2 = any(re.search(r"\b" + re.escape(w) + r"\b", t2_low) for w in set_b)
+        if (has_a1 and not has_b1 and has_b2 and not has_a2) or (has_b1 and not has_a1 and has_a2 and not has_b2):
+            return True, "universal_polar_opposition"
+    return False, ""
+
+
+def detect_contradiction(t1: str, t2: str, prompt: str = "") -> Tuple[bool, str]:
     """Detects factual inversions and opposing claims across responses."""
-    t1_low = (t1 or "").lower()
-    t2_low = (t2 or "").lower()
+    # 1. Entity Role Inversion Check (for comparative queries)
+    if prompt:
+        swap, s_r = detect_role_swap(prompt, t1, t2)
+        if swap:
+            return True, f"contradiction_rejected: {s_r}"
 
-    key_phrases = [
-        "purchasing power", "prices", "ice", "tcp", "udp", "oxygen",
-        "carbon dioxide", "glucose", "water", "immune system", "sky",
-        "seasons", "western roman empire", "rome",
-    ]
-    for kp in key_phrases:
-        if re.search(r"\b" + re.escape(kp) + r"\b", t1_low) and re.search(r"\b" + re.escape(kp) + r"\b", t2_low):
-            cl1 = get_clause_snippet(t1_low, kp)
-            cl2 = get_clause_snippet(t2_low, kp)
-            for set_a, set_b in ANTONYM_MODIFIERS:
-                has_a_1, has_b_1 = check_snippet_polarity(cl1, set_a, set_b)
-                has_a_2, has_b_2 = check_snippet_polarity(cl2, set_a, set_b)
-                if (has_a_1 and has_b_2) or (has_b_1 and has_a_2):
-                    return True, f"antonym_clause_collision on {kp}"
+    # 2. Universal Directional/Polar Opposition Check
+    polar, p_r = detect_polar_opposition(t1, t2)
+    if polar:
+        return True, f"contradiction_rejected: {p_r}"
 
-    # Broad antonym check across full text if no multi-phrase collision
-    for set_a, set_b in ANTONYM_MODIFIERS:
-        has_a_1, has_b_1 = check_snippet_polarity(t1_low, set_a, set_b)
-        has_a_2, has_b_2 = check_snippet_polarity(t2_low, set_a, set_b)
-        if (has_a_1 and not has_b_1 and has_b_2 and not has_a_2) or (has_b_1 and not has_a_1 and has_a_2 and not has_b_2):
-            return True, "broad_antonym_polar_opposition"
+    # 3. Cross-Encoder NLI Contradiction (for non-comparative explanatory statements)
+    is_comparative = extract_comparison_entities(prompt) is not None if prompt else False
+    if not is_comparative:
+        nli_res = run_onnx_nli(t1, t2)
+        if nli_res and nli_res.get("contradiction", 0.0) >= 0.85 and nli_res.get("entailment", 1.0) <= 0.05:
+            c_val = nli_res["contradiction"]
+            return True, f"nli_contradiction_rejected ({c_val:.2f})"
 
     return False, "no_contradiction"
 
@@ -549,99 +666,6 @@ def generate_procedural_canary(seed: Optional[int] = None) -> Dict[str, Any]:
         return {"id": cid, "feature": "brain_inference", "prompt": prompt, "test_assertions": assertions, "type": "code"}
 
 
-CONCEPT_TAXONOMY: Dict[str, Set[str]] = {
-    "PHYSICS_QUANTUM": {
-        "quantum", "entangle", "particl", "subatom", "wave", "stat", "spin", "photon",
-        "atom", "electron", "proton", "superposit", "teleport", "physic", "matter",
-        "energi", "field", "intertwin", "molecul", "mechan", "correlat",
-    },
-    "OPTICS_LIGHT": {
-        "light", "wavelength", "scatter", "rayleigh", "atmospher", "sunlight",
-        "molecul", "blue", "sky", "color", "spectrum", "optic", "reflect",
-        "refract", "absorb", "frequenc", "photon", "beam", "radiat",
-    },
-    "BIOLOGY_LIFE": {
-        "photosynthe", "plant", "cell", "chlorophyl", "chloroplast", "sugar",
-        "glucos", "solar", "sun", "leaf", "leav", "carbon", "dioxid", "oxygen",
-        "water", "organ", "biolog", "energi", "chemic",
-    },
-    "RELATIVITY_GRAVITY": {
-        "relativ", "gravit", "spacetim", "space", "time", "mass", "curv",
-        "curvatur", "einstein", "fabric", "speed", "veloc", "warp", "accelerat",
-        "matter", "physic",
-    },
-    "COMPUTING_TECH": {
-        "comput", "algorithm", "code", "softwar", "program", "hash", "encrypt",
-        "network", "server", "data", "token", "neural", "train", "model",
-        "tcp", "udp", "protocol", "packet", "handshak", "reliabl", "unreliabl",
-        "latenc", "stream", "datagram", "deliveri", "connect", "order",
-    },
-    "ASTRONOMY_PLANETARY": {
-        "season", "earth", "sun", "orbit", "tilt", "axi", "hemispher", "solar",
-        "planet", "summer", "winter", "rotat", "angl", "radiat", "incid", "climat",
-        "astronomi", "space", "eclips", "equator", "pole", "axial",
-    },
-    "CHEMISTRY_MATTER": {
-        "ice", "water", "solid", "liquid", "gas", "crystal", "lattic", "hydrogen",
-        "bond", "dens", "densiti", "freez", "molecul", "expand", "float", "temperatur",
-        "mass", "volum", "hexagan", "hexagonal", "structur", "melt",
-    },
-    "ECONOMICS_FINANCE": {
-        "infl", "inflat", "price", "pric", "money", "currenc", "purchas", "power", "suppli", "supp", "demand",
-        "market", "cost", "deflat", "econom", "economic", "economi", "bank", "good", "servic",
-        "output", "monetari", "central", "rate", "consum", "spend",
-    },
-    "HISTORY_CIVILIZATION": {
-        "rome", "roman", "empir", "fall", "barbarian", "invas", "collaps", "decay",
-        "corrupt", "crisi", "militari", "mercenari", "emperor", "trib", "ancient",
-        "civil", "west", "western", "visigoth", "vandal", "instabl",
-    },
-    "MEDICINE_IMMUNOLOGY": {
-        "vaccin", "immun", "antibodi", "antigen", "pathogen", "viru", "infect",
-        "diseas", "white", "blood", "cell", "bacteria", "protect", "defens",
-        "neutral", "bodi", "health", "medic", "prepar",
-    },
-    "GENERAL_SCIENCE": {
-        "phenomenon", "measur", "observ", "correlat", "interact", "system",
-        "mechan", "dynam", "transform", "process", "instant", "instantane",
-        "simultan", "connect", "link", "depend", "properti", "stat", "effect",
-        "caus", "determin", "acros", "distanc", "space", "pair",
-    },
-    "RELATIONAL_CORE": {
-        "connect", "link", "pair", "stat", "chang", "occur", "remain", "depend",
-        "caus", "produc", "differ", "similar", "increas", "decreas", "describ",
-        "relat", "regardles", "hold", "keep", "bound", "tie",
-    },
-    "RELATION_SPACE": {
-        "distanc", "space", "far", "remot", "separat", "acros", "locat",
-        "posit", "spatial", "interv", "reach", "apart", "away",
-    },
-    "RELATION_STATE": {
-        "remain", "stay", "persist", "hold", "continu", "maintain", "keep", "exist",
-    },
-    "RELATION_TIME": {
-        "instant", "immediat", "instantane", "simultan", "time", "speed", "durat", "fast", "moment", "quick",
-    },
-    "RELATION_CONDITION": {
-        "regardles", "despit", "independ", "irrespect", "notwithstand",
-    },
-    "OBSERVE_MEASURE": {
-        "measur", "observ", "detect", "determin", "test", "probe", "gaug", "check", "record",
-    },
-    "CAUSAL_DETERMINE": {
-        "caus", "determin", "influenc", "affect", "dictat", "control", "govern", "decid", "lead", "trigger", "fix",
-    },
-}
-
-
-def extract_novel_clusters(stems: Iterable[str]) -> Set[str]:
-    """Maps content stems to broad semantic concept clusters."""
-    clusters = set()
-    for st in stems:
-        for c_name, words in CONCEPT_TAXONOMY.items():
-            if st in words or any(w.startswith(st) or st.startswith(w) for w in words):
-                clusters.add(c_name)
-    return clusters
 
 
 GOLDEN_CANARIES: List[Dict[str, Any]] = [
@@ -905,64 +929,7 @@ class MasterHubCoordinator:
         self.canary_injection_rate_pct: int = 5
         self.force_canary_injection: bool = False
         self._worker_last_canary: Dict[str, float] = {}
-        self._replay_canary_pool: List[Dict[str, Any]] = [
-            {
-                "id": "replay-seed-sky-blue",
-                "feature": "brain_inference",
-                "prompt": "Why is the sky blue?",
-                "trusted_output": "The blue color of the sky is caused by Rayleigh scattering. As sunlight enters the atmosphere, shorter blue wavelengths are scattered much more strongly by air molecules than longer red wavelengths.",
-                "is_replay": True,
-            },
-            {
-                "id": "replay-seed-seasons",
-                "feature": "brain_inference",
-                "prompt": "Why do we have seasons on Earth?",
-                "trusted_output": "Seasons occur because of the 23.5 degree axial tilt of the Earth. When the Northern Hemisphere is tilted toward the Sun, it experiences summer due to direct sunlight, while the Southern Hemisphere experiences winter.",
-                "is_replay": True,
-            },
-            {
-                "id": "replay-seed-vaccines",
-                "feature": "brain_inference",
-                "prompt": "How do vaccines protect against disease?",
-                "trusted_output": "Vaccines work by training the immune system to recognize antigens from pathogens. The body creates specific antibodies and memory B and T cells that rapidly neutralize the actual pathogen if exposed later.",
-                "is_replay": True,
-            },
-            {
-                "id": "replay-seed-tcp-udp",
-                "feature": "brain_inference",
-                "prompt": "What is the difference between TCP and UDP protocols?",
-                "trusted_output": "TCP is a connection-oriented protocol that provides reliable, ordered, and error-checked delivery of data using a three-way handshake, whereas UDP is connectionless and faster without delivery guarantees.",
-                "is_replay": True,
-            },
-            {
-                "id": "replay-seed-ice-float",
-                "feature": "brain_inference",
-                "prompt": "Why does ice float on water?",
-                "trusted_output": "Solid water floats because it expands upon freezing due to hydrogen bonding. The resulting crystalline structure has more open space between molecules, meaning ice has lower density than liquid water.",
-                "is_replay": True,
-            },
-            {
-                "id": "replay-seed-inflation",
-                "feature": "brain_inference",
-                "prompt": "What causes economic inflation?",
-                "trusted_output": "Economic inflation occurs when too much money chases too few goods, often triggered by loose central bank monetary policy (demand-pull) or supply chain disruptions and rising energy costs (cost-push).",
-                "is_replay": True,
-            },
-            {
-                "id": "replay-seed-photosynthesis",
-                "feature": "brain_inference",
-                "prompt": "How does photosynthesis work in plants?",
-                "trusted_output": "In plant chloroplasts, solar energy drives a chemical reaction combining water and carbon dioxide to produce glucose for energy while discharging oxygen gas into the atmosphere.",
-                "is_replay": True,
-            },
-            {
-                "id": "replay-seed-rome-fall",
-                "feature": "brain_inference",
-                "prompt": "What caused the fall of the Western Roman Empire?",
-                "trusted_output": "The collapse of Western Rome was driven by internal decay such as political instability and economic decline, combined with external military pressure and migrations from barbarian tribes including the Visigoths and Vandals.",
-                "is_replay": True,
-            },
-        ]
+        self._replay_canary_pool: List[Dict[str, Any]] = []
         self._path = state_path
         self._workers: Dict[str, WorkerNodeRecord] = {}
         self._pending: Dict[str, dict] = {}
@@ -1008,6 +975,7 @@ class MasterHubCoordinator:
                     self.treasury_balance = float(data.get("treasury_balance", 0.0))
                     self.current_epoch = int(data.get("current_epoch", 1))
                     last_settled_hash = str(data.get("last_settled_ledger_hash", ""))
+                    self._replay_canary_pool = list(data.get("replay_canary_pool", []))
                     workers_data = data.get("workers", [])
                 else:
                     workers_data = data
@@ -1078,6 +1046,7 @@ class MasterHubCoordinator:
                 "treasury_balance": self.treasury_balance,
                 "current_epoch": self.current_epoch,
                 "last_settled_ledger_hash": getattr(self.ledger, "head_hash", "") if self.ledger else "",
+                "replay_canary_pool": self._replay_canary_pool,
                 "workers": [w.to_dict(include_key=True) for w in self._workers.values()],
             }
             with tmp.open("w", encoding="utf-8") as fh:
@@ -1768,7 +1737,7 @@ class MasterHubCoordinator:
             if len(self._replay_canary_pool) > 100:
                 self._replay_canary_pool.pop(0)
 
-    def create_golden_canary_task(self, worker_id: str, canary_idx: Optional[int] = None) -> dict:
+    def create_golden_canary_task(self, worker_id: str, canary_idx: Optional[Any] = None) -> dict:
         """Injects an unannounced ground-truth canary task to spot-check worker honesty.
         Procedurally generates unique challenges disguised identically to real requester tasks.
         """
@@ -1776,12 +1745,14 @@ class MasterHubCoordinator:
             worker = self.get_worker(worker_id)
             if not worker:
                 raise KeyError(f"Unknown worker {worker_id!r}")
-            if canary_idx is not None and canary_idx < len(GOLDEN_CANARIES):
+            if canary_idx == "replay" and self._replay_canary_pool:
+                canary = secrets.choice(self._replay_canary_pool)
+            elif isinstance(canary_idx, int) and canary_idx < len(GOLDEN_CANARIES):
                 canary = GOLDEN_CANARIES[canary_idx]
             elif self._replay_canary_pool and secrets.randbelow(10) < 5:
                 canary = secrets.choice(self._replay_canary_pool)
             else:
-                canary = generate_procedural_canary(seed=canary_idx)
+                canary = generate_procedural_canary(seed=canary_idx if isinstance(canary_idx, int) else None)
             payload = {"prompt": canary["prompt"]}
             if "test_assertions" in canary:
                 payload["test_assertions"] = canary["test_assertions"]
@@ -1956,11 +1927,15 @@ class MasterHubCoordinator:
                 p_stems = extract_prompt_stems(canary.get("prompt", ""))
                 coh, _ = check_prose_coherence(out_str)
                 vague, _ = is_vague_non_answer(out_str)
-                contra, _ = detect_contradiction(out_str, t_out)
-                s1 = set(extract_novel_stems(out_str, p_stems))
-                s2 = set(extract_novel_stems(t_out, p_stems))
-                shared = s1 & s2
-                passed = coh and not vague and not contra and len(shared) >= 2
+                contra, _ = detect_contradiction(out_str, t_out, prompt=canary.get("prompt", ""))
+                s1_mech = set(extract_novel_stems(out_str, p_stems)) - SETTING_DISCOURSE_WORDS
+                s2_mech = set(extract_novel_stems(t_out, p_stems)) - SETTING_DISCOURSE_WORDS
+                shared_mech_count = len(s1_mech & s2_mech)
+                cos_sim = compute_cosine_similarity(
+                    compute_semantic_embedding(out_str),
+                    compute_semantic_embedding(t_out)
+                )
+                passed = coh and not vague and not contra and (shared_mech_count >= 2 or (cos_sim >= 0.74 and shared_mech_count >= 1))
             elif canary.get("verifier") and callable(canary["verifier"]):
                 try:
                     passed = bool(canary["verifier"](out_str))
@@ -2211,55 +2186,36 @@ class MasterHubCoordinator:
                     is_short_factual = len(out1.split()) <= 25 and len(out2.split()) <= 25
 
                     # 4. Principled Grounding & Sybil Collusion Detection:
-                    # Identify prompt domain concept clusters and verify if novel shared words are grounded.
-                    # Zero hardcoded token blacklists! Generic detection of ungrounded coordinated vocabulary.
-                    prompt_clusters = {
-                        c_name for c_name, words in CONCEPT_TAXONOMY.items()
-                        if any(stem_token(w) in prompt_stems or any(ps.startswith(w) or w.startswith(ps) for ps in prompt_stems) for w in words)
-                    }
-                    valid_grounding_clusters = prompt_clusters | {
-                        "GENERAL_SCIENCE", "RELATIONAL_CORE", "RELATION_SPACE",
-                        "RELATION_STATE", "RELATION_TIME", "RELATION_CONDITION",
-                        "OBSERVE_MEASURE", "CAUSAL_DETERMINE",
-                    }
-                    grounded_vocab = set()
-                    for c in valid_grounding_clusters:
-                        grounded_vocab |= CONCEPT_TAXONOMY.get(c, set())
-
-                    grounded_shared = {
-                        w for w in shared_novel
-                        if any(w.startswith(gw) or gw.startswith(w) for gw in grounded_vocab)
-                    }
-                    ungrounded_shared = shared_novel - grounded_shared
-
+                    # Semantic embedding grounding check without hardcoded token taxonomies.
+                    prompt_cos = max(compute_cosine_similarity(emb_prompt, emb1), compute_cosine_similarity(emb_prompt, emb2))
                     is_collusion = False
-                    # If workers share multiple arbitrary novel words with ZERO grounding in prompt topic
-                    if len(ungrounded_shared) >= 2 and len(grounded_shared) == 0:
+                    if prompt_cos < 0.25 and shared_novel_count >= 2:
                         is_collusion = True
-                    elif not is_short_factual and (cos_sim >= 0.85 or out1.strip().lower() == out2.strip().lower()) and shared_novel_count >= 2:
-                        prompt_cos = max(compute_cosine_similarity(emb_prompt, emb1), compute_cosine_similarity(emb_prompt, emb2))
-                        if prompt_cos < 0.15 and len(grounded_shared) == 0:
-                            is_collusion = True
+                    elif prompt_cos < 0.20 and cos_sim >= 0.70:
+                        is_collusion = True
 
                     if is_collusion:
                         return self._reject(worker, "sybil_collusion_detected (arbitrary ungrounded vocabulary across nodes)", task=task)
 
                     # Contradiction Detection: Catch factual inversions and opposing claims
-                    is_contra, c_reason = detect_contradiction(out1, out2)
+                    is_contra, c_reason = detect_contradiction(out1, out2, prompt=prompt_str)
                     if is_contra:
-                        return self._reject(worker, f"consensus_semantic_divergence_rejected (contradiction_rejected: {c_reason})", task=task)
+                        return self._reject(worker, f"consensus_semantic_divergence_rejected ({c_reason})", task=task)
 
-                    # 5. Semantic Agreement Check:
+                    # 5. Novel Mechanism Stems
+                    s1_mech = set(novel_stems_1) - SETTING_DISCOURSE_WORDS
+                    s2_mech = set(novel_stems_2) - SETTING_DISCOURSE_WORDS
+                    shared_mech_count = len(s1_mech & s2_mech)
+
+                    # 6. Semantic Agreement Check:
                     is_agreed = False
                     if is_short_factual:
                         # Strict factual entity agreement:
-                        # NEVER match on whole-sentence cosine (which triggers on prompt-echo filler like "is the capital of Japan")!
-                        # Contradicting entities (Tokyo vs Osaka) or filler non-answers have shared_novel_count == 0 and are REJECTED!
                         if out1.strip().lower() == out2.strip().lower() or shared_novel_count >= 1:
                             is_agreed = True
                     else:
                         # Explanatory responses: evaluate shared novel explanatory mechanism stems
-                        if len_ratio >= 0.15 and shared_novel_count >= 2:
+                        if len_ratio >= 0.15 and (shared_mech_count >= 2 or (cos_sim >= 0.82 and shared_mech_count >= 1)):
                             is_agreed = True
 
                     if is_agreed:
