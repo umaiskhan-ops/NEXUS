@@ -277,6 +277,13 @@ def make_handler(grid, client):
                     self.send_header(hk, hv)
             self.end_headers()
             self.wfile.write(data)
+            obs = getattr(grid, "observability", None)
+            if obs is not None:
+                import time as _obs_t
+                req_start = getattr(self, "_req_start", None)
+                latency_s = max(0.0, _obs_t.monotonic() - req_start) if req_start is not None else 0.0
+                req_path = str(getattr(self, "path", "") or "").split("?", 1)[0]
+                obs.record_http_request(req_path, int(code), latency_s)
 
         def _get_cookie(self, name: str) -> str:
             raw = self.headers.get("Cookie", "")
@@ -359,6 +366,12 @@ def make_handler(grid, client):
                     return None
                 return wrec
             return None
+
+        def parse_request(self):  # noqa: D102
+            ok = super().parse_request()
+            import time as _obs_t
+            self._req_start = _obs_t.monotonic()
+            return ok
 
         def do_GET(self):  # noqa: N802
             client_ip = self.client_address[0] if self.client_address else "127.0.0.1"
@@ -941,6 +954,22 @@ def make_handler(grid, client):
                 return self._send(200, {"ok": True, "node": grid.node_id, "lockdown": grid.system_lockdown})
             if path == "/p2p/head":
                 return self._p2p_head()
+            if path == "/api/metrics":
+                if not self._auth_ok():
+                    return self._send(401, {"ok": False, "error": "unauthorized"})
+                obs = getattr(grid, "observability", None)
+                if obs is None:
+                    return self._send(503, {"ok": False, "error": "observability unavailable"})
+                qs = parse_qs(urlparse(self.path).query)
+                fmt = (qs.get("format", [""])[0] or "").lower()
+                accept = (self.headers.get("Accept", "") or "").lower()
+                if fmt == "prometheus" or "text/plain" in accept:
+                    return self._send(
+                        200,
+                        obs.format_prometheus_metrics(grid),
+                        "text/plain; version=0.0.4; charset=utf-8",
+                    )
+                return self._send(200, {"ok": True, **obs.get_telemetry_snapshot(grid)})
             if path in {"/dashboard", "/api/status"}:
                 if not self._auth_ok():
                     return self._send(401, {"error": "unauthorized"})
@@ -1182,6 +1211,8 @@ def make_handler(grid, client):
                 "/api/learning/reject_candidate",
                 "/api/learning/kill_switch",
                 "/api/learning/auto_gpu",
+                "/api/learning/generate_curriculum",
+                "/api/learning/dgm_cycle",
             }:
                 if not self._auth_ok():
                     return self._send(401, {"ok": False, "error": "unauthorized"})
@@ -1268,6 +1299,51 @@ def make_handler(grid, client):
                             return self._send(503, {"ok": False, "error": str(r_err), "status": "TRAINING_UNAVAILABLE"})
                         return self._send(500, {"ok": False, "error": str(r_err)})
 
+                if path == "/api/learning/generate_curriculum":
+                    try:
+                        target_count = int(body.get("target_count", 5000) or 5000)
+                        seed = int(body.get("seed", 42) or 42)
+                        res = grid.continuous_learning.generate_verified_curriculum(target_count=target_count, seed=seed)
+                        return self._send(200 if res.get("ok") else 400, res)
+                    except Exception as exc:
+                        return self._send(400, {"ok": False, "error": str(exc)})
+
+                if path == "/api/learning/dgm_cycle":
+                    try:
+                        samples = int(body.get("samples_per_task", 5) or 5)
+                        strategy = body.get("strategy")
+                        res = grid.continuous_learning.dgm_loop.run_evolution_cycle(
+                            samples_per_task=samples,
+                            strategy=strategy,
+                        )
+                        return self._send(200 if res.get("ok") else 400, res)
+                    except PermissionError as p_err:
+                        return self._send(403, {"ok": False, "error": str(p_err)})
+                    except Exception as exc:
+                        return self._send(400, {"ok": False, "error": str(exc)})
+
+            if path in {"/api/models/evaluate_garden", "/api/hub/wal_drill"}:
+                if not self._auth_ok():
+                    return self._send(401, {"ok": False, "error": "unauthorized"})
+                body = self._read_json_body(allow_empty=True)
+                if body is None:
+                    return
+                if path == "/api/models/evaluate_garden":
+                    from .models import ModelGardenEvaluator
+                    evaluator = ModelGardenEvaluator()
+                    single_vs_ensemble = evaluator.evaluate_single_vs_ensemble(grid.router)
+                    urdu_suite = evaluator.evaluate_urdu_suite(router=grid.router)
+                    return self._send(
+                        200,
+                        {"ok": True, "single_vs_ensemble": single_vs_ensemble, "urdu_suite": urdu_suite},
+                    )
+                if path == "/api/hub/wal_drill":
+                    obs = getattr(grid, "observability", None)
+                    if obs is None:
+                        return self._send(503, {"ok": False, "error": "observability unavailable"})
+                    res = obs.run_wal_backup_and_restore_drill(grid.hub, grid.ledger)
+                    return self._send(200 if res.get("ok") else 500, res)
+
             if path in {"/api/worker/register", "/api/worker/heartbeat", "/api/worker/submit_result", "/api/worker/enqueue_task"}:
                 import secrets
                 body = self._read_json_body(allow_empty=True)
@@ -1276,6 +1352,8 @@ def make_handler(grid, client):
 
                 if path == "/api/worker/submit_result":
                     settled = grid.hub.verify_and_settle(body) if getattr(grid, "hub", None) else {"ok": False, "error": "hub unavailable"}
+                    if getattr(grid, "observability", None) is not None and isinstance(settled, dict):
+                        grid.observability.record_settlement_outcome(settled)
                     return self._send(200 if settled.get("ok") else 400, settled)
 
                 if path == "/api/worker/enqueue_task":

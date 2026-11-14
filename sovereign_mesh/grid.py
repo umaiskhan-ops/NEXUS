@@ -110,6 +110,10 @@ class UltimateAgiSovereignGrid:
             ledger=self.ledger,
             router=self.router,
         )
+        from .observability import ObservabilityManager
+        self.observability = ObservabilityManager(self.data_dir)
+        if getattr(self, "hub", None) is not None:
+            self.hub.observability = self.observability
 
         self.system_lockdown = False
         self.frozen = False

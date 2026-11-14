@@ -63,3 +63,8 @@
 | `/api/learning/kill_switch` | POST | Hub Owner | `DASHBOARD_TOKEN` / Cookie | Engage emergency learning kill switch |
 | `/api/p2p/dispute/resolve` | POST | Hub Owner | `DASHBOARD_TOKEN` / Cookie | Owner dispute resolution authority |
 | `/api/lottery/draw` | POST | Hub Owner | `DASHBOARD_TOKEN` / Cookie | Trigger lottery draw with commit-reveal randomness |
+| `/api/metrics` | GET | Hub Owner | `DASHBOARD_TOKEN` / Cookie | Telemetry snapshot JSON or Prometheus exposition metrics (`?format=prometheus`) |
+| `/api/learning/generate_curriculum` | POST | Hub Owner | `DASHBOARD_TOKEN` / Cookie | Generate verified disjoint training curriculum samples |
+| `/api/learning/dgm_cycle` | POST | Hub Owner | `DASHBOARD_TOKEN` / Cookie | Run DGM-lite self-improvement scaffold evolution cycle |
+| `/api/models/evaluate_garden` | POST | Hub Owner | `DASHBOARD_TOKEN` / Cookie | Evaluate single vs ensemble models and Urdu/Roman Urdu suite |
+| `/api/hub/wal_drill` | POST | Hub Owner | `DASHBOARD_TOKEN` / Cookie | Run automated WAL + ledger backup and crash-restore verification drill |

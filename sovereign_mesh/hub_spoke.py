@@ -899,6 +899,17 @@ class WorkerNodeRecord:
     daily_task_credits_earned: int = 0
     daily_task_window_start: float = 0.0
     canary_strikes: int = 0
+    # Phase B: Anti-Sybil Reputation, Collateral Stake & Device Attestation
+    reputation_score: float = 0.25
+    staked_collateral: int = 0
+    device_attestation: Dict[str, Any] = field(default_factory=dict)
+    verifier_checks_completed: int = 0
+    attributable_slashes: int = 0
+
+    def spendable_credits(self) -> int:
+        locked_welcome = max(0, int(getattr(self, "welcome_credits_locked", 0)))
+        staked = max(0, int(getattr(self, "staked_collateral", 0)))
+        return max(0, int(self.credits) - locked_welcome - staked)
 
     def __post_init__(self) -> None:
         if not self.referral_code:
@@ -920,6 +931,7 @@ class WorkerNodeRecord:
 
     def to_dict(self, include_key: bool = False) -> dict:
         d = dataclasses.asdict(self)
+        d["spendable_credits"] = self.spendable_credits()
         if not include_key:
             d.pop("key")
         return d
@@ -1137,12 +1149,16 @@ class MasterHubCoordinator:
             return minted
 
     # -- registry
-    def register_worker(self, worker_id: str, url: str = "local", initial_credits: int = WELCOME_CREDITS,
+    def register_worker(self, worker_id: str, url: str = "local", initial_credits: Optional[int] = None,
                         hardware_uuid: str = "", public_ip: str = "", hardware_spec: str = "",
                         referred_by: str = "", version: str = "",
                         quantum_address: str = "", quantum_vault_pub: Optional[Dict[str, Any]] = None,
                         puf_seal: str = "") -> WorkerNodeRecord:
         from .brain_matrix import assign_worker_brain_shard
+
+        is_default_welcome = initial_credits is None
+        eff_initial_credits = WELCOME_CREDITS if is_default_welcome else int(initial_credits)
+        locked_welcome = WELCOME_CREDITS if (is_default_welcome and worker_id != "owner-master") else 0
 
         hardware_uuid = (hardware_uuid or "").strip()
         public_ip = (public_ip or "").strip()
@@ -1241,7 +1257,8 @@ class MasterHubCoordinator:
                 worker_id=worker_id,
                 key=secrets.token_hex(32),
                 url=url,
-                credits=initial_credits,
+                credits=eff_initial_credits,
+                welcome_credits_locked=locked_welcome,
                 hardware_uuid=hardware_uuid,
                 public_ip=public_ip,
                 hardware_spec=eff_spec,
@@ -1260,7 +1277,8 @@ class MasterHubCoordinator:
             self.ledger.append("worker_registered", {
                 "worker_id": worker_id,
                 "url": url,
-                "credits": initial_credits,
+                "credits": eff_initial_credits,
+                "welcome_credits_locked": locked_welcome,
                 "hardware_uuid": hardware_uuid,
                 "hardware_spec": rec.hardware_spec,
                 "brain_shard": rec.brain_shard,
@@ -1857,6 +1875,169 @@ class MasterHubCoordinator:
             t2 = self.enqueue_nat_task(w2.worker_id, feature_key, p2, funded_by=funded_by, funded_credits=funded_credits)
             return t1, t2
 
+    def update_worker_reputation(self, worker: Optional[WorkerNodeRecord], event: str) -> float:
+        """Updates worker reputation slowly on verified work and sharply on failures/slashing (B11)."""
+        if not worker:
+            return 0.0
+        with self._lock:
+            rep = float(getattr(worker, "reputation_score", 0.25))
+            if event == "task_verified":
+                uptime_hrs = min(25, int(getattr(worker, "uptime_minutes_verified", 0)) // 60)
+                delta = 0.02 + (0.002 * uptime_hrs)
+                rep = min(1.0, rep + delta)
+            elif event == "verifier_completed":
+                rep = min(1.0, rep + 0.015)
+            elif event == "result_rejected":
+                rep = max(0.0, rep - 0.12)
+            elif event == "canary_strike":
+                rep = max(0.0, rep - 0.30)
+            elif event == "slashed":
+                rep = 0.0
+            worker.reputation_score = round(rep, 4)
+            return worker.reputation_score
+
+    def compute_effective_spot_check_rate(self, worker: WorkerNodeRecord) -> float:
+        """Adaptive reputation-scaled spot checking (B2 Darja 3 / B9):
+        - Probationary, low-reputation, or flagged workers receive 100% spot checks (1.0).
+        - High-reputation veteran workers scale smoothly down to a 5% floor (0.05-0.25).
+        """
+        rep = float(getattr(worker, "reputation_score", 0.25))
+        verified_cnt = int(getattr(worker, "tasks_verified", 0))
+        strikes = int(getattr(worker, "canary_strikes", 0))
+        rejects = int(getattr(worker, "rejected_packets", 0))
+        if verified_cnt < 5 or rep < 0.60 or strikes > 0 or rejects > 0:
+            return 1.0
+        rate = max(0.05, min(0.25, 0.25 - 0.50 * (rep - 0.60)))
+        return round(rate, 4)
+
+    def stake_worker_collateral(self, worker_id: str, amount: int) -> dict:
+        """Locks spendable credits as anti-sybil worker collateral stake (B10)."""
+        amt = int(amount)
+        if amt <= 0:
+            raise ValueError("Collateral stake amount must be positive")
+        with self._lock:
+            worker = self._resolve_worker_or_key(worker_id)
+            if not worker:
+                raise KeyError(f"Unknown worker node {worker_id!r}")
+            if worker.status == "SLASHED":
+                raise PermissionError(f"Worker {worker.worker_id!r} is SLASHED")
+            spendable = worker.spendable_credits()
+            if spendable < amt:
+                return {
+                    "ok": False,
+                    "status": "INSUFFICIENT_SPENDABLE_CREDITS",
+                    "spendable_credits": spendable,
+                    "required": amt,
+                    "error": f"Insufficient spendable credits ({spendable} < {amt}); unvested welcome credits cannot be staked.",
+                }
+            worker.staked_collateral += amt
+            rep_boost = min(0.15, amt / 500.0)
+            worker.reputation_score = min(1.0, round(worker.reputation_score + rep_boost, 4))
+            self._flush()
+            block = self.ledger.append("worker_collateral_staked", {
+                "worker_id": worker.worker_id,
+                "staked_amount": amt,
+                "total_staked_collateral": worker.staked_collateral,
+                "reputation_score": worker.reputation_score,
+            })
+            return {
+                "ok": True,
+                "status": "COLLATERAL_STAKED",
+                "worker_id": worker.worker_id,
+                "staked_collateral": worker.staked_collateral,
+                "spendable_credits": worker.spendable_credits(),
+                "reputation_score": worker.reputation_score,
+                "ledger_block": block["hash"][:16],
+            }
+
+    def verify_device_attestation(self, worker_id: str, attestation_payload: Dict[str, Any]) -> dict:
+        """Verifies cryptographic device attestation (GPU/TPM/PUF quote signed by worker key) (B10)."""
+        if not isinstance(attestation_payload, dict):
+            return {"ok": False, "error": "attestation_payload must be a dict"}
+        with self._lock:
+            worker = self._resolve_worker_or_key(worker_id)
+            if not worker:
+                raise KeyError(f"Unknown worker node {worker_id!r}")
+            if worker.status == "SLASHED":
+                raise PermissionError(f"Worker {worker.worker_id!r} is SLASHED")
+            sig = str(attestation_payload.get("signature", "")).strip()
+            quote_body = {
+                "worker_id": worker.worker_id,
+                "gpu_uuid": str(attestation_payload.get("gpu_uuid", "")),
+                "tpm_quote_hash": str(attestation_payload.get("tpm_quote_hash", "")),
+                "puf_seal": str(attestation_payload.get("puf_seal") or worker.puf_seal or ""),
+            }
+            if not sig or not hmac.compare_digest(sig, compute_hmac(worker.key, quote_body)):
+                return {"ok": False, "status": "ATTESTATION_REJECTED", "error": "invalid_device_attestation_signature"}
+            already_attested = bool(worker.device_attestation.get("verified"))
+            worker.device_attestation = {
+                "verified": True,
+                "gpu_uuid": quote_body["gpu_uuid"],
+                "tpm_quote_hash": quote_body["tpm_quote_hash"],
+                "puf_seal": quote_body["puf_seal"],
+                "attested_at": time.time(),
+            }
+            if not already_attested:
+                worker.reputation_score = min(1.0, round(worker.reputation_score + 0.10, 4))
+            self._flush()
+            self.ledger.append("worker_device_attested", {
+                "worker_id": worker.worker_id,
+                "gpu_uuid": quote_body["gpu_uuid"],
+                "reputation_score": worker.reputation_score,
+            })
+            return {
+                "ok": True,
+                "status": "DEVICE_ATTESTED",
+                "worker_id": worker.worker_id,
+                "device_attestation": dict(worker.device_attestation),
+                "reputation_score": worker.reputation_score,
+            }
+
+    def dispatch_verifier_task(
+        self,
+        target_worker_id: str,
+        original_task_id: str,
+        feature_key: str,
+        payload: dict,
+        submitted_result: Any,
+        submitted_sig: str = "",
+    ) -> Optional[dict]:
+        """Offloads spot-check verification to an independent high-reputation verifier worker (B2 Darja 3 / B9)."""
+        with self._lock:
+            target = self.get_worker(target_worker_id)
+            if not target:
+                return None
+            candidates = [
+                w for w in self._workers.values()
+                if w.status == "ACTIVE"
+                and w.worker_id != target.worker_id
+                and float(getattr(w, "reputation_score", 0.25)) >= 0.70
+                and int(getattr(w, "tasks_verified", 0)) >= 5
+                and _is_independent_peer(target, w)
+            ]
+            if not candidates:
+                return None
+            verifier = secrets.choice(candidates)
+            verifier_payload = {
+                "original_task_id": original_task_id,
+                "target_worker_id": target.worker_id,
+                "original_feature": feature_key,
+                "original_payload": payload,
+                "candidate_result": submitted_result,
+                "candidate_sig": submitted_sig,
+            }
+            pkt = self.enqueue_nat_task(
+                verifier.worker_id,
+                "verifier_spot_check",
+                verifier_payload,
+                funded_by="hub_internal",
+                funded_credits=max(1, self.halving_epoch_info()["active_task_reward_credits"] // 5),
+            )
+            t_rec = self._pending.get(pkt["task_id"])
+            if t_rec:
+                t_rec["is_verifier_task"] = True
+            return pkt
+
     def _prune_consensus_buffer(self) -> None:
         """Removes expired entries from the freeform consensus buffer (TTL = 300s) and refunds escrow."""
         now = time.time()
@@ -1873,6 +2054,7 @@ class MasterHubCoordinator:
     def _reject(self, worker: Optional[WorkerNodeRecord], reason: str, task: Optional[dict] = None) -> dict:
         if worker:
             worker.rejected_packets += 1
+            self.update_worker_reputation(worker, "result_rejected")
             self._flush()
         if task and isinstance(task, dict):
             self.refund_task_escrow(task, reason=f"task_rejected:{reason}")
@@ -1933,12 +2115,54 @@ class MasterHubCoordinator:
             self._nat_in_flight.pop(task_id, None)
 
         verified = False
+        offloaded_verifier_task_id = ""
+        effective_spot_rate = (
+            self.compute_effective_spot_check_rate(worker)
+            if self.spot_check_rate >= 1.0
+            else min(float(self.spot_check_rate), self.compute_effective_spot_check_rate(worker))
+        )
         clean_res, res_flags = sanitize_payload(result)
         if "prompt_injection_suspected" in res_flags:
             return self._reject(worker, "tainted_or_injected_worker_output", task=task)
 
+        # Offloaded Verifier Worker Spot-Check Settlement (B2 Darja 3 / B9)
+        if task["feature"] == "verifier_spot_check" or task.get("is_verifier_task"):
+            if "verified_match" not in result or not isinstance(result.get("verified_match"), bool):
+                return self._reject(worker, "invalid_verifier_spot_check_payload", task=task)
+            with self._lock:
+                worker.verifier_checks_completed = int(getattr(worker, "verifier_checks_completed", 0)) + 1
+                self.update_worker_reputation(worker, "verifier_completed")
+            verified = True
+            if result.get("verified_match") is False and self.grid is not None:
+                v_payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+                orig_feat = str(v_payload.get("original_feature") or "")
+                orig_pay = v_payload.get("original_payload") or {}
+                target_wid = str(v_payload.get("target_worker_id") or "")
+                cand_res = v_payload.get("candidate_result")
+                cand_sig = str(v_payload.get("candidate_sig") or "")
+                target_w = self.get_worker(target_wid) if target_wid else None
+                if target_w and target_w.status == "ACTIVE" and _spot_checkable(orig_feat, orig_pay):
+                    try:
+                        expected = self.grid.registry.get(orig_feat).handler(self.grid, sanitize_payload(orig_pay)[0])
+                        if _canonical(_comparable(expected)) != _canonical(_comparable(cand_res)):
+                            with self._lock:
+                                self._slash(
+                                    target_w,
+                                    f"verifier_offload_spot_check_mismatch on {orig_feat} (task {v_payload.get('original_task_id', '')})",
+                                    task_id=str(v_payload.get("original_task_id") or ""),
+                                    attributable_proof={
+                                        "worker_id": target_w.worker_id,
+                                        "task_id": str(v_payload.get("original_task_id") or ""),
+                                        "verifier_worker_id": worker.worker_id,
+                                        "submitted_sig_prefix": cand_sig[:32],
+                                        "evidence": "verifier_reported_and_hub_confirmed_mismatch",
+                                    },
+                                )
+                    except Exception:
+                        pass
+
         # Golden Canary Task Spot-Check Verification
-        if task.get("is_canary"):
+        if not verified and task.get("is_canary"):
             canary = task.get("canary_spec") or {}
             out_str = str(
                 result.get("output")
@@ -1994,6 +2218,7 @@ class MasterHubCoordinator:
             else:
                 # Canary failed! Graduated penalty system (Warning -> 20% burn -> Slashed)
                 worker.canary_strikes = getattr(worker, "canary_strikes", 0) + 1
+                self.update_worker_reputation(worker, "canary_strike")
                 strike = worker.canary_strikes
                 cid = canary.get("id", "canary_unknown")
                 if strike == 1:
@@ -2040,7 +2265,18 @@ class MasterHubCoordinator:
                     }
                     self.appeal_log.append(log_entry)
                     with self._lock:
-                        slash_res = self._slash(worker, f"canary_strike_3_slash: 3 ground-truth canary failures ({cid})")
+                        slash_res = self._slash(
+                            worker,
+                            f"canary_strike_3_slash: 3 ground-truth canary failures ({cid})",
+                            task_id=task_id,
+                            attributable_proof={
+                                "worker_id": worker.worker_id,
+                                "task_id": task_id,
+                                "canary_id": cid,
+                                "sig_verified": True,
+                                "evidence": "3_ground_truth_canary_failures",
+                            },
+                        )
                         return {
                             "ok": False,
                             "status": "SLASHED",
@@ -2049,61 +2285,97 @@ class MasterHubCoordinator:
                             "worker_id": worker.worker_id,
                         }
 
-        if self.grid is not None and _spot_checkable(task["feature"], task["payload"]) \
-                and secrets.randbelow(10_000) < int(self.spot_check_rate * 10_000):
-            try:
-                expected = self.grid.registry.get(task["feature"]).handler(self.grid, sanitize_payload(task["payload"])[0])
-                if _canonical(_comparable(expected)) != _canonical(_comparable(result)):
-                    with self._lock:
-                        return self._slash(worker, f"spot_check_mismatch on {task['feature']} (task {task_id})")
+        if not verified and self.grid is not None and _spot_checkable(task["feature"], task["payload"]):
+            if secrets.randbelow(10_000) < int(effective_spot_rate * 10_000):
+                try:
+                    expected = self.grid.registry.get(task["feature"]).handler(self.grid, sanitize_payload(task["payload"])[0])
+                    if _canonical(_comparable(expected)) != _canonical(_comparable(result)):
+                        with self._lock:
+                            return self._slash(
+                                worker,
+                                f"spot_check_mismatch on {task['feature']} (task {task_id})",
+                                task_id=task_id,
+                                attributable_proof={
+                                    "worker_id": worker.worker_id,
+                                    "task_id": task_id,
+                                    "feature": task["feature"],
+                                    "sig_verified": True,
+                                    "evidence": "hub_deterministic_spot_check_mismatch",
+                                },
+                            )
+                    verified = True
+                except Exception as exc:
+                    return self._reject(worker, f"spot_check_handler_error: {exc}")
+            else:
+                v_pkt = self.dispatch_verifier_task(
+                    worker.worker_id,
+                    task_id,
+                    task["feature"],
+                    task["payload"],
+                    result,
+                    str(raw_proof or ""),
+                )
+                if v_pkt:
+                    offloaded_verifier_task_id = v_pkt["task_id"]
                 verified = True
-            except Exception as exc:
-                return self._reject(worker, f"spot_check_handler_error: {exc}")
-        elif task["feature"] in SPOT_CHECKABLE:
-            # Standalone Hub verification of deterministic features (rejects fabricated answers)
-            t_payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
-            if task["feature"] == "data_analysis":
-                raw_nums = t_payload.get("series") or t_payload.get("data") or t_payload.get("numbers")
-                nums = []
-                if isinstance(raw_nums, (list, tuple)):
-                    nums = [float(x) for x in raw_nums if isinstance(x, (int, float)) and not isinstance(x, bool)]
-                elif isinstance(raw_nums, str):
-                    nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", raw_nums)]
-                if nums and isinstance(result.get("mean"), (int, float)) and not isinstance(result.get("mean"), bool):
-                    expected_mean = sum(nums) / len(nums)
-                    if abs(float(result["mean"]) - expected_mean) <= 0.05:
-                        if "count" in result and int(result["count"]) != len(nums):
-                            verified = False
-                        elif "sum" in result and abs(float(result["sum"]) - sum(nums)) > 0.05:
-                            verified = False
-                        else:
-                            verified = True
-            elif task["feature"] == "trend_forecasting":
-                raw_vals = t_payload.get("series") or t_payload.get("data") or t_payload.get("values")
-                xs = []
-                if isinstance(raw_vals, (list, tuple)):
-                    xs = [float(x) for x in raw_vals if isinstance(x, (int, float)) and not isinstance(x, bool)]
-                elif isinstance(raw_vals, str):
-                    xs = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", raw_vals)]
-                if len(xs) >= 2:
-                    n = len(xs)
-                    t = list(range(n))
-                    t_mean = sum(t) / n
-                    x_mean = sum(xs) / n
-                    denom = sum((ti - t_mean) ** 2 for ti in t)
-                    expected_slope = sum((ti - t_mean) * (xi - x_mean) for ti, xi in zip(t, xs)) / (denom if denom != 0 else 1)
-                    expected_direction = "UPWARD" if expected_slope > 0.01 else ("DOWNWARD" if expected_slope < -0.01 else "FLAT")
-                    res_trend = str(result.get("trend") or "").upper()
-                    if res_trend == "UP":
-                        res_trend = "UPWARD"
-                    elif res_trend == "DOWN":
-                        res_trend = "DOWNWARD"
-                    if res_trend == expected_direction:
-                        if "slope" in result and isinstance(result["slope"], (int, float)) and not isinstance(result["slope"], bool):
-                            if abs(float(result["slope"]) - expected_slope) <= 0.05:
+        elif not verified and task["feature"] in SPOT_CHECKABLE:
+            if secrets.randbelow(10_000) >= int(effective_spot_rate * 10_000):
+                v_pkt = self.dispatch_verifier_task(
+                    worker.worker_id,
+                    task_id,
+                    task["feature"],
+                    task["payload"],
+                    result,
+                    str(raw_proof or ""),
+                )
+                if v_pkt:
+                    offloaded_verifier_task_id = v_pkt["task_id"]
+                verified = True
+            else:
+                # Standalone Hub verification of deterministic features (rejects fabricated answers)
+                t_payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+                if task["feature"] == "data_analysis":
+                    raw_nums = t_payload.get("series") or t_payload.get("data") or t_payload.get("numbers")
+                    nums = []
+                    if isinstance(raw_nums, (list, tuple)):
+                        nums = [float(x) for x in raw_nums if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                    elif isinstance(raw_nums, str):
+                        nums = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", raw_nums)]
+                    if nums and isinstance(result.get("mean"), (int, float)) and not isinstance(result.get("mean"), bool):
+                        expected_mean = sum(nums) / len(nums)
+                        if abs(float(result["mean"]) - expected_mean) <= 0.05:
+                            if "count" in result and int(result["count"]) != len(nums):
+                                verified = False
+                            elif "sum" in result and abs(float(result["sum"]) - sum(nums)) > 0.05:
+                                verified = False
+                            else:
                                 verified = True
-                        else:
-                            verified = True
+                elif task["feature"] == "trend_forecasting":
+                    raw_vals = t_payload.get("series") or t_payload.get("data") or t_payload.get("values")
+                    xs = []
+                    if isinstance(raw_vals, (list, tuple)):
+                        xs = [float(x) for x in raw_vals if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                    elif isinstance(raw_vals, str):
+                        xs = [float(x) for x in re.findall(r"[-+]?(?:\d*\.\d+|\d+)", raw_vals)]
+                    if len(xs) >= 2:
+                        n = len(xs)
+                        t = list(range(n))
+                        t_mean = sum(t) / n
+                        x_mean = sum(xs) / n
+                        denom = sum((ti - t_mean) ** 2 for ti in t)
+                        expected_slope = sum((ti - t_mean) * (xi - x_mean) for ti, xi in zip(t, xs)) / (denom if denom != 0 else 1)
+                        expected_direction = "UPWARD" if expected_slope > 0.01 else ("DOWNWARD" if expected_slope < -0.01 else "FLAT")
+                        res_trend = str(result.get("trend") or "").upper()
+                        if res_trend == "UP":
+                            res_trend = "UPWARD"
+                        elif res_trend == "DOWN":
+                            res_trend = "DOWNWARD"
+                        if res_trend == expected_direction:
+                            if "slope" in result and isinstance(result["slope"], (int, float)) and not isinstance(result["slope"], bool):
+                                if abs(float(result["slope"]) - expected_slope) <= 0.05:
+                                    verified = True
+                            else:
+                                verified = True
 
         # Objective Ground Truth Verifier for LLM Tasks (Code assertions, Math logic, Schema contracts)
         if not verified and task["feature"] in {"brain_inference", "model_query", "neural_shard_compute", "code_review"}:
@@ -2279,6 +2551,8 @@ class MasterHubCoordinator:
                                     w1.credits += w1_reward
                                 w1.tasks_completed += 1
                                 w1.tasks_verified += 1
+                                w1.welcome_credits_locked = max(0, int(getattr(w1, "welcome_credits_locked", 0)) - 5)
+                                self.update_worker_reputation(w1, "task_verified")
                                 if getattr(w1, "canary_strikes", 0) > 0 and w1.tasks_verified % 20 == 0:
                                     w1.canary_strikes = max(0, w1.canary_strikes - 1)
                                 if self.ledger:
@@ -2329,7 +2603,16 @@ class MasterHubCoordinator:
                             with self._lock:
                                 return self._slash(
                                     worker,
-                                    f"Byzantine Fake Gradient Attack detected on {shard_name}: Cosine similarity {cos_sim:.4f} < 0.98 (task {task_id})"
+                                    f"Byzantine Fake Gradient Attack detected on {shard_name}: Cosine similarity {cos_sim:.4f} < 0.98 (task {task_id})",
+                                    task_id=task_id,
+                                    attributable_proof={
+                                        "worker_id": worker.worker_id,
+                                        "task_id": task_id,
+                                        "domain_shard": shard_name,
+                                        "cosine_similarity": round(float(cos_sim), 6),
+                                        "sig_verified": True,
+                                        "evidence": "byzantine_fake_gradient_cosine_below_0.98",
+                                    },
                                 )
                         verified = True
                     except Exception:
@@ -2358,6 +2641,10 @@ class MasterHubCoordinator:
             worker.tasks_completed += 1
             worker.tasks_verified += int(verified)
             worker.epoch_tasks_verified += int(verified)
+            if verified:
+                worker.welcome_credits_locked = max(0, int(getattr(worker, "welcome_credits_locked", 0)) - 5)
+                if task["feature"] != "verifier_spot_check":
+                    self.update_worker_reputation(worker, "task_verified")
             if getattr(worker, "canary_strikes", 0) > 0 and worker.tasks_verified % 20 == 0:
                 worker.canary_strikes = max(0, worker.canary_strikes - 1)
             referral_bonus = self._award_referral_bonus(worker, effective_reward, source="task_settlement")
@@ -2365,6 +2652,8 @@ class MasterHubCoordinator:
             block = self.ledger.append("worker_task_settled", {
                 "task_id": task_id, "worker_id": worker_id, "feature": task["feature"], "verified": verified,
                 "reward": effective_reward, "referral_bonus_minted": referral_bonus, "balance": worker.credits,
+                "reputation_score": worker.reputation_score,
+                "welcome_credits_locked": worker.welcome_credits_locked,
                 "quantum_verified": quantum_verified,
                 "quantum_address": worker.quantum_address,
                 "crypto_security_level": worker.crypto_security_level,
@@ -2376,6 +2665,11 @@ class MasterHubCoordinator:
                 "reward_credits": effective_reward, "reward_umais": effective_reward,
                 "referral_bonus_minted": referral_bonus,
                 "total_credits": worker.credits, "worker_credits": worker.credits, "balance_umais": worker.credits,
+                "spendable_credits": worker.spendable_credits(),
+                "welcome_credits_locked": worker.welcome_credits_locked,
+                "reputation_score": worker.reputation_score,
+                "effective_spot_check_rate": effective_spot_rate,
+                "offloaded_verifier_task_id": offloaded_verifier_task_id,
                 "quantum_verified": quantum_verified,
                 "quantum_address": worker.quantum_address,
                 "crypto_security_level": worker.crypto_security_level,
@@ -2401,11 +2695,21 @@ class MasterHubCoordinator:
                 ev.set()
             return settled_out
 
-    def _slash(self, worker: WorkerNodeRecord, reason: str) -> dict:
+    def _slash(
+        self,
+        worker: WorkerNodeRecord,
+        reason: str,
+        task_id: str = "",
+        attributable_proof: Optional[Dict[str, Any]] = None,
+    ) -> dict:
         burned, worker.credits = worker.credits, 0
+        forfeited_collateral = int(getattr(worker, "staked_collateral", 0))
+        worker.staked_collateral = 0
         worker.burned_credits += burned
         worker.pending_payout = 0.0  # Slashed workers forfeit pending payouts
         worker.epoch_tasks_verified = 0
+        worker.reputation_score = 0.0
+        worker.attributable_slashes = int(getattr(worker, "attributable_slashes", 0)) + 1
         worker.status = "SLASHED"
         worker.slashed_reason = reason
         # Also slash any staked collateral in token_sink if available
@@ -2414,12 +2718,24 @@ class MasterHubCoordinator:
         if sink and hasattr(sink, "slash_staker"):
             burned_staked = sink.slash_staker(worker.worker_id, reason=reason)
             worker.burned_credits += burned_staked
+        proof_obj = dict(attributable_proof) if isinstance(attributable_proof, dict) else {
+            "worker_id": worker.worker_id,
+            "task_id": task_id,
+            "reason": reason,
+            "evidence": "attributable_slashing",
+            "timestamp": time.time(),
+        }
+        proof_digest = hashlib.sha256(json.dumps(proof_obj, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         self._flush()
         block = self.ledger.append("worker_slashed", {
             "worker_id": worker.worker_id,
+            "task_id": task_id,
             "reason": reason,
             "burned_credits": burned,
+            "forfeited_collateral": forfeited_collateral,
             "burned_staked": burned_staked,
+            "attributable_proof": proof_obj,
+            "attributable_proof_hash": proof_digest,
         })
         return {
             "ok": False,
@@ -2427,18 +2743,25 @@ class MasterHubCoordinator:
             "worker_id": worker.worker_id,
             "reason": reason,
             "burned_credits": burned,
+            "forfeited_collateral": forfeited_collateral,
             "burned_staked": burned_staked,
             "remaining_credits": 0,
+            "attributable_proof_hash": proof_digest,
             "ledger_block": block["hash"][:16],
         }
 
-    def slash_worker(self, worker_id: str, reason: str = "Provable misbehaviour or security violation") -> dict:
-        """Authority method to slash a misbehaving or malicious worker node, burning all credits."""
+    def slash_worker(
+        self,
+        worker_id: str,
+        reason: str = "Provable misbehaviour or security violation",
+        attributable_proof: Optional[Dict[str, Any]] = None,
+    ) -> dict:
+        """Authority method to slash a misbehaving or malicious worker node with attributable proof, burning all credits."""
         with self._lock:
             worker = self._resolve_worker_or_key(worker_id)
             if not worker:
                 return {"status": "NOT_FOUND", "worker_id": worker_id}
-            return self._slash(worker, reason)
+            return self._slash(worker, reason, attributable_proof=attributable_proof)
 
     # -- Model 1: Compute Barter & Credit Economy
     def spend_credits(self, worker_id: str, amount: int, reason: str = "compute_task") -> dict:
@@ -2460,6 +2783,22 @@ class MasterHubCoordinator:
                         "balance": worker.credits, "required": amount,
                         "error": (f"Insufficient credits (balance: {worker.credits}, required: {amount}). "
                                   f"Run worker node to execute network tasks and earn compute credits!")}
+            spendable = worker.spendable_credits()
+            if spendable < amount:
+                return {
+                    "status": "INSUFFICIENT_SPENDABLE_CREDITS",
+                    "worker_id": worker.worker_id,
+                    "balance": worker.credits,
+                    "spendable_credits": spendable,
+                    "welcome_credits_locked": int(getattr(worker, "welcome_credits_locked", 0)),
+                    "staked_collateral": int(getattr(worker, "staked_collateral", 0)),
+                    "required": amount,
+                    "error": (
+                        f"Insufficient spendable credits (spendable: {spendable}, total: {worker.credits}, "
+                        f"welcome_locked: {getattr(worker, 'welcome_credits_locked', 0)}, "
+                        f"staked: {getattr(worker, 'staked_collateral', 0)}, required: {amount})."
+                    ),
+                }
             prev_bal = worker.credits
             new_bal = prev_bal - amount
             # H4 Fix: Write-Ahead Ledger entry first, then mutate state and fsync atomically
@@ -2539,6 +2878,21 @@ class MasterHubCoordinator:
                 return {"ok": False, "status": "INSUFFICIENT_CREDITS", "worker_id": w_from.worker_id,
                         "balance": w_from.credits, "required": amount,
                         "error": f"Insufficient credits in {w_from.worker_id} (balance: {w_from.credits}, required: {amount})"}
+            spendable_from = w_from.spendable_credits()
+            if spendable_from < amount:
+                if int(getattr(w_from, "welcome_credits_locked", 0)) > 0:
+                    raise PermissionError(
+                        "unvested_welcome_credits_locked: complete verified tasks before transferring welcome credits"
+                    )
+                return {
+                    "ok": False,
+                    "status": "INSUFFICIENT_SPENDABLE_CREDITS",
+                    "worker_id": w_from.worker_id,
+                    "balance": w_from.credits,
+                    "spendable_credits": spendable_from,
+                    "required": amount,
+                    "error": f"Insufficient spendable credits in {w_from.worker_id} (spendable: {spendable_from}, required: {amount})",
+                }
             prev_from, prev_to = w_from.credits, w_to.credits
             new_from, new_to = prev_from - amount, prev_to + amount
             block = self.ledger.append("credits_transferred", {
@@ -2570,6 +2924,10 @@ class MasterHubCoordinator:
                 "worker_id": worker.worker_id,
                 "status": worker.status,
                 "credits": worker.credits,
+                "spendable_credits": worker.spendable_credits(),
+                "welcome_credits_locked": int(getattr(worker, "welcome_credits_locked", 0)),
+                "staked_collateral": int(getattr(worker, "staked_collateral", 0)),
+                "reputation_score": float(getattr(worker, "reputation_score", 0.25)),
                 "balance_umais": worker.credits,
                 "currency_symbol": "UMAIS",
                 "credit_to_umais_parity": "1 Credit = 1 UMAIS",

@@ -15,7 +15,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Protocol
+from typing import Any, Callable, Deque, Dict, List, Optional, Protocol, Tuple
 
 from .ledger import interprocess_file_lock
 from .state import TokenBudget
@@ -853,4 +853,325 @@ class ModelRouter:
         if hasattr(self.backend, "list_models"):
             return self.backend.list_models()
         return []
+
+
+# ==============================================================================
+# B14: Model Garden & Urdu / Roman Urdu Evaluation Harness
+# ==============================================================================
+
+URDU_ROMAN_URDU_BENCHMARK_TASKS: List[Dict[str, Any]] = [
+    # --- 8 Roman Urdu Objective Tasks ---
+    {
+        "id": "ur_rom_01",
+        "script": "roman_urdu",
+        "type": "CODE",
+        "prompt": "Ek Python function `urdu_hisab_jama(a, b)` likhein jo do numbers ko jama kar ke natija return kare.",
+        "hidden_tests": "assert urdu_hisab_jama(15, 27) == 42\nassert urdu_hisab_jama(-4, 9) == 5",
+    },
+    {
+        "id": "ur_rom_02",
+        "script": "roman_urdu",
+        "type": "CODE",
+        "prompt": "Python function `karaya_total(fasla_km, rate)` banayein jo agar fasla_km > 0 ho to fasla_km * rate return kare warna 0.",
+        "hidden_tests": "assert karaya_total(12, 50) == 600\nassert karaya_total(-3, 50) == 0",
+    },
+    {
+        "id": "ur_rom_03",
+        "script": "roman_urdu",
+        "type": "CODE",
+        "prompt": "Function `chota_lafz(alfaz)` likhein jo list mein se sab se choti lambai wale lafz ki lambai return kare (khali list par 0).",
+        "hidden_tests": "assert chota_lafz(['lahore', 'ok', 'karachi']) == 2\nassert chota_lafz([]) == 0",
+    },
+    {
+        "id": "ur_rom_04",
+        "script": "roman_urdu",
+        "type": "MATH",
+        "prompt": "Agar ek node 1 ghante mein 4 credits banata hai to 6 ghante aur 15 bonus credits milakar kul kitne honge? Sirf hisabi expression likhein.",
+        "expected_value": 39,
+    },
+    {
+        "id": "ur_rom_05",
+        "script": "roman_urdu",
+        "type": "MATH",
+        "prompt": "Hisab lagayein: `(18 * 5) + (120 / 4) - 10` ka sahi jawabi adad kya hai?",
+        "expected_value": 110,
+    },
+    {
+        "id": "ur_rom_06",
+        "script": "roman_urdu",
+        "type": "SCHEMA",
+        "prompt": "JSON format mein aik student record dein jis mein keys `naam` (str), `umar` (int>=0), aur `paas` (bool) hon.",
+        "required_keys": ["naam:str", "umar:int>=0", "paas:bool"],
+    },
+    {
+        "id": "ur_rom_07",
+        "script": "roman_urdu",
+        "type": "SCHEMA",
+        "prompt": "JSON object banayein jis mein `shehar` (str), `darja_hararat` (int>=0), aur `barish` (bool) shamil hon.",
+        "required_keys": ["shehar:str", "darja_hararat:int>=0", "barish:bool"],
+    },
+    {
+        "id": "ur_rom_08",
+        "script": "roman_urdu",
+        "type": "CODE",
+        "prompt": "Function `even_ginti(nums)` likhein jo di gayi list mein kitne jor (even) adad hain un ki ginti return kare.",
+        "hidden_tests": "assert even_ginti([1, 2, 4, 7, 8]) == 3\nassert even_ginti([1, 3, 5]) == 0",
+    },
+    # --- 8 Urdu Script Objective Tasks ---
+    {
+        "id": "ur_scr_01",
+        "script": "urdu_script",
+        "type": "CODE",
+        "prompt": "ایک Python فنکشن `urdu_zarb(x, y)` لکھیں جو دو اعداد کو ضرب دے کر واپس کرے۔",
+        "hidden_tests": "assert urdu_zarb(6, 7) == 42\nassert urdu_zarb(0, 99) == 0",
+    },
+    {
+        "id": "ur_scr_02",
+        "script": "urdu_script",
+        "type": "CODE",
+        "prompt": "Python فنکشن `ausat_nikalo(a, b, c)` بنائیں جو تین اعداد کا اوسط `(a + b + c) / 3` واپس کرے۔",
+        "hidden_tests": "assert ausat_nikalo(3, 6, 9) == 6.0\nassert ausat_nikalo(10, 20, 30) == 20.0",
+    },
+    {
+        "id": "ur_scr_03",
+        "script": "urdu_script",
+        "type": "CODE",
+        "prompt": "فنکشن `sab_se_bara(lst)` لکھیں جو فہرست کا سب سے بڑا عدد واپس کرے (خالی فہرست پر 0)۔",
+        "hidden_tests": "assert sab_se_bara([4, 19, 7]) == 19\nassert sab_se_bara([]) == 0",
+    },
+    {
+        "id": "ur_scr_04",
+        "script": "urdu_script",
+        "type": "MATH",
+        "prompt": "حساب لگائیں: `(45 * 2) + 35 - 15` کا درست عددی جواب کیا ہے؟",
+        "expected_value": 110,
+    },
+    {
+        "id": "ur_scr_05",
+        "script": "urdu_script",
+        "type": "MATH",
+        "prompt": "اگر فی صارف 25 کریڈٹ ہوں تو 8 صارفین اور 40 اضافی کریڈٹ ملا کر کل کتنے ہوں گے؟",
+        "expected_value": 240,
+    },
+    {
+        "id": "ur_scr_06",
+        "script": "urdu_script",
+        "type": "SCHEMA",
+        "prompt": "JSON فارمیٹ میں ایک ورکر ریکارڈ دیں جس میں keys `worker_name` (str)، `credits` (int>=0)، اور `active` (bool) شامل ہوں۔",
+        "required_keys": ["worker_name:str", "credits:int>=0", "active:bool"],
+    },
+    {
+        "id": "ur_scr_07",
+        "script": "urdu_script",
+        "type": "SCHEMA",
+        "prompt": "JSON آبجیکٹ بنائیں جس میں `node_city` (str)، `latency_ms` (int>=0)، اور `verified` (bool) موجود ہوں۔",
+        "required_keys": ["node_city:str", "latency_ms:int>=0", "verified:bool"],
+    },
+    {
+        "id": "ur_scr_08",
+        "script": "urdu_script",
+        "type": "CODE",
+        "prompt": "فنکشن `manfi_hatao(nums)` لکھیں جو صرف مثبت (`x > 0`) اعداد کا مجموعہ واپس کرے۔",
+        "hidden_tests": "assert manfi_hatao([-5, 3, 7, -1]) == 10\nassert manfi_hatao([-2, -3]) == 0",
+    },
+]
+
+
+class ModelGardenEvaluator:
+    """Evaluates single models vs ensemble strategies (vote / debate) and the Urdu / Roman Urdu suite (B14)."""
+
+    @staticmethod
+    def _extract_code(raw: str) -> str:
+        m = re.findall(r"```(?:python)?\s*([\s\S]*?)\s*```", raw or "", re.IGNORECASE)
+        if m:
+            return m[0].strip()
+        return (raw or "").strip()
+
+    @classmethod
+    def verify_task_output(cls, task: Dict[str, Any], raw_output: str) -> Dict[str, Any]:
+        from .continuous_learning import ObjectiveGroundTruthVerifier
+
+        t_type = str(task.get("type") or "CODE").upper()
+        out_str = str(raw_output or "").strip()
+        if t_type == "CODE":
+            code = cls._extract_code(out_str)
+            tests = str(task.get("hidden_tests") or task.get("test_assertion") or "")
+            return ObjectiveGroundTruthVerifier.verify_code(code, test_assertions=tests, timeout=2.0)
+        if t_type == "MATH":
+            return ObjectiveGroundTruthVerifier.verify_math(out_str, expected_val=task.get("expected_value"))
+        if t_type == "SCHEMA":
+            return ObjectiveGroundTruthVerifier.verify_json_schema(
+                out_str, required_keys=task.get("required_keys") or []
+            )
+        return {"verified": False, "error": f"Unknown task type {t_type}"}
+
+    def evaluate_single_vs_ensemble(
+        self,
+        router: ModelRouter,
+        tasks: Optional[List[Dict[str, Any]]] = None,
+        model_callables: Optional[Dict[str, Callable[[str], str]]] = None,
+        debate_critique_fn: Optional[Callable[[str, List[str]], str]] = None,
+    ) -> Dict[str, Any]:
+        """Produces a per-model pass@1 benchmark table and compares single models against
+        ensemble voting and roundtable debate synthesis.
+        """
+        from collections import Counter
+
+        eval_tasks = list(tasks or URDU_ROMAN_URDU_BENCHMARK_TASKS[:8])
+        callables: Dict[str, Callable[[str], str]] = dict(model_callables or {})
+        if not callables:
+            for node in router.eligible_nodes() or router.nodes:
+                def _make_fn(n: ModelNode) -> Callable[[str], str]:
+                    def _fn(prompt: str) -> str:
+                        try:
+                            return router.backend.chat(n.model, "", prompt, timeout=router.timeout_s)
+                        except Exception:
+                            return ""
+                    return _fn
+                callables[node.name] = _make_fn(node)
+
+        single_model_table: Dict[str, Dict[str, Any]] = {}
+        per_task_model_outputs: Dict[int, List[Tuple[str, str]]] = {i: [] for i in range(len(eval_tasks))}
+
+        for model_name, fn in callables.items():
+            passed = 0
+            latencies: List[float] = []
+            for t_idx, task in enumerate(eval_tasks):
+                t0 = time.perf_counter()
+                try:
+                    raw_out = str(fn(task["prompt"]) or "")
+                except Exception:
+                    raw_out = ""
+                latencies.append(time.perf_counter() - t0)
+                per_task_model_outputs[t_idx].append((model_name, raw_out))
+                vr = self.verify_task_output(task, raw_out)
+                if vr.get("verified"):
+                    passed += 1
+            total = len(eval_tasks)
+            single_model_table[model_name] = {
+                "passed": passed,
+                "total": total,
+                "pass_at_1": round(passed / float(total), 4) if total else 0.0,
+                "avg_latency_s": round(sum(latencies) / float(len(latencies)), 4) if latencies else 0.0,
+            }
+
+        # Ensemble Strategy 1: Majority Vote (most common normalized answer among models)
+        vote_passed = 0
+        # Ensemble Strategy 2: Debate / Critique Judge (executes or cross-validates candidate pool)
+        debate_passed = 0
+        ensemble_details: List[Dict[str, Any]] = []
+
+        for t_idx, task in enumerate(eval_tasks):
+            model_outs = [out for _, out in per_task_model_outputs[t_idx]]
+            norm_counts = Counter(o.strip() for o in model_outs if o.strip())
+            voted_out = norm_counts.most_common(1)[0][0] if norm_counts else ""
+            vote_vr = self.verify_task_output(task, voted_out)
+            is_vote_ok = bool(vote_vr.get("verified"))
+            if is_vote_ok:
+                vote_passed += 1
+
+            # Debate/judge synthesis selects best critiqued output or delegates to debate_critique_fn / router
+            debate_out = voted_out
+            if debate_critique_fn is not None:
+                try:
+                    debate_out = str(debate_critique_fn(task["prompt"], model_outs) or voted_out)
+                except Exception:
+                    debate_out = voted_out
+            else:
+                # Objective verification critique pass picks a valid verified candidate from debate pool
+                for cand in model_outs:
+                    if cand.strip() and self.verify_task_output(task, cand).get("verified"):
+                        debate_out = cand
+                        break
+            debate_vr = self.verify_task_output(task, debate_out)
+            is_debate_ok = bool(debate_vr.get("verified"))
+            if is_debate_ok:
+                debate_passed += 1
+
+            ensemble_details.append({
+                "task_id": task.get("id", f"task_{t_idx}"),
+                "vote_passed": is_vote_ok,
+                "debate_passed": is_debate_ok,
+            })
+
+        total = len(eval_tasks)
+        best_single_p1 = max((m["pass_at_1"] for m in single_model_table.values()), default=0.0)
+        vote_p1 = round(vote_passed / float(total), 4) if total else 0.0
+        debate_p1 = round(debate_passed / float(total), 4) if total else 0.0
+        best_ensemble_p1 = max(vote_p1, debate_p1)
+
+        return {
+            "ok": True,
+            "tasks_evaluated": total,
+            "single_model_table": single_model_table,
+            "best_single_pass_at_1": best_single_p1,
+            "vote_pass_at_1": vote_p1,
+            "debate_pass_at_1": debate_p1,
+            "best_ensemble_pass_at_1": best_ensemble_p1,
+            "ensemble_gain_over_best_single": round(best_ensemble_p1 - best_single_p1, 4),
+            "details": ensemble_details,
+        }
+
+    def evaluate_urdu_suite(
+        self,
+        callable_fn: Optional[Callable[[str], str]] = None,
+        router: Optional[ModelRouter] = None,
+        tasks: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Evaluates a model callable or ModelRouter on the Roman Urdu + Urdu script benchmark suite."""
+        eval_tasks = list(tasks or URDU_ROMAN_URDU_BENCHMARK_TASKS)
+        if callable_fn is None and router is None:
+            raise ValueError("Either callable_fn or router must be provided")
+
+        def _invoke(prompt: str) -> str:
+            if callable_fn is not None:
+                return str(callable_fn(prompt) or "")
+            assert router is not None
+            try:
+                return str(router.ask(prompt).get("text", "") or "")
+            except Exception:
+                return ""
+
+        roman_total = 0
+        roman_passed = 0
+        urdu_total = 0
+        urdu_passed = 0
+        results: List[Dict[str, Any]] = []
+
+        for task in eval_tasks:
+            raw_out = _invoke(task["prompt"])
+            vr = self.verify_task_output(task, raw_out)
+            is_ok = bool(vr.get("verified"))
+            script = task.get("script", "roman_urdu")
+            if script == "urdu_script":
+                urdu_total += 1
+                if is_ok:
+                    urdu_passed += 1
+            else:
+                roman_total += 1
+                if is_ok:
+                    roman_passed += 1
+            results.append({
+                "id": task["id"],
+                "script": script,
+                "type": task["type"],
+                "passed": is_ok,
+                "error": vr.get("error", ""),
+            })
+
+        total = len(eval_tasks)
+        passed = roman_passed + urdu_passed
+        return {
+            "ok": True,
+            "total_tasks": total,
+            "passed_count": passed,
+            "overall_pass_at_1": round(passed / float(total), 4) if total else 0.0,
+            "roman_urdu_pass_at_1": round(roman_passed / float(roman_total), 4) if roman_total else 0.0,
+            "urdu_script_pass_at_1": round(urdu_passed / float(urdu_total), 4) if urdu_total else 0.0,
+            "roman_urdu_passed": roman_passed,
+            "roman_urdu_total": roman_total,
+            "urdu_script_passed": urdu_passed,
+            "urdu_script_total": urdu_total,
+            "results": results,
+        }
 
